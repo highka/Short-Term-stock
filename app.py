@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.2.0
-獨立短線研究版：V1.2 跨股票策略健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
+黑嚕嚕－短線交易雷達 ST V1.2.1
+獨立短線研究版：V1.2.1 族群股票池健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
 1. 統一指標：MA5 / MA15 / MA30 / MA60 / MA200 + KD(9,3,3)
@@ -36,7 +36,7 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.2.0"
+APP_VERSION = "ST V1.2.1"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
@@ -455,6 +455,38 @@ def classify_stock_state(data_map: Dict[str, pd.DataFrame]) -> Dict[str, object]
     }
 
 
+
+SECTOR_POOLS = {
+    "半導體/晶圓": ["2330", "2303", "5347", "6770"],
+    "IC設計": ["2454", "3034", "2379", "3443"],
+    "AI伺服器/ODM": ["2382", "3231", "6669", "2356"],
+    "電腦品牌/板卡": ["2357", "2376", "2377", "2395"],
+    "PCB/載板": ["3037", "8046", "3189", "4958"],
+    "散熱/機殼": ["3017", "3324", "3653", "8210"],
+    "網通": ["2345", "3596", "6285", "5388"],
+    "記憶體": ["2408", "2344", "8299", "3260"],
+    "面板": ["2409", "3481"],
+    "被動元件": ["2327", "2492", "3026"],
+    "電源/能源管理": ["2308", "6412", "6409"],
+    "封測": ["3711", "6239", "2449"],
+    "金融": ["2881", "2882", "2891", "2886"],
+    "航運": ["2603", "2609", "2615", "2618"],
+    "鋼鐵": ["2002", "2014", "2027"],
+    "塑化": ["1301", "1303", "1326"],
+    "生技": ["6446", "4743", "1795"],
+    "營建": ["2542", "5522", "2501"],
+}
+
+def sector_symbols(selected_sectors: List[str], per_sector: int, market: str) -> List[str]:
+    out = []
+    for sec in selected_sectors:
+        for code in SECTOR_POOLS.get(sec, [])[:per_sector]:
+            s = normalize_symbol(code, market)
+            if s not in out:
+                out.append(s)
+    return out
+
+
 def parse_batch_codes(text: str, market: str) -> List[str]:
     raw = text.replace("，", ",").replace("、", ",").replace("\n", ",").replace(" ", ",")
     codes = []
@@ -466,6 +498,39 @@ def parse_batch_codes(text: str, market: str) -> List[str]:
         if s not in codes:
             codes.append(s)
     return codes
+
+
+
+def code_from_symbol(symbol: str) -> str:
+    return str(symbol).split(".")[0]
+
+def sector_of_symbol(symbol: str) -> str:
+    code = code_from_symbol(symbol)
+    for sec, codes in SECTOR_POOLS.items():
+        if code in codes:
+            return sec
+    return "其他/手動"
+
+def sector_strategy_summary(detail: pd.DataFrame) -> pd.DataFrame:
+    if detail.empty:
+        return pd.DataFrame()
+    x = detail[detail["交易數"] > 0].copy()
+    if x.empty:
+        return pd.DataFrame()
+    x["族群"] = x["股票"].map(sector_of_symbol)
+
+    def positive_rate(s):
+        s = pd.to_numeric(s, errors="coerce").dropna()
+        return (s > 0).mean() * 100 if len(s) else np.nan
+
+    return x.groupby(["族群", "週期", "規則", "持有"], dropna=False).agg(
+        股票數=("股票", "nunique"),
+        總交易數=("交易數", "sum"),
+        正期望股票比例=("期望值%", positive_rate),
+        期望值中位數=("期望值%", "median"),
+        PF中位數=("ProfitFactor", "median"),
+        平均勝率=("勝率%", "mean"),
+    ).reset_index()
 
 
 def cross_stock_summary(batch_summary: pd.DataFrame) -> pd.DataFrame:
@@ -529,7 +594,8 @@ def run_batch_matrix(symbols: List[str], intervals: List[str], rules: List[str],
     detail = pd.DataFrame(all_rows)
     states_df = pd.DataFrame(states)
     cross = cross_stock_summary(detail[detail["交易數"] > 0].copy()) if not detail.empty else pd.DataFrame()
-    return detail, cross, states_df
+    sector_summary = sector_strategy_summary(detail)
+    return detail, cross, states_df, sector_summary
 
 
 def run_matrix(symbol: str, intervals: List[str], rules: List[str], modes: List[str],
@@ -608,11 +674,28 @@ with st.sidebar:
     st.header("研究設定")
     research_mode = st.radio("研究模式", ["單一股票", "跨股票批次"], horizontal=True)
     code = st.text_input("股票代號", value="2330")
+    pool_mode = st.radio(
+        "批次股票池",
+        ["手動輸入", "族群代表池"],
+        horizontal=True,
+        disabled=(research_mode != "跨股票批次"),
+    )
     batch_text = st.text_area(
         "批次股票代號",
         value="2330,2357,3711,2317,2454,2382",
-        help="用逗號分隔。V1.2 建議先跑 5～10 檔確認速度，再擴大到 20～50 檔。",
-        disabled=(research_mode != "跨股票批次"),
+        help="用逗號分隔。",
+        disabled=(research_mode != "跨股票批次" or pool_mode != "手動輸入"),
+    )
+    selected_sectors = st.multiselect(
+        "選擇族群",
+        list(SECTOR_POOLS.keys()),
+        default=["半導體/晶圓", "IC設計", "AI伺服器/ODM", "電腦品牌/板卡", "封測", "航運"],
+        disabled=(research_mode != "跨股票批次" or pool_mode != "族群代表池"),
+    )
+    per_sector = st.slider(
+        "每族群代表檔數",
+        1, 4, 3,
+        disabled=(research_mode != "跨股票批次" or pool_mode != "族群代表池"),
     )
     market = st.radio("市場", ["上市", "上櫃"], horizontal=True)
     symbol = normalize_symbol(code, market)
@@ -672,7 +755,7 @@ with st.sidebar:
 
     run = st.button("🚀 開始策略健診", type="primary", use_container_width=True)
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["📊 單股總表", "🌐 跨股穩定度", "🧬 狀態分類", "📈 K線/KD", "🔬 KD分區", "📦 量價/斜率", "🧾 交易明細"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(["📊 單股總表", "🌐 跨股穩定度", "🏭 族群比較", "🧬 狀態分類", "📈 K線/KD", "🔬 KD分區", "📦 量價/斜率", "🧾 交易明細"])
 
 if run:
     if not selected_intervals or not selected_rules or not selected_modes:
@@ -680,16 +763,16 @@ if run:
         st.stop()
 
     if research_mode == "跨股票批次":
-        symbols = parse_batch_codes(batch_text, market)
+        symbols = (parse_batch_codes(batch_text, market) if pool_mode == "手動輸入" else sector_symbols(selected_sectors, per_sector, market))
         if not symbols:
             st.error("請輸入至少一檔股票。")
             st.stop()
         with st.spinner(f"跨股票策略健診：{len(symbols)} 檔…"):
-            batch_detail, cross, states_df = run_batch_matrix(
+            batch_detail, cross, states_df, sector_summary = run_batch_matrix(
                 symbols, selected_intervals, selected_rules, selected_modes, cost, period
             )
         st.session_state["st_v120_batch"] = {
-            "detail": batch_detail, "cross": cross, "states": states_df, "symbols": symbols
+            "detail": batch_detail, "cross": cross, "states": states_df, "sector_summary": sector_summary, "symbols": symbols
         }
         # 同時載入第一檔供圖表/單股頁查看
         symbol = symbols[0]
@@ -795,6 +878,34 @@ if state:
             )
 
     with tab3:
+        st.subheader("族群 × 策略健診")
+        if not batch_state or batch_state.get("sector_summary", pd.DataFrame()).empty:
+            st.info("使用「跨股票批次 → 族群代表池」執行後，這裡會比較不同族群的策略表現。")
+        else:
+            ss = batch_state["sector_summary"].copy()
+            sec_filter = st.multiselect(
+                "顯示族群",
+                sorted(ss["族群"].dropna().unique().tolist()),
+                default=sorted(ss["族群"].dropna().unique().tolist()),
+                key="sector_filter",
+            )
+            sx = ss[ss["族群"].isin(sec_filter)].copy()
+            sec_sort = st.selectbox(
+                "族群表排序",
+                ["正期望股票比例", "期望值中位數", "PF中位數", "總交易數"],
+                key="sector_sort",
+            )
+            sx = sx.sort_values(["族群", sec_sort], ascending=[True, False], na_position="last")
+            st.dataframe(sx.round(3), use_container_width=True, hide_index=True)
+            st.caption("族群結果用來找『策略在哪些產業環境較穩定』，不把單一族群的最高數字直接視為最終策略。")
+            st.download_button(
+                "⬇️ 下載族群策略健診 CSV",
+                sx.to_csv(index=False).encode("utf-8-sig"),
+                file_name="ST_V1.2.1_sector_strategy.csv",
+                mime="text/csv",
+            )
+
+    with tab4:
         st.subheader("股票目前狀態分類")
         if not batch_state or batch_state["states"].empty:
             local_state = classify_stock_state(data_map)
@@ -803,7 +914,7 @@ if state:
             st.dataframe(batch_state["states"], use_container_width=True, hide_index=True)
             st.caption("這是研究用『當前狀態』，不是把股票永久分類；同一股票日後可能從趨勢轉為震盪或高波動。")
 
-    with tab4:
+    with tab5:
         iv = st.selectbox("圖表週期", list(data_map.keys()), key="chart_iv")
         d = data_map.get(iv, pd.DataFrame())
         if d.empty:
@@ -818,7 +929,7 @@ if state:
             mcols[6].metric("KD", "-" if pd.isna(last.K) else f"{last.K:.1f}/{last.D:.1f}")
             plot_chart(d, iv)
 
-    with tab5:
+    with tab6:
         st.subheader("KD 所在區間是否真的影響結果？")
         all_t = [t for t in trade_map.values() if t is not None and not t.empty]
         if not all_t:
@@ -838,7 +949,7 @@ if state:
                 "先觀察，不先假設超買一定要賣、超賣一定要買。"
             )
 
-    with tab6:
+    with tab7:
         st.subheader("量價 / 均線斜率研究")
         all_t2 = [t for t in trade_map.values() if t is not None and not t.empty]
         if not all_t2:
@@ -869,7 +980,7 @@ if state:
             st.markdown("#### MA30 3根斜率")
             st.dataframe(slopetab.round(3), use_container_width=True, hide_index=True)
 
-    with tab7:
+    with tab8:
         keys = [k for k, t in trade_map.items() if t is not None and not t.empty]
         if not keys:
             st.warning("沒有交易明細。")
@@ -889,18 +1000,20 @@ else:
     with tab2:
         st.write("跨股票批次完成後顯示策略跨股穩定度。")
     with tab3:
-        st.write("完成驗證後顯示股票目前狀態分類。")
+        st.write("族群代表池完成後顯示族群 × 策略比較。")
     with tab4:
-        st.write("完成第一次驗證後顯示 MA5/15/30/60/200、VWAP 與 KD。")
+        st.write("完成驗證後顯示股票目前狀態分類。")
     with tab5:
-        st.write("完成第一次驗證後分析 KD 區間。")
+        st.write("完成第一次驗證後顯示 MA5/15/30/60/200、VWAP 與 KD。")
     with tab6:
-        st.write("完成第一次驗證後分析量比與均線斜率。")
+        st.write("完成第一次驗證後分析 KD 區間。")
     with tab7:
+        st.write("完成第一次驗證後分析量比與均線斜率。")
+    with tab8:
         st.write("完成第一次驗證後顯示逐筆交易。")
 
 st.divider()
 st.caption(
-    "ST V1.2.0 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.2.1 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
