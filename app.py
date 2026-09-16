@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.0.0
-獨立短線研究版：不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
+黑嚕嚕－短線交易雷達 ST V1.1.0
+獨立短線研究版：V1.1 多週期＋量價驗證；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
 1. 統一指標：MA5 / MA15 / MA30 / MA60 / MA200 + KD(9,3,3)
 2. 比較 5m / 15m / 60m
 3. 比較當沖、隔日、2日、3日、5日持有
 4. 先做研究與回測，不下真單
-5. 下一階段再依結果決定是否加入 VWAP / 成交量 / MACD / ATR 等
+5. V1.1 新增：KD區間、MA斜率、成交量/20期均量、日內VWAP與多週期研究欄位
+6. MACD / RSI / Bollinger / ATR / ADX 暫不加入，避免一次堆疊過多參數
 
 資料：
 - V1.0 使用 yfinance 做研究資料
@@ -35,7 +36,7 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.0.0"
+APP_VERSION = "ST V1.1.0"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
@@ -162,9 +163,27 @@ def add_indicators(d: pd.DataFrame) -> pd.DataFrame:
 
     x["K_ZONE"] = pd.cut(
         x["K"],
-        bins=[-np.inf, 20, 50, 80, np.inf],
-        labels=["K<20", "K20-50", "K50-80", "K>80"],
+        bins=[-np.inf, 20, 30, 50, 80, np.inf],
+        labels=["K<20", "K20-30", "K30-50", "K50-80", "K>80"],
     )
+
+    # V1.1：均線斜率，以目前 MA - 3 根前 MA 表示方向。
+    for n in MA_LIST:
+        x[f"MA{n}_SLOPE3"] = x[f"MA{n}"] - x[f"MA{n}"].shift(3)
+
+    # V1.1：量能比 = 當根成交量 / 前20期平均量（shift 1 避免把當根放入基準）。
+    x["VOL_MA20_PREV"] = x["Volume"].shift(1).rolling(20, min_periods=20).mean()
+    x["VOL_RATIO20"] = x["Volume"] / x["VOL_MA20_PREV"].replace(0, np.nan)
+
+    # V1.1：日內 VWAP，每個交易日重新累積。
+    tp = (x["High"] + x["Low"] + x["Close"]) / 3.0
+    dates = pd.Index([pd.Timestamp(i).date() for i in x.index])
+    pv = tp * x["Volume"].fillna(0)
+    cum_pv = pv.groupby(dates).cumsum()
+    cum_v = x["Volume"].fillna(0).groupby(dates).cumsum().replace(0, np.nan)
+    x["VWAP"] = cum_pv / cum_v
+    x["PRICE_GT_VWAP"] = x["Close"] > x["VWAP"]
+
     return x
 
 
@@ -189,6 +208,16 @@ def signal_mask(d: pd.DataFrame, rule: str) -> pd.Series:
         "完整多頭排列": d.get("FULL_BULL", false) & (~d.get("FULL_BULL", false).shift(1).fillna(False)),
         "完整多頭排列 + KD黃金交叉": d.get("FULL_BULL", false) & d.get("KD_GOLD", false),
         "站上MA200 + KD黃金交叉": d.get("PRICE_GT_MA200", false) & d.get("KD_GOLD", false),
+        "KD黃金交叉 + K<30": d.get("KD_GOLD", false) & (d.get("K", pd.Series(np.nan, index=d.index)) < 30),
+        "KD黃金交叉 + K30-50": d.get("KD_GOLD", false) & (d.get("K", pd.Series(np.nan, index=d.index)) >= 30) & (d.get("K", pd.Series(np.nan, index=d.index)) < 50),
+        "KD黃金交叉 + K50-80": d.get("KD_GOLD", false) & (d.get("K", pd.Series(np.nan, index=d.index)) >= 50) & (d.get("K", pd.Series(np.nan, index=d.index)) < 80),
+        "KD黃金交叉 + K>80": d.get("KD_GOLD", false) & (d.get("K", pd.Series(np.nan, index=d.index)) >= 80),
+        "KD黃金交叉 + MA30向上": d.get("KD_GOLD", false) & (d.get("MA30_SLOPE3", pd.Series(np.nan, index=d.index)) > 0),
+        "KD黃金交叉 + MA60向上": d.get("KD_GOLD", false) & (d.get("MA60_SLOPE3", pd.Series(np.nan, index=d.index)) > 0),
+        "KD黃金交叉 + 量比>1.2": d.get("KD_GOLD", false) & (d.get("VOL_RATIO20", pd.Series(np.nan, index=d.index)) > 1.2),
+        "KD黃金交叉 + 量比>1.5": d.get("KD_GOLD", false) & (d.get("VOL_RATIO20", pd.Series(np.nan, index=d.index)) > 1.5),
+        "KD黃金交叉 + 站上VWAP": d.get("KD_GOLD", false) & d.get("PRICE_GT_VWAP", false),
+        "MA5>15 + KD + 站上VWAP": d.get("MA_BULL_5_15", false) & d.get("KD_GOLD", false) & d.get("PRICE_GT_VWAP", false),
     }
     return rules.get(rule, false).fillna(False)
 
@@ -293,6 +322,10 @@ def backtest(
             "訊號D": float(d["D"].iloc[i]) if pd.notna(d["D"].iloc[i]) else np.nan,
             "K區間": str(d["K_ZONE"].iloc[i]) if pd.notna(d["K_ZONE"].iloc[i]) else "",
             "訊號收盤": float(d["Close"].iloc[i]),
+            "訊號VWAP": float(d["VWAP"].iloc[i]) if "VWAP" in d and pd.notna(d["VWAP"].iloc[i]) else np.nan,
+            "量比20": float(d["VOL_RATIO20"].iloc[i]) if "VOL_RATIO20" in d and pd.notna(d["VOL_RATIO20"].iloc[i]) else np.nan,
+            "MA30斜率3": float(d["MA30_SLOPE3"].iloc[i]) if "MA30_SLOPE3" in d and pd.notna(d["MA30_SLOPE3"].iloc[i]) else np.nan,
+            "MA60斜率3": float(d["MA60_SLOPE3"].iloc[i]) if "MA60_SLOPE3" in d and pd.notna(d["MA60_SLOPE3"].iloc[i]) else np.nan,
         })
         last_entry = entry_i
 
@@ -392,6 +425,8 @@ def plot_chart(d: pd.DataFrame, interval: str):
     ), row=1, col=1)
     for n in MA_LIST:
         fig.add_trace(go.Scatter(x=show.index, y=show[f"MA{n}"], mode="lines", name=f"MA{n}"), row=1, col=1)
+    if "VWAP" in show.columns:
+        fig.add_trace(go.Scatter(x=show.index, y=show["VWAP"], mode="lines", name="VWAP"), row=1, col=1)
     fig.add_trace(go.Scatter(x=show.index, y=show["K"], mode="lines", name="K"), row=2, col=1)
     fig.add_trace(go.Scatter(x=show.index, y=show["D"], mode="lines", name="D"), row=2, col=1)
     fig.add_hline(y=80, row=2, col=1)
@@ -427,6 +462,16 @@ with st.sidebar:
         "完整多頭排列",
         "完整多頭排列 + KD黃金交叉",
         "站上MA200 + KD黃金交叉",
+        "KD黃金交叉 + K<30",
+        "KD黃金交叉 + K30-50",
+        "KD黃金交叉 + K50-80",
+        "KD黃金交叉 + K>80",
+        "KD黃金交叉 + MA30向上",
+        "KD黃金交叉 + MA60向上",
+        "KD黃金交叉 + 量比>1.2",
+        "KD黃金交叉 + 量比>1.5",
+        "KD黃金交叉 + 站上VWAP",
+        "MA5>15 + KD + 站上VWAP",
     ]
     selected_rules = st.multiselect(
         "進場規則",
@@ -437,6 +482,12 @@ with st.sidebar:
             "MA5>15 + KD黃金交叉",
             "MA5>15>30 + KD黃金交叉",
             "完整多頭排列 + KD黃金交叉",
+            "KD黃金交叉 + K<30",
+            "KD黃金交叉 + K50-80",
+            "KD黃金交叉 + MA30向上",
+            "KD黃金交叉 + MA60向上",
+            "KD黃金交叉 + 量比>1.2",
+            "KD黃金交叉 + 站上VWAP",
         ],
     )
     selected_modes = st.multiselect(
@@ -453,7 +504,7 @@ with st.sidebar:
 
     run = st.button("🚀 開始多週期驗證", type="primary", use_container_width=True)
 
-tab1, tab2, tab3, tab4 = st.tabs(["📊 驗證總表", "📈 K線 / KD", "🔬 KD分區研究", "🧾 交易明細"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 驗證總表", "📈 K線 / KD", "🔬 KD分區研究", "📦 量價/斜率", "🧾 交易明細"])
 
 if run:
     if not selected_intervals or not selected_rules or not selected_modes:
@@ -564,6 +615,37 @@ if state:
             )
 
     with tab4:
+        st.subheader("量價 / 均線斜率研究")
+        all_t2 = [t for t in trade_map.values() if t is not None and not t.empty]
+        if not all_t2:
+            st.warning("沒有交易樣本。")
+        else:
+            ft = pd.concat(all_t2, ignore_index=True)
+            ft["量比分組"] = pd.cut(
+                ft["量比20"],
+                bins=[-np.inf, 0.8, 1.2, 1.5, 2.0, np.inf],
+                labels=["<0.8", "0.8-1.2", "1.2-1.5", "1.5-2.0", ">2.0"],
+            )
+            voltab = ft.groupby(["週期", "量比分組"], observed=True).agg(
+                交易數=("淨報酬%", "count"),
+                勝率=("淨報酬%", lambda x: (x > 0).mean() * 100),
+                平均淨報酬=("淨報酬%", "mean"),
+                平均MFE=("MFE%", "mean"),
+                平均MAE=("MAE%", "mean"),
+            ).reset_index()
+            st.markdown("#### 成交量 / 20期均量")
+            st.dataframe(voltab.round(3), use_container_width=True, hide_index=True)
+
+            ft["MA30方向"] = np.where(ft["MA30斜率3"] > 0, "向上", "非向上")
+            slopetab = ft.groupby(["週期", "MA30方向"]).agg(
+                交易數=("淨報酬%", "count"),
+                勝率=("淨報酬%", lambda x: (x > 0).mean() * 100),
+                平均淨報酬=("淨報酬%", "mean"),
+            ).reset_index()
+            st.markdown("#### MA30 3根斜率")
+            st.dataframe(slopetab.round(3), use_container_width=True, hide_index=True)
+
+    with tab5:
         keys = [k for k, t in trade_map.items() if t is not None and not t.empty]
         if not keys:
             st.warning("沒有交易明細。")
@@ -585,10 +667,12 @@ else:
     with tab3:
         st.write("完成第一次驗證後分析 KD 區間。")
     with tab4:
+        st.write("完成第一次驗證後分析量比與均線斜率。")
+    with tab5:
         st.write("完成第一次驗證後顯示逐筆交易。")
 
 st.divider()
 st.caption(
-    "ST V1.0.0 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.1.0 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
