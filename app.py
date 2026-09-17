@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.2.1
-獨立短線研究版：V1.2.1 族群股票池健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
+黑嚕嚕－短線交易雷達 ST V1.2.2
+獨立短線研究版：V1.2.2 動態短線股票池健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
 1. 統一指標：MA5 / MA15 / MA30 / MA60 / MA200 + KD(9,3,3)
@@ -36,7 +36,7 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.2.1"
+APP_VERSION = "ST V1.2.2"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
@@ -456,6 +456,81 @@ def classify_stock_state(data_map: Dict[str, pd.DataFrame]) -> Dict[str, object]
 
 
 
+
+# V1.2.2 候選母池：不是「固定熱門排名」；真正入選名單會用近期日線重新排序。
+# 刻意涵蓋大型權值、電子次產業、金融、傳產與高交易活躍族群。
+SHORT_TERM_UNIVERSE = [
+    "2330.TW","2303.TW","2454.TW","2317.TW","2382.TW","3231.TW","2357.TW","2376.TW","2377.TW","2395.TW",
+    "3034.TW","2379.TW","3443.TW","3711.TW","6239.TW","2449.TW","3037.TW","8046.TW","3189.TW","4958.TW",
+    "3017.TW","3653.TW","2345.TW","3596.TW","6285.TW","2408.TW","2344.TW","2409.TW","3481.TW","2327.TW",
+    "2492.TW","3026.TW","2308.TW","6412.TW","6409.TW","6669.TW","2356.TW","2603.TW","2609.TW","2615.TW",
+    "2618.TW","2002.TW","2014.TW","2027.TW","1301.TW","1303.TW","1326.TW","2881.TW","2882.TW","2891.TW",
+    "2886.TW","2884.TW","2885.TW","2887.TW","2892.TW","5871.TW","5880.TW","2542.TW","5522.TW","2501.TW",
+    "6446.TW","4743.TW","1795.TW","2207.TW","2301.TW","2353.TW","2354.TW","2368.TW","2383.TW","2385.TW",
+    "2404.TW","2441.TW","2451.TW","2474.TW","3008.TW","3019.TW","3044.TW","3234.TW","3661.TW","3706.TW",
+    "4938.TW","5269.TW","5876.TW","6213.TW","6274.TW","6505.TW","6531.TW","6781.TW","6805.TW","8454.TW",
+    "1477.TW","1590.TW","2105.TW","2201.TW","2606.TW","2610.TW","2634.TW","9904.TW","9910.TW","9914.TW",
+    "5347.TWO","6770.TW","8299.TWO","3260.TWO","3324.TWO","5388.TWO"
+]
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def rank_short_term_pool(symbols: List[str], top_n: int = 30, lookback: str = "1mo") -> pd.DataFrame:
+    """
+    動態短線池：用近期日線資料衡量『可交易性』，不是預測漲跌。
+    主要使用20日成交金額中位數、20日成交量中位數、日內振幅與有效資料天數。
+    """
+    rows = []
+    for symbol in symbols:
+        try:
+            d = yf.download(
+                symbol, period=lookback, interval="1d",
+                auto_adjust=False, progress=False, threads=False
+            )
+        except Exception:
+            continue
+        if d is None or d.empty:
+            continue
+        if isinstance(d.columns, pd.MultiIndex):
+            try:
+                d.columns = d.columns.get_level_values(0)
+            except Exception:
+                pass
+        needed = {"Close","High","Low","Volume"}
+        if not needed.issubset(set(d.columns)):
+            continue
+        x = d.dropna(subset=["Close","High","Low","Volume"]).tail(20).copy()
+        if len(x) < 8:
+            continue
+        turnover = (x["Close"] * x["Volume"]).replace([np.inf,-np.inf], np.nan)
+        amp = ((x["High"] - x["Low"]) / x["Close"].replace(0,np.nan) * 100).replace([np.inf,-np.inf],np.nan)
+        med_turn = float(turnover.median())
+        med_vol = float(x["Volume"].median())
+        med_amp = float(amp.median())
+        rows.append({
+            "股票": symbol,
+            "有效日數": len(x),
+            "20日成交金額中位數": med_turn,
+            "20日成交量中位數": med_vol,
+            "20日振幅中位數%": med_amp,
+        })
+
+    r = pd.DataFrame(rows)
+    if r.empty:
+        return r
+
+    # 百分位分數避免不同量綱互相壓制。流動性70%、振幅30%。
+    r["成交金額百分位"] = r["20日成交金額中位數"].rank(pct=True) * 100
+    r["成交量百分位"] = r["20日成交量中位數"].rank(pct=True) * 100
+    r["振幅百分位"] = r["20日振幅中位數%"].rank(pct=True) * 100
+    r["短線可交易分"] = (
+        r["成交金額百分位"] * 0.50 +
+        r["成交量百分位"] * 0.20 +
+        r["振幅百分位"] * 0.30
+    )
+    r = r.sort_values(["短線可交易分","20日成交金額中位數"], ascending=False)
+    return r.head(int(top_n)).reset_index(drop=True)
+
+
 SECTOR_POOLS = {
     "半導體/晶圓": ["2330", "2303", "5347", "6770"],
     "IC設計": ["2454", "3034", "2379", "3443"],
@@ -555,6 +630,17 @@ def cross_stock_summary(batch_summary: pd.DataFrame) -> pd.DataFrame:
 
     # 穩定度不是「最佳策略評分」，只是描述跨股票一致性。
     g["樣本覆蓋率"] = g["股票數"] / max(1, batch_summary["股票"].nunique()) * 100
+    # 研究標記，不是投資評級：避免只看最高期望值。
+    g["研究穩健標記"] = np.select(
+        [
+            (g["股票數"] >= 10) & (g["總交易數"] >= 100) &
+            (g["正期望股票比例"] >= 70) & (g["期望值中位數"] > 0) & (g["PF中位數"] > 1.2),
+            (g["股票數"] >= 5) & (g["總交易數"] >= 50) &
+            (g["正期望股票比例"] >= 60) & (g["期望值中位數"] > 0) & (g["PF中位數"] > 1.0),
+        ],
+        ["跨股一致性較高", "值得續測"],
+        default="證據不足"
+    )
     return g
 
 
@@ -676,7 +762,7 @@ with st.sidebar:
     code = st.text_input("股票代號", value="2330")
     pool_mode = st.radio(
         "批次股票池",
-        ["手動輸入", "族群代表池"],
+        ["手動輸入", "族群代表池", "動態短線TOP池"],
         horizontal=True,
         disabled=(research_mode != "跨股票批次"),
     )
@@ -696,6 +782,12 @@ with st.sidebar:
         "每族群代表檔數",
         1, 4, 3,
         disabled=(research_mode != "跨股票批次" or pool_mode != "族群代表池"),
+    )
+    top_n = st.slider(
+        "動態短線池檔數",
+        10, 100, 30, step=10,
+        disabled=(research_mode != "跨股票批次" or pool_mode != "動態短線TOP池"),
+        help="先由候選母池用近期成交金額、成交量與振幅排序，再對入選股票執行分K策略健診。",
     )
     market = st.radio("市場", ["上市", "上櫃"], horizontal=True)
     symbol = normalize_symbol(code, market)
@@ -755,7 +847,7 @@ with st.sidebar:
 
     run = st.button("🚀 開始策略健診", type="primary", use_container_width=True)
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(["📊 單股總表", "🌐 跨股穩定度", "🏭 族群比較", "🧬 狀態分類", "📈 K線/KD", "🔬 KD分區", "📦 量價/斜率", "🧾 交易明細"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 單股總表", "🌐 跨股穩定度", "🔥 動態短線池", "🏭 族群比較", "🧬 狀態分類", "📈 K線/KD", "🔬 KD分區", "📦 量價/斜率", "🧾 交易明細"])
 
 if run:
     if not selected_intervals or not selected_rules or not selected_modes:
@@ -763,7 +855,16 @@ if run:
         st.stop()
 
     if research_mode == "跨股票批次":
-        symbols = (parse_batch_codes(batch_text, market) if pool_mode == "手動輸入" else sector_symbols(selected_sectors, per_sector, market))
+        if pool_mode == "手動輸入":
+            symbols = parse_batch_codes(batch_text, market)
+            ranked_pool = pd.DataFrame()
+        elif pool_mode == "族群代表池":
+            symbols = sector_symbols(selected_sectors, per_sector, market)
+            ranked_pool = pd.DataFrame()
+        else:
+            with st.spinner("建立動態短線股票池：讀取近期日線流動性與振幅…"):
+                ranked_pool = rank_short_term_pool(SHORT_TERM_UNIVERSE, top_n=top_n)
+            symbols = ranked_pool["股票"].tolist() if not ranked_pool.empty else []
         if not symbols:
             st.error("請輸入至少一檔股票。")
             st.stop()
@@ -772,7 +873,7 @@ if run:
                 symbols, selected_intervals, selected_rules, selected_modes, cost, period
             )
         st.session_state["st_v120_batch"] = {
-            "detail": batch_detail, "cross": cross, "states": states_df, "sector_summary": sector_summary, "symbols": symbols
+            "detail": batch_detail, "cross": cross, "states": states_df, "sector_summary": sector_summary, "symbols": symbols, "ranked_pool": ranked_pool
         }
         # 同時載入第一檔供圖表/單股頁查看
         symbol = symbols[0]
@@ -878,6 +979,24 @@ if state:
             )
 
     with tab3:
+        st.subheader("動態短線股票池")
+        if not batch_state or batch_state.get("ranked_pool", pd.DataFrame()).empty:
+            st.info("左側選擇「跨股票批次 → 動態短線TOP池」後執行，即會顯示近期可交易性排名與實際健診名單。")
+        else:
+            rp = batch_state["ranked_pool"].copy()
+            show = rp.copy()
+            show["20日成交金額中位數(億)"] = show["20日成交金額中位數"] / 1e8
+            cols = ["股票","短線可交易分","20日成交金額中位數(億)","20日成交量中位數","20日振幅中位數%","有效日數"]
+            st.dataframe(show[cols].round(2), use_container_width=True, hide_index=True)
+            st.caption("此排名只衡量近期流動性與波動是否適合短線研究，不代表預測報酬或推薦買賣。")
+            st.download_button(
+                "⬇️ 下載本次動態短線股票池 CSV",
+                show[cols].to_csv(index=False).encode("utf-8-sig"),
+                file_name="ST_V1.2.2_dynamic_short_term_pool.csv",
+                mime="text/csv",
+            )
+
+    with tab4:
         st.subheader("族群 × 策略健診")
         if not batch_state or batch_state.get("sector_summary", pd.DataFrame()).empty:
             st.info("使用「跨股票批次 → 族群代表池」執行後，這裡會比較不同族群的策略表現。")
@@ -905,7 +1024,7 @@ if state:
                 mime="text/csv",
             )
 
-    with tab4:
+    with tab5:
         st.subheader("股票目前狀態分類")
         if not batch_state or batch_state["states"].empty:
             local_state = classify_stock_state(data_map)
@@ -914,7 +1033,7 @@ if state:
             st.dataframe(batch_state["states"], use_container_width=True, hide_index=True)
             st.caption("這是研究用『當前狀態』，不是把股票永久分類；同一股票日後可能從趨勢轉為震盪或高波動。")
 
-    with tab5:
+    with tab6:
         iv = st.selectbox("圖表週期", list(data_map.keys()), key="chart_iv")
         d = data_map.get(iv, pd.DataFrame())
         if d.empty:
@@ -929,7 +1048,7 @@ if state:
             mcols[6].metric("KD", "-" if pd.isna(last.K) else f"{last.K:.1f}/{last.D:.1f}")
             plot_chart(d, iv)
 
-    with tab6:
+    with tab7:
         st.subheader("KD 所在區間是否真的影響結果？")
         all_t = [t for t in trade_map.values() if t is not None and not t.empty]
         if not all_t:
@@ -949,7 +1068,7 @@ if state:
                 "先觀察，不先假設超買一定要賣、超賣一定要買。"
             )
 
-    with tab7:
+    with tab8:
         st.subheader("量價 / 均線斜率研究")
         all_t2 = [t for t in trade_map.values() if t is not None and not t.empty]
         if not all_t2:
@@ -980,7 +1099,7 @@ if state:
             st.markdown("#### MA30 3根斜率")
             st.dataframe(slopetab.round(3), use_container_width=True, hide_index=True)
 
-    with tab8:
+    with tab9:
         keys = [k for k, t in trade_map.items() if t is not None and not t.empty]
         if not keys:
             st.warning("沒有交易明細。")
@@ -1000,20 +1119,22 @@ else:
     with tab2:
         st.write("跨股票批次完成後顯示策略跨股穩定度。")
     with tab3:
-        st.write("族群代表池完成後顯示族群 × 策略比較。")
+        st.write("動態短線TOP池完成後顯示本次入選股票與可交易性。")
     with tab4:
-        st.write("完成驗證後顯示股票目前狀態分類。")
+        st.write("族群代表池完成後顯示族群 × 策略比較。")
     with tab5:
-        st.write("完成第一次驗證後顯示 MA5/15/30/60/200、VWAP 與 KD。")
+        st.write("完成驗證後顯示股票目前狀態分類。")
     with tab6:
-        st.write("完成第一次驗證後分析 KD 區間。")
+        st.write("完成第一次驗證後顯示 MA5/15/30/60/200、VWAP 與 KD。")
     with tab7:
-        st.write("完成第一次驗證後分析量比與均線斜率。")
+        st.write("完成第一次驗證後分析 KD 區間。")
     with tab8:
+        st.write("完成第一次驗證後分析量比與均線斜率。")
+    with tab9:
         st.write("完成第一次驗證後顯示逐筆交易。")
 
 st.divider()
 st.caption(
-    "ST V1.2.1 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.2.2 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
