@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.2.3
+黑嚕嚕－短線交易雷達 ST V1.2.3.1
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,7 +36,7 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.2.3"
+APP_VERSION = "ST V1.2.3.1"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
@@ -828,7 +828,7 @@ with st.sidebar:
     )
     top_n = st.slider(
         "動態短線池檔數",
-        10, 100, 50, step=10,
+        10, 100, 20, step=10,
         disabled=(research_mode != "跨股票批次" or pool_mode != "動態短線TOP池"),
         help="先由候選母池用近期成交金額、成交量與振幅排序，再對入選股票執行分K策略健診。",
     )
@@ -888,6 +888,11 @@ with st.sidebar:
     slip_bp = st.number_input("單邊滑價（bp）", min_value=0.0, max_value=30.0, value=5.0, step=1.0)
     cost = CostConfig(fee_discount=fee_discount, slippage_pct=slip_bp / 10000)
 
+    combo_est = max(1, len(selected_intervals)) * max(1, len(selected_rules)) * max(1, len(selected_modes))
+    if research_mode == "跨股票批次" and pool_mode == "動態短線TOP池":
+        st.info(f"本次預計：TOP {top_n} × {len(selected_intervals)}週期 × {len(selected_rules)}規則 × {len(selected_modes)}持有方式；先完成股票池，再逐檔健診。")
+        if top_n > 30:
+            st.warning("目前仍使用 yfinance。一次超過30檔容易遇到下載限制或執行時間過長；建議先20～30檔分批驗證。")
     run = st.button("🚀 開始策略健診", type="primary", use_container_width=True)
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 單股總表", "🌐 跨股穩定度", "🔥 動態短線池", "🏭 族群比較", "🧬 狀態分類", "📈 K線/KD", "🔬 KD分區", "📦 量價/斜率", "🧾 交易明細"])
@@ -909,12 +914,26 @@ if run:
                 ranked_pool = rank_short_term_pool(SHORT_TERM_UNIVERSE, top_n=top_n)
             symbols = ranked_pool["股票"].tolist() if not ranked_pool.empty else []
         if not symbols:
-            st.error("請輸入至少一檔股票。")
+            st.error("股票池建立失敗：沒有可用股票。請先降低TOP數或稍後重試。")
+            if not ranked_pool.empty:
+                st.dataframe(ranked_pool, use_container_width=True, hide_index=True)
             st.stop()
-        with st.spinner(f"跨股票策略健診：{len(symbols)} 檔…"):
-            batch_detail, cross, states_df, sector_summary = run_batch_matrix(
-                symbols, selected_intervals, selected_rules, selected_modes, cost, period
-            )
+
+        # 股票池先存入 session，避免長時間回測失敗後畫面完全空白。
+        st.session_state["st_v1231_pool_preview"] = ranked_pool.copy()
+        st.success(f"股票池建立完成：{len(symbols)} 檔。開始分K健診。")
+        with st.expander("查看本次實際健診名單", expanded=False):
+            st.write("、".join(symbols))
+
+        try:
+            with st.spinner(f"跨股票策略健診：{len(symbols)} 檔…"):
+                batch_detail, cross, states_df, sector_summary = run_batch_matrix(
+                    symbols, selected_intervals, selected_rules, selected_modes, cost, period
+                )
+        except Exception as e:
+            st.error(f"分K健診中斷：{type(e).__name__}: {e}")
+            st.warning("股票池已保留。請先把TOP數降到20，或只勾15m＋60m再執行；確認資料層穩定後再擴大。")
+            st.stop()
         st.session_state["st_v120_batch"] = {
             "detail": batch_detail, "cross": cross, "states": states_df, "sector_summary": sector_summary, "symbols": symbols, "ranked_pool": ranked_pool
         }
@@ -1023,10 +1042,13 @@ if state:
 
     with tab3:
         st.subheader("動態短線股票池")
-        if not batch_state or batch_state.get("ranked_pool", pd.DataFrame()).empty:
+        preview_pool = st.session_state.get("st_v1231_pool_preview", pd.DataFrame())
+        if (not batch_state or batch_state.get("ranked_pool", pd.DataFrame()).empty) and preview_pool.empty:
             st.info("左側選擇「跨股票批次 → 動態短線TOP池」後執行，即會顯示近期可交易性排名與實際健診名單。")
         else:
-            rp = batch_state["ranked_pool"].copy()
+            rp = (batch_state["ranked_pool"].copy()
+                  if batch_state and not batch_state.get("ranked_pool", pd.DataFrame()).empty
+                  else preview_pool.copy())
             show = rp.copy()
             show["20日成交金額中位數(億)"] = show["20日成交金額中位數"] / 1e8
             cols = ["股票","短線可交易分","20日成交金額中位數(億)","20日成交量中位數","20日振幅中位數%","有效日數"]
@@ -1182,6 +1204,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.2.3 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.2.3.1 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
