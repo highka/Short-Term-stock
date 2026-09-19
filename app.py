@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.2.3.4
+黑嚕嚕－短線交易雷達 ST V1.2.4
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,7 +36,7 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.2.3.4"
+APP_VERSION = "ST V1.2.4"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
@@ -739,6 +739,27 @@ def cross_stock_summary(batch_summary: pd.DataFrame) -> pd.DataFrame:
     return g
 
 
+def theme_strategy_summary(detail: pd.DataFrame) -> pd.DataFrame:
+    if detail is None or detail.empty or "研究主題" not in detail.columns:
+        return pd.DataFrame()
+    d = detail[detail["交易數"] > 0].copy()
+    if d.empty:
+        return pd.DataFrame()
+    rows = []
+    for key, x in d.groupby(["研究主題","週期","規則","持有"], dropna=False):
+        pf = x["Profit Factor"].replace([np.inf,-np.inf],np.nan)
+        rows.append({
+            "研究主題":key[0],"週期":key[1],"規則":key[2],"持有":key[3],
+            "股票數":int(x["股票"].nunique()),"總交易數":int(x["交易數"].sum()),
+            "正期望股票比例":float((x["期望值%"]>0).mean()*100),
+            "期望值中位數":float(x["期望值%"].median()),
+            "PF中位數":float(pf.median()),"平均勝率":float(x["勝率%"].mean()),
+            "平均最大回撤":float(x["最大回撤%"].mean())
+        })
+    return pd.DataFrame(rows).sort_values(
+        ["正期望股票比例","期望值中位數","PF中位數","總交易數"],
+        ascending=[False,False,False,False]).reset_index(drop=True)
+
 def run_batch_matrix(symbols: List[str], intervals: List[str], rules: List[str], modes: List[str],
                      cost: CostConfig, period: str):
     all_rows, states = [], []
@@ -773,7 +794,8 @@ def run_batch_matrix(symbols: List[str], intervals: List[str], rules: List[str],
                     t = backtest(d, interval, rule, mode, cost)
                     m = metrics(t)
                     all_rows.append({
-                        "股票": symbol, "市場狀態": state["市場狀態"],
+                        "股票": symbol, "研究主題": research_theme(symbol),
+                        "市場狀態": state["市場狀態"],
                         "週期": interval, "規則": rule, "持有": mode, **m
                     })
         p.progress(0.25 + 0.75*idx/total, text=f"策略計算 {symbol}｜{idx}/{total}")
@@ -783,12 +805,13 @@ def run_batch_matrix(symbols: List[str], intervals: List[str], rules: List[str],
     states_df = pd.DataFrame(states)
     cross = cross_stock_summary(detail[detail["交易數"] > 0].copy()) if not detail.empty else pd.DataFrame()
     sector_summary = sector_strategy_summary(detail)
+    theme_summary = theme_strategy_summary(detail)
     diagnostics = pd.DataFrame([
         {"週期": iv, "要求股票數": len(symbols), "成功下載": success_count[iv],
          "失敗/空資料": len(symbols)-success_count[iv]}
         for iv in intervals
     ])
-    return detail, cross, states_df, sector_summary, diagnostics
+    return detail, cross, states_df, sector_summary, theme_summary, diagnostics
 
 
 def run_matrix(symbol: str, intervals: List[str], rules: List[str], modes: List[str],
@@ -892,7 +915,7 @@ with st.sidebar:
     )
     top_n = st.slider(
         "動態短線池檔數",
-        10, 100, 20, step=10,
+        10, 100, 50, step=10,
         disabled=(research_mode != "跨股票批次" or pool_mode != "動態短線TOP池"),
         help="先由候選母池用近期成交金額、成交量與振幅排序，再對入選股票執行分K策略健診。",
     )
@@ -929,8 +952,6 @@ with st.sidebar:
         default=[
             "KD黃金交叉",
             "KD黃金交叉 + K<30",
-            "KD黃金交叉 + MA30向上",
-            "KD黃金交叉 + MA60向上",
             "KD黃金交叉 + 站上VWAP",
         ],
     )
@@ -985,7 +1006,7 @@ if run:
 
         try:
             with st.spinner(f"跨股票策略健診：{len(symbols)} 檔…"):
-                batch_detail, cross, states_df, sector_summary, diagnostics = run_batch_matrix(
+                batch_detail, cross, states_df, sector_summary, theme_summary, diagnostics = run_batch_matrix(
                     symbols, selected_intervals, selected_rules, selected_modes, cost, period
                 )
         except Exception as e:
@@ -993,7 +1014,7 @@ if run:
             st.warning("股票池已保留。請先把TOP數降到20，或只勾15m＋60m再執行；確認資料層穩定後再擴大。")
             st.stop()
         st.session_state["st_v120_batch"] = {
-            "detail": batch_detail, "cross": cross, "states": states_df, "sector_summary": sector_summary, "diagnostics": diagnostics, "symbols": symbols, "ranked_pool": ranked_pool
+            "detail": batch_detail, "cross": cross, "states": states_df, "sector_summary": sector_summary, "theme_summary": theme_summary, "diagnostics": diagnostics, "symbols": symbols, "ranked_pool": ranked_pool
         }
         # 批次完成後不再重跑第一檔，避免再次下載造成中斷。
         symbol = symbols[0]
@@ -1264,6 +1285,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.2.3.4 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.2.4 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
