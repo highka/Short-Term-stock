@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.2.3.2
+黑嚕嚕－短線交易雷達 ST V1.2.3.3
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,7 +36,7 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.2.3.2"
+APP_VERSION = "ST V1.2.3.3"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
@@ -616,6 +616,84 @@ def download_intraday_batch(symbols: List[str], interval: str, period: str) -> D
     return out
 
 
+SECTOR_POOLS = {
+    "半導體/晶圓": ["2330", "2303", "5347", "6770"],
+    "IC設計": ["2454", "3034", "2379", "3443"],
+    "AI伺服器/ODM": ["2382", "3231", "6669", "2356"],
+    "電腦品牌/板卡": ["2357", "2376", "2377", "2395"],
+    "PCB/載板": ["3037", "8046", "3189", "4958"],
+    "散熱/機殼": ["3017", "3324", "3653", "8210"],
+    "網通": ["2345", "3596", "6285", "5388"],
+    "記憶體": ["2408", "2344", "8299", "3260"],
+    "面板": ["2409", "3481"],
+    "被動元件": ["2327", "2492", "3026"],
+    "電源/能源管理": ["2308", "6412", "6409"],
+    "封測": ["3711", "6239", "2449"],
+    "金融": ["2881", "2882", "2891", "2886"],
+    "航運": ["2603", "2609", "2615", "2618"],
+    "鋼鐵": ["2002", "2014", "2027"],
+    "塑化": ["1301", "1303", "1326"],
+    "生技": ["6446", "4743", "1795"],
+    "營建": ["2542", "5522", "2501"],
+}
+
+def sector_symbols(selected_sectors: List[str], per_sector: int, market: str) -> List[str]:
+    out = []
+    for sec in selected_sectors:
+        for code in SECTOR_POOLS.get(sec, [])[:per_sector]:
+            s = normalize_symbol(code, market)
+            if s not in out:
+                out.append(s)
+    return out
+
+
+def parse_batch_codes(text: str, market: str) -> List[str]:
+    raw = text.replace("，", ",").replace("、", ",").replace("\n", ",").replace(" ", ",")
+    codes = []
+    for x in raw.split(","):
+        x = x.strip()
+        if not x:
+            continue
+        s = normalize_symbol(x, market)
+        if s not in codes:
+            codes.append(s)
+    return codes
+
+
+
+def code_from_symbol(symbol: str) -> str:
+    return str(symbol).split(".")[0]
+
+def sector_of_symbol(symbol: str) -> str:
+    code = code_from_symbol(symbol)
+    for sec, codes in SECTOR_POOLS.items():
+        if code in codes:
+            return sec
+    return "其他/手動"
+
+def sector_strategy_summary(detail: pd.DataFrame) -> pd.DataFrame:
+    if detail.empty:
+        return pd.DataFrame()
+    x = detail[detail["交易數"] > 0].copy()
+    if x.empty:
+        return pd.DataFrame()
+    x["族群"] = x["股票"].map(sector_of_symbol)
+
+    def positive_rate(s):
+        s = pd.to_numeric(s, errors="coerce").dropna()
+        return (s > 0).mean() * 100 if len(s) else np.nan
+
+    return x.groupby(["族群", "週期", "規則", "持有"], dropna=False).agg(
+        股票數=("股票", "nunique"),
+        總交易數=("交易數", "sum"),
+        正期望股票比例=("期望值%", positive_rate),
+        期望值中位數=("期望值%", "median"),
+        PF中位數=("ProfitFactor", "median"),
+        平均勝率=("勝率%", "mean"),
+    ).reset_index()
+
+
+
 def cross_stock_summary(batch_summary: pd.DataFrame) -> pd.DataFrame:
     if batch_summary.empty:
         return pd.DataFrame()
@@ -1182,6 +1260,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.2.3.2 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.2.3.3 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
