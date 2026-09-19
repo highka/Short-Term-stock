@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.2.5
+黑嚕嚕－短線交易雷達 ST V1.2.6
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,10 +36,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.2.5"
+APP_VERSION = "ST V1.2.6"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
+
+APP_VERSION = "ST_V1.2.6"
+EXPORT_PREFIX = "ST_V1.2.6"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -827,10 +830,16 @@ def run_batch_matrix(symbols: List[str], intervals: List[str], rules: List[str],
 
     p.empty()
     detail = pd.DataFrame(all_rows)
+    if not detail.empty:
+        detail["回測版本"] = APP_VERSION
+        detail["持倉模式"] = "允許重疊" if allow_overlap else "禁止重疊"
     if not detail.empty and "PF" not in detail.columns and "Profit Factor" in detail.columns:
         detail["PF"] = detail["Profit Factor"]
     states_df = pd.DataFrame(states)
     cross = cross_stock_summary(detail[detail["交易數"] > 0].copy()) if not detail.empty else pd.DataFrame()
+    if not cross.empty:
+        cross.insert(0, "回測版本", APP_VERSION)
+        cross.insert(1, "持倉模式", "允許重疊" if allow_overlap else "禁止重疊")
     sector_summary = sector_strategy_summary(detail)
     theme_summary = theme_strategy_summary(detail)
     diagnostics = pd.DataFrame([
@@ -1163,9 +1172,18 @@ if state:
             st.download_button(
                 "⬇️ 下載跨股票穩定度 CSV",
                 cx.to_csv(index=False).encode("utf-8-sig"),
-                file_name="ST_V1.2_cross_stock_stability.csv",
+                file_name=f"{EXPORT_PREFIX}_cross_stock_stability_nonoverlap.csv",
                 mime="text/csv",
             )
+            detail_export = batch_state.get("detail", pd.DataFrame())
+            if not detail_export.empty:
+                st.download_button(
+                    "⬇️ 下載批次策略明細（含重疊排除）",
+                    data=detail_export.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"{EXPORT_PREFIX}_batch_strategy_detail_nonoverlap.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
 
     with tab3:
         st.subheader("動態短線股票池")
@@ -1188,7 +1206,7 @@ if state:
             st.download_button(
                 "⬇️ 下載本次動態短線股票池 CSV",
                 show[cols].to_csv(index=False).encode("utf-8-sig"),
-                file_name="ST_V1.2.2_dynamic_short_term_pool.csv",
+                file_name=f"{EXPORT_PREFIX}_dynamic_short_term_pool.csv",
                 mime="text/csv",
             )
 
@@ -1216,7 +1234,7 @@ if state:
             st.download_button(
                 "⬇️ 下載族群策略健診 CSV",
                 sx.to_csv(index=False).encode("utf-8-sig"),
-                file_name="ST_V1.2.1_sector_strategy.csv",
+                file_name=f"{EXPORT_PREFIX}_sector_strategy_nonoverlap.csv",
                 mime="text/csv",
             )
 
@@ -1331,6 +1349,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.2.5 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.2.6 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
