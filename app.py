@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.2.4
+黑嚕嚕－短線交易雷達 ST V1.2.4.1
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,7 +36,7 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.2.4"
+APP_VERSION = "ST V1.2.4.1"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
@@ -1041,15 +1041,26 @@ if state:
     trade_map = state["trade_map"]
 
     with tab1:
-        st.subheader(f"{symbol}｜多週期基準比較")
-        valid = (
-    summary[summary["交易數"] > 0].copy()
-    if isinstance(summary, pd.DataFrame) and (not summary.empty) and ("交易數" in summary.columns)
-    else pd.DataFrame()
-)
-        if valid.empty:
-            st.warning("目前條件沒有產生足夠交易。可換股票、延長資料或放寬進場規則。")
+        if research_mode == "跨股票批次":
+            st.subheader("📊 跨股票批次健診")
+            _diag = batch_state.get("diagnostics", pd.DataFrame()) if batch_state else pd.DataFrame()
+            _cross = batch_state.get("cross", pd.DataFrame()) if batch_state else pd.DataFrame()
+            c1, c2, c3 = st.columns(3)
+            c1.metric("實際健診股票", len(batch_state.get("symbols", [])) if batch_state else 0)
+            c2.metric("跨股策略組合", len(_cross))
+            c3.metric("成功週期", int((_diag["成功下載"] > 0).sum()) if not _diag.empty and "成功下載" in _diag.columns else 0)
+            st.info("批次模式不重複下載第一檔做單股基準；請查看「跨股票穩定度／族群比較／動態短線池」。")
+            valid = pd.DataFrame()
         else:
+            st.subheader(f"{symbol}｜多週期基準比較")
+            valid = (
+                summary[summary["交易數"] > 0].copy()
+                if isinstance(summary, pd.DataFrame) and (not summary.empty) and ("交易數" in summary.columns)
+                else pd.DataFrame()
+            )
+        if research_mode != "跨股票批次" and valid.empty:
+            st.warning("目前條件沒有產生足夠交易。可換股票、延長資料或放寬進場規則。")
+        elif research_mode != "跨股票批次":
             # 不宣告單一「最佳策略」；提供客觀排序欄位供研究。
             sort_col = st.selectbox(
                 "總表排序依據",
@@ -1285,6 +1296,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.2.4 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.2.4.1 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
