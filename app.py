@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.2.4.1
+黑嚕嚕－短線交易雷達 ST V1.2.4.2
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,7 +36,7 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.2.4.1"
+APP_VERSION = "ST V1.2.4.2"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
@@ -747,13 +747,14 @@ def theme_strategy_summary(detail: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     rows = []
     for key, x in d.groupby(["研究主題","週期","規則","持有"], dropna=False):
-        pf = x["Profit Factor"].replace([np.inf,-np.inf],np.nan)
+        pf_col = "PF" if "PF" in x.columns else ("Profit Factor" if "Profit Factor" in x.columns else None)
+        pf = x[pf_col].replace([np.inf,-np.inf],np.nan) if pf_col else pd.Series(dtype=float)
         rows.append({
             "研究主題":key[0],"週期":key[1],"規則":key[2],"持有":key[3],
             "股票數":int(x["股票"].nunique()),"總交易數":int(x["交易數"].sum()),
             "正期望股票比例":float((x["期望值%"]>0).mean()*100),
             "期望值中位數":float(x["期望值%"].median()),
-            "PF中位數":float(pf.median()),"平均勝率":float(x["勝率%"].mean()),
+            "PF中位數":float(pf.median()) if not pf.empty else np.nan,"平均勝率":float(x["勝率%"].mean()),
             "平均最大回撤":float(x["最大回撤%"].mean())
         })
     return pd.DataFrame(rows).sort_values(
@@ -802,6 +803,8 @@ def run_batch_matrix(symbols: List[str], intervals: List[str], rules: List[str],
 
     p.empty()
     detail = pd.DataFrame(all_rows)
+    if not detail.empty and "PF" not in detail.columns and "Profit Factor" in detail.columns:
+        detail["PF"] = detail["Profit Factor"]
     states_df = pd.DataFrame(states)
     cross = cross_stock_summary(detail[detail["交易數"] > 0].copy()) if not detail.empty else pd.DataFrame()
     sector_summary = sector_strategy_summary(detail)
@@ -1011,7 +1014,7 @@ if run:
                 )
         except Exception as e:
             st.error(f"分K健診中斷：{type(e).__name__}: {e}")
-            st.warning("股票池已保留。請先把TOP數降到20，或只勾15m＋60m再執行；確認資料層穩定後再擴大。")
+            st.warning("股票池已保留。若仍中斷，請把紅色錯誤訊息截圖給我。")
             st.stop()
         st.session_state["st_v120_batch"] = {
             "detail": batch_detail, "cross": cross, "states": states_df, "sector_summary": sector_summary, "theme_summary": theme_summary, "diagnostics": diagnostics, "symbols": symbols, "ranked_pool": ranked_pool
@@ -1296,6 +1299,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.2.4.1 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.2.4.2 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
