@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.2.3.1
+黑嚕嚕－短線交易雷達 ST V1.2.3.2
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,7 +36,7 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.2.3.1"
+APP_VERSION = "ST V1.2.3.2"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
@@ -508,138 +508,112 @@ def research_theme(symbol: str) -> str:
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def rank_short_term_pool(symbols: List[str], top_n: int = 30, lookback: str = "1mo") -> pd.DataFrame:
-    """
-    動態短線池：用近期日線資料衡量『可交易性』，不是預測漲跌。
-    主要使用20日成交金額中位數、20日成交量中位數、日內振幅與有效資料天數。
-    """
+    """一次批次下載母池日線，避免逐檔請求造成 Streamlit Cloud 中斷。"""
+    if not symbols:
+        return pd.DataFrame()
+    try:
+        raw = yf.download(
+            tickers=" ".join(symbols),
+            period=lookback,
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            threads=True,
+            group_by="ticker",
+        )
+    except Exception:
+        return pd.DataFrame()
+
     rows = []
     for symbol in symbols:
         try:
-            d = yf.download(
-                symbol, period=lookback, interval="1d",
-                auto_adjust=False, progress=False, threads=False
-            )
+            if isinstance(raw.columns, pd.MultiIndex):
+                if symbol not in raw.columns.get_level_values(0):
+                    continue
+                d = raw[symbol].copy()
+            else:
+                d = raw.copy()
+            needed = {"Close","High","Low","Volume"}
+            if not needed.issubset(d.columns):
+                continue
+            x = d.dropna(subset=["Close","High","Low","Volume"]).tail(20)
+            if len(x) < 8:
+                continue
+            turn = (x["Close"] * x["Volume"]).replace([np.inf,-np.inf], np.nan)
+            amp = ((x["High"]-x["Low"]) / x["Close"].replace(0,np.nan) * 100).replace([np.inf,-np.inf],np.nan)
+            rows.append({
+                "股票": symbol,
+                "研究主題": research_theme(symbol),
+                "有效日數": len(x),
+                "20日成交金額中位數": float(turn.median()),
+                "20日成交量中位數": float(x["Volume"].median()),
+                "20日振幅中位數%": float(amp.median()),
+            })
         except Exception:
             continue
-        if d is None or d.empty:
-            continue
-        if isinstance(d.columns, pd.MultiIndex):
-            try:
-                d.columns = d.columns.get_level_values(0)
-            except Exception:
-                pass
-        needed = {"Close","High","Low","Volume"}
-        if not needed.issubset(set(d.columns)):
-            continue
-        x = d.dropna(subset=["Close","High","Low","Volume"]).tail(20).copy()
-        if len(x) < 8:
-            continue
-        turnover = (x["Close"] * x["Volume"]).replace([np.inf,-np.inf], np.nan)
-        amp = ((x["High"] - x["Low"]) / x["Close"].replace(0,np.nan) * 100).replace([np.inf,-np.inf],np.nan)
-        med_turn = float(turnover.median())
-        med_vol = float(x["Volume"].median())
-        med_amp = float(amp.median())
-        rows.append({
-            "股票": symbol,
-            "研究主題": research_theme(symbol),
-            "有效日數": len(x),
-            "20日成交金額中位數": med_turn,
-            "20日成交量中位數": med_vol,
-            "20日振幅中位數%": med_amp,
-        })
 
     r = pd.DataFrame(rows)
     if r.empty:
         return r
-
-    # 百分位分數避免不同量綱互相壓制。流動性70%、振幅30%。
-    r["成交金額百分位"] = r["20日成交金額中位數"].rank(pct=True) * 100
-    r["成交量百分位"] = r["20日成交量中位數"].rank(pct=True) * 100
-    r["振幅百分位"] = r["20日振幅中位數%"].rank(pct=True) * 100
+    r["成交金額分位"] = r["20日成交金額中位數"].rank(pct=True)
+    r["成交量分位"] = r["20日成交量中位數"].rank(pct=True)
+    r["振幅分位"] = r["20日振幅中位數%"].rank(pct=True)
     r["短線可交易分"] = (
-        r["成交金額百分位"] * 0.50 +
-        r["成交量百分位"] * 0.20 +
-        r["振幅百分位"] * 0.30
+        r["成交金額分位"] * 50 +
+        r["成交量分位"] * 20 +
+        r["振幅分位"] * 30
     )
-    r = r.sort_values(["短線可交易分","20日成交金額中位數"], ascending=False)
-    return r.head(int(top_n)).reset_index(drop=True)
+    return r.sort_values("短線可交易分", ascending=False).head(int(top_n)).reset_index(drop=True)
 
 
-SECTOR_POOLS = {
-    "半導體/晶圓": ["2330", "2303", "5347", "6770"],
-    "IC設計": ["2454", "3034", "2379", "3443"],
-    "AI伺服器/ODM": ["2382", "3231", "6669", "2356"],
-    "電腦品牌/板卡": ["2357", "2376", "2377", "2395"],
-    "PCB/載板": ["3037", "8046", "3189", "4958"],
-    "散熱/機殼": ["3017", "3324", "3653", "8210"],
-    "網通": ["2345", "3596", "6285", "5388"],
-    "記憶體": ["2408", "2344", "8299", "3260"],
-    "面板": ["2409", "3481"],
-    "被動元件": ["2327", "2492", "3026"],
-    "電源/能源管理": ["2308", "6412", "6409"],
-    "封測": ["3711", "6239", "2449"],
-    "金融": ["2881", "2882", "2891", "2886"],
-    "航運": ["2603", "2609", "2615", "2618"],
-    "鋼鐵": ["2002", "2014", "2027"],
-    "塑化": ["1301", "1303", "1326"],
-    "生技": ["6446", "4743", "1795"],
-    "營建": ["2542", "5522", "2501"],
-}
+@st.cache_data(ttl=900, show_spinner=False)
+def download_intraday_batch(symbols: List[str], interval: str, period: str) -> Dict[str, pd.DataFrame]:
+    """每個週期一次抓整批股票，再切回單檔；大幅減少 Yahoo 請求數。"""
+    out = {s: pd.DataFrame() for s in symbols}
+    if not symbols:
+        return out
+    try:
+        raw = yf.download(
+            tickers=" ".join(symbols),
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+            progress=False,
+            threads=True,
+            prepost=False,
+            group_by="ticker",
+        )
+    except Exception:
+        return out
 
-def sector_symbols(selected_sectors: List[str], per_sector: int, market: str) -> List[str]:
-    out = []
-    for sec in selected_sectors:
-        for code in SECTOR_POOLS.get(sec, [])[:per_sector]:
-            s = normalize_symbol(code, market)
-            if s not in out:
-                out.append(s)
-    return out
-
-
-def parse_batch_codes(text: str, market: str) -> List[str]:
-    raw = text.replace("，", ",").replace("、", ",").replace("\n", ",").replace(" ", ",")
-    codes = []
-    for x in raw.split(","):
-        x = x.strip()
-        if not x:
+    for symbol in symbols:
+        try:
+            if isinstance(raw.columns, pd.MultiIndex):
+                if symbol not in raw.columns.get_level_values(0):
+                    continue
+                d = raw[symbol].copy()
+            else:
+                d = raw.copy()
+            need = ["Open","High","Low","Close","Volume"]
+            if not all(c in d.columns for c in need):
+                continue
+            d = d[need].copy()
+            for c in need:
+                d[c] = pd.to_numeric(d[c], errors="coerce")
+            d = d.dropna(subset=["Open","High","Low","Close"])
+            if d.empty:
+                continue
+            idx = pd.to_datetime(d.index)
+            if getattr(idx, "tz", None) is not None:
+                try:
+                    idx = idx.tz_convert("Asia/Taipei").tz_localize(None)
+                except Exception:
+                    idx = idx.tz_localize(None)
+            d.index = idx
+            out[symbol] = d.sort_index()
+        except Exception:
             continue
-        s = normalize_symbol(x, market)
-        if s not in codes:
-            codes.append(s)
-    return codes
-
-
-
-def code_from_symbol(symbol: str) -> str:
-    return str(symbol).split(".")[0]
-
-def sector_of_symbol(symbol: str) -> str:
-    code = code_from_symbol(symbol)
-    for sec, codes in SECTOR_POOLS.items():
-        if code in codes:
-            return sec
-    return "其他/手動"
-
-def sector_strategy_summary(detail: pd.DataFrame) -> pd.DataFrame:
-    if detail.empty:
-        return pd.DataFrame()
-    x = detail[detail["交易數"] > 0].copy()
-    if x.empty:
-        return pd.DataFrame()
-    x["族群"] = x["股票"].map(sector_of_symbol)
-
-    def positive_rate(s):
-        s = pd.to_numeric(s, errors="coerce").dropna()
-        return (s > 0).mean() * 100 if len(s) else np.nan
-
-    return x.groupby(["族群", "週期", "規則", "持有"], dropna=False).agg(
-        股票數=("股票", "nunique"),
-        總交易數=("交易數", "sum"),
-        正期望股票比例=("期望值%", positive_rate),
-        期望值中位數=("期望值%", "median"),
-        PF中位數=("ProfitFactor", "median"),
-        平均勝率=("勝率%", "mean"),
-    ).reset_index()
+    return out
 
 
 def cross_stock_summary(batch_summary: pd.DataFrame) -> pd.DataFrame:
@@ -689,42 +663,54 @@ def cross_stock_summary(batch_summary: pd.DataFrame) -> pd.DataFrame:
 
 def run_batch_matrix(symbols: List[str], intervals: List[str], rules: List[str], modes: List[str],
                      cost: CostConfig, period: str):
-    all_rows = []
-    states = []
+    all_rows, states = [], []
     total = max(1, len(symbols))
-    p = st.progress(0, text="跨股票驗證中…")
+    p = st.progress(0, text="批次下載分K資料…")
 
+    # 每個 interval 只呼叫 Yahoo 一次
+    interval_raw = {}
+    for i, interval in enumerate(intervals, 1):
+        interval_raw[interval] = download_intraday_batch(symbols, interval, period)
+        p.progress(min(0.25, 0.25*i/max(1,len(intervals))),
+                   text=f"完成 {interval} 批次下載｜{i}/{len(intervals)}")
+
+    success_count = {iv: 0 for iv in intervals}
     for idx, symbol in enumerate(symbols, 1):
         local_data = {}
         for interval in intervals:
-            raw = download_intraday(symbol, interval, period)
-            local_data[interval] = add_indicators(raw) if not raw.empty else pd.DataFrame()
+            raw = interval_raw.get(interval, {}).get(symbol, pd.DataFrame())
+            if not raw.empty:
+                success_count[interval] += 1
+                local_data[interval] = add_indicators(raw)
+            else:
+                local_data[interval] = pd.DataFrame()
 
         state = classify_stock_state(local_data)
         states.append({"股票": symbol, **state})
 
         for interval in intervals:
-            d = local_data.get(interval, pd.DataFrame())
+            d = local_data[interval]
             for rule in rules:
                 for mode in modes:
                     t = backtest(d, interval, rule, mode, cost)
                     m = metrics(t)
                     all_rows.append({
-                        "股票": symbol,
-                        "市場狀態": state["市場狀態"],
-                        "週期": interval,
-                        "規則": rule,
-                        "持有": mode,
-                        **m,
+                        "股票": symbol, "市場狀態": state["市場狀態"],
+                        "週期": interval, "規則": rule, "持有": mode, **m
                     })
-        p.progress(idx / total, text=f"{symbol}｜{idx}/{total}")
-    p.empty()
+        p.progress(0.25 + 0.75*idx/total, text=f"策略計算 {symbol}｜{idx}/{total}")
 
+    p.empty()
     detail = pd.DataFrame(all_rows)
     states_df = pd.DataFrame(states)
     cross = cross_stock_summary(detail[detail["交易數"] > 0].copy()) if not detail.empty else pd.DataFrame()
     sector_summary = sector_strategy_summary(detail)
-    return detail, cross, states_df, sector_summary
+    diagnostics = pd.DataFrame([
+        {"週期": iv, "要求股票數": len(symbols), "成功下載": success_count[iv],
+         "失敗/空資料": len(symbols)-success_count[iv]}
+        for iv in intervals
+    ])
+    return detail, cross, states_df, sector_summary, diagnostics
 
 
 def run_matrix(symbol: str, intervals: List[str], rules: List[str], modes: List[str],
@@ -863,23 +849,17 @@ with st.sidebar:
         "進場規則",
         all_rules,
         default=[
-            "MA5上穿MA15",
             "KD黃金交叉",
-            "MA5>15 + KD黃金交叉",
-            "MA5>15>30 + KD黃金交叉",
-            "完整多頭排列 + KD黃金交叉",
             "KD黃金交叉 + K<30",
-            "KD黃金交叉 + K50-80",
             "KD黃金交叉 + MA30向上",
             "KD黃金交叉 + MA60向上",
-            "KD黃金交叉 + 量比>1.2",
             "KD黃金交叉 + 站上VWAP",
         ],
     )
     selected_modes = st.multiselect(
         "持有方式",
         ["當沖", "隔日", "2日", "3日", "5日"],
-        default=["當沖", "隔日", "3日", "5日"],
+        default=["3日", "5日"],
     )
 
     st.divider()
@@ -927,7 +907,7 @@ if run:
 
         try:
             with st.spinner(f"跨股票策略健診：{len(symbols)} 檔…"):
-                batch_detail, cross, states_df, sector_summary = run_batch_matrix(
+                batch_detail, cross, states_df, sector_summary, diagnostics = run_batch_matrix(
                     symbols, selected_intervals, selected_rules, selected_modes, cost, period
                 )
         except Exception as e:
@@ -935,13 +915,11 @@ if run:
             st.warning("股票池已保留。請先把TOP數降到20，或只勾15m＋60m再執行；確認資料層穩定後再擴大。")
             st.stop()
         st.session_state["st_v120_batch"] = {
-            "detail": batch_detail, "cross": cross, "states": states_df, "sector_summary": sector_summary, "symbols": symbols, "ranked_pool": ranked_pool
+            "detail": batch_detail, "cross": cross, "states": states_df, "sector_summary": sector_summary, "diagnostics": diagnostics, "symbols": symbols, "ranked_pool": ranked_pool
         }
-        # 同時載入第一檔供圖表/單股頁查看
+        # 批次完成後不再重跑第一檔，避免再次下載造成中斷。
         symbol = symbols[0]
-        summary, data_map, trade_map = run_matrix(
-            symbol, selected_intervals, selected_rules, selected_modes, cost, period
-        )
+        summary, data_map, trade_map = pd.DataFrame(), {}, {}
     else:
         with st.spinner(f"下載 {symbol} 分K並回測…"):
             summary, data_map, trade_map = run_matrix(
@@ -1204,6 +1182,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.2.3.1 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.2.3.2 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
