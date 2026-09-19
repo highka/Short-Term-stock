@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.2.3.3
+黑嚕嚕－短線交易雷達 ST V1.2.3.4
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,7 +36,7 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.2.3.3"
+APP_VERSION = "ST V1.2.3.4"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
@@ -1021,7 +1021,11 @@ if state:
 
     with tab1:
         st.subheader(f"{symbol}｜多週期基準比較")
-        valid = summary[summary["交易數"] > 0].copy()
+        valid = (
+    summary[summary["交易數"] > 0].copy()
+    if isinstance(summary, pd.DataFrame) and (not summary.empty) and ("交易數" in summary.columns)
+    else pd.DataFrame()
+)
         if valid.empty:
             st.warning("目前條件沒有產生足夠交易。可換股票、延長資料或放寬進場規則。")
         else:
@@ -1260,6 +1264,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.2.3.3 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.2.3.4 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
