@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.2.4.2
+黑嚕嚕－短線交易雷達 ST V1.2.5
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,7 +36,7 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.2.4.2"
+APP_VERSION = "ST V1.2.5"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
@@ -246,7 +246,7 @@ def find_exit_index(d: pd.DataFrame, entry_i: int, mode: str, interval: str) -> 
             j += 1
         return j if j > entry_i else None
 
-    day_map = {"隔日": 1, "2日": 2, "3日": 3, "5日": 5}
+    day_map = {"隔日": 1, "2日": 2, "3日": 3, "4日": 4, "5日": 5, "6日": 6, "7日": 7}
     target_days = day_map.get(mode, 1)
     seen = []
     for j in range(entry_i + 1, len(d)):
@@ -331,6 +331,25 @@ def backtest(
 
     return pd.DataFrame(rows)
 
+
+def enforce_non_overlapping(trades: pd.DataFrame) -> pd.DataFrame:
+    """同一股票/策略採單一持倉：前一筆尚未出場時，忽略後續新訊號。"""
+    if trades is None or trades.empty:
+        return trades
+    entry_col = next((c for c in ["進場時間","進場日期","EntryTime"] if c in trades.columns), None)
+    exit_col = next((c for c in ["出場時間","出場日期","ExitTime"] if c in trades.columns), None)
+    if not entry_col or not exit_col:
+        return trades
+    t = trades.copy()
+    t[entry_col] = pd.to_datetime(t[entry_col])
+    t[exit_col] = pd.to_datetime(t[exit_col])
+    t = t.sort_values(entry_col)
+    keep, last_exit = [], None
+    for idx, row in t.iterrows():
+        if last_exit is None or row[entry_col] > last_exit:
+            keep.append(idx)
+            last_exit = row[exit_col]
+    return t.loc[keep].reset_index(drop=True)
 
 def metrics(trades: pd.DataFrame) -> Dict[str, float]:
     if trades is None or trades.empty:
@@ -762,7 +781,7 @@ def theme_strategy_summary(detail: pd.DataFrame) -> pd.DataFrame:
         ascending=[False,False,False,False]).reset_index(drop=True)
 
 def run_batch_matrix(symbols: List[str], intervals: List[str], rules: List[str], modes: List[str],
-                     cost: CostConfig, period: str):
+                     cost: CostConfig, period: str, allow_overlap: bool = False):
     all_rows, states = [], []
     total = max(1, len(symbols))
     p = st.progress(0, text="批次下載分K資料…")
@@ -793,7 +812,12 @@ def run_batch_matrix(symbols: List[str], intervals: List[str], rules: List[str],
             for rule in rules:
                 for mode in modes:
                     t = backtest(d, interval, rule, mode, cost)
+                    raw_signal_count = len(t)
+                    if not allow_overlap:
+                        t = enforce_non_overlapping(t)
                     m = metrics(t)
+                    m["原始訊號數"] = raw_signal_count
+                    m["重疊排除數"] = raw_signal_count - len(t)
                     all_rows.append({
                         "股票": symbol, "研究主題": research_theme(symbol),
                         "市場狀態": state["市場狀態"],
@@ -958,10 +982,18 @@ with st.sidebar:
             "KD黃金交叉 + 站上VWAP",
         ],
     )
+    overlap_mode = st.radio(
+        "持倉期間新訊號處理",
+        ["禁止重疊（較接近實際單一持倉）", "允許重疊（訊號事件研究）"],
+        horizontal=True,
+        help="禁止重疊：同一股票持倉尚未結束時忽略新訊號；允許重疊：保留舊版訊號事件統計。",
+    )
+    allow_overlap = overlap_mode.startswith("允許")
+
     selected_modes = st.multiselect(
         "持有方式",
-        ["當沖", "隔日", "2日", "3日", "5日"],
-        default=["3日", "5日"],
+        ["當沖", "隔日", "2日", "3日", "4日", "5日", "6日", "7日"],
+        default=["隔日", "2日", "3日", "4日", "5日", "6日", "7日"],
     )
 
     st.divider()
@@ -1010,14 +1042,14 @@ if run:
         try:
             with st.spinner(f"跨股票策略健診：{len(symbols)} 檔…"):
                 batch_detail, cross, states_df, sector_summary, theme_summary, diagnostics = run_batch_matrix(
-                    symbols, selected_intervals, selected_rules, selected_modes, cost, period
+                    symbols, selected_intervals, selected_rules, selected_modes, cost, period, allow_overlap
                 )
         except Exception as e:
             st.error(f"分K健診中斷：{type(e).__name__}: {e}")
             st.warning("股票池已保留。若仍中斷，請把紅色錯誤訊息截圖給我。")
             st.stop()
         st.session_state["st_v120_batch"] = {
-            "detail": batch_detail, "cross": cross, "states": states_df, "sector_summary": sector_summary, "theme_summary": theme_summary, "diagnostics": diagnostics, "symbols": symbols, "ranked_pool": ranked_pool
+            "detail": batch_detail, "cross": cross, "states": states_df, "sector_summary": sector_summary, "theme_summary": theme_summary, "diagnostics": diagnostics, "symbols": symbols, "ranked_pool": ranked_pool, "allow_overlap": allow_overlap
         }
         # 批次完成後不再重跑第一檔，避免再次下載造成中斷。
         symbol = symbols[0]
@@ -1299,6 +1331,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.2.4.2 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.2.5 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
