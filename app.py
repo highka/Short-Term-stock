@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.2.6
+黑嚕嚕－短線交易雷達 ST V1.2.7
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,13 +36,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.2.6"
+APP_VERSION = "ST V1.2.7"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.2.6"
-EXPORT_PREFIX = "ST_V1.2.6"
+APP_VERSION = "ST_V1.2.7"
+EXPORT_PREFIX = "ST_V1.2.7"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -958,7 +958,10 @@ with st.sidebar:
     market = st.radio("市場", ["上市", "上櫃"], horizontal=True)
     symbol = normalize_symbol(code, market)
 
-    selected_intervals = st.multiselect("K棒週期", INTERVALS, default=INTERVALS)
+    selected_intervals = st.multiselect(
+        "K棒週期", INTERVALS, default=["60m"],
+        help="V1.2.7 預設只驗證目前最穩定的60m；需要對照時仍可自行加入15m/5m。"
+    )
     period = st.selectbox("研究資料長度", ["60d", "1mo"], index=0)
 
     all_rules = [
@@ -985,11 +988,8 @@ with st.sidebar:
     selected_rules = st.multiselect(
         "進場規則",
         all_rules,
-        default=[
-            "KD黃金交叉",
-            "KD黃金交叉 + K<30",
-            "KD黃金交叉 + 站上VWAP",
-        ],
+        default=["KD黃金交叉 + K<30"],
+        help="V1.2.7 先鎖定已通過30檔驗證的核心規則，避免同時測太多條件造成多重比較偏誤。",
     )
     overlap_mode = st.radio(
         "持倉期間新訊號處理",
@@ -1002,8 +1002,11 @@ with st.sidebar:
     selected_modes = st.multiselect(
         "持有方式",
         ["當沖", "隔日", "2日", "3日", "4日", "5日", "6日", "7日"],
-        default=["隔日", "2日", "3日", "4日", "5日", "6日", "7日"],
+        default=["4日", "5日", "6日", "7日"],
     )
+
+    if research_mode == "跨股票批次":
+        st.caption("V1.2.7 驗證門檻：優先觀察 60m｜KD黃金交叉+K<30｜4~7日；若TOP50仍維持正期望股票比例≥70%、期望中位數>0、PF中位數>1.2，再進入下一階段。")
 
     st.divider()
     st.subheader("交易成本")
@@ -1013,8 +1016,8 @@ with st.sidebar:
 
     combo_est = max(1, len(selected_intervals)) * max(1, len(selected_rules)) * max(1, len(selected_modes))
     if research_mode == "跨股票批次" and pool_mode == "動態短線TOP池":
-        st.info(f"本次預計：TOP {top_n} × {len(selected_intervals)}週期 × {len(selected_rules)}規則 × {len(selected_modes)}持有方式；先完成股票池，再逐檔健診。")
-        if top_n > 30:
+        st.info(f"本次預計：TOP {top_n} × {len(selected_intervals)}週期 × {len(selected_rules)}規則 × {len(selected_modes)}持有方式。V1.2.7 建議 TOP50，用來確認30檔結果的樣本穩健度。")
+        if top_n > 50:
             st.warning("目前仍使用 yfinance。一次超過30檔容易遇到下載限制或執行時間過長；建議先20～30檔分批驗證。")
     run = st.button("🚀 開始策略健診", type="primary", use_container_width=True)
 
@@ -1349,6 +1352,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.2.6 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.2.7 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
