@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.3.2
+黑嚕嚕－短線交易雷達 ST V1.3.3
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,13 +36,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.3.2"
+APP_VERSION = "ST V1.3.3"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.3.2"
-EXPORT_PREFIX = "ST_V1.3.2"
+APP_VERSION = "ST_V1.3.3"
+EXPORT_PREFIX = "ST_V1.3.3"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -289,7 +289,12 @@ def build_multitimeframe_5m_signal(
     env = base["ENV_60M_LOW"].fillna(False)
     confirm = base["CONFIRM_15M_RECENT"].fillna(False)
 
-    if entry_rule == "5m KD黃金交叉":
+    confirm_start = confirm & ~confirm.shift(1, fill_value=False)
+
+    if entry_rule == "15m確認後首根5m":
+        # 對照組：不再等待5m第二次KD交叉，直接用15m確認後第一根可交易5m。
+        trigger = confirm_start
+    elif entry_rule == "5m KD黃金交叉":
         trigger = base["KD_GOLD"].fillna(False)
     elif entry_rule == "5m MA5上穿MA15":
         trigger = base["MA5_XUP_MA15"].fillna(False)
@@ -360,6 +365,13 @@ def run_multitimeframe_batch(
                 m = metrics(t)
                 m["原始訊號數"] = raw_count
                 m["重疊排除數"] = raw_count - len(t)
+                if not t.empty and "進場時間" in t.columns:
+                    et = pd.to_datetime(t["進場時間"], errors="coerce")
+                    mins = et.dt.hour * 60 + et.dt.minute
+                    m["09:00-10:29交易數"] = int((mins < 630).sum())
+                    m["10:30-11:59交易數"] = int(((mins >= 630) & (mins < 720)).sum())
+                    m["12:00-12:59交易數"] = int(((mins >= 720) & (mins < 780)).sum())
+                    m["13:00後交易數"] = int((mins >= 780).sum())
                 rule_name = f"60m K<30 → 15m KD黃金交叉 → {er}"
                 all_rows.append({
                     "股票": symbol,
@@ -1180,16 +1192,16 @@ with st.sidebar:
 
     if research_mode == "多週期當沖/隔日驗證":
         st.markdown("#### V1.3.0 多週期進場")
-        st.caption("固定 60m K<30 作環境、15m KD黃金交叉作確認，再比較不同5m觸發。")
+        st.caption("固定60m K<30＋15m KD黃金交叉；V1.3.3加入「15m確認後首根5m」對照組，檢查等待5m KD是否反而延遲進場。")
         mtf_entry_rules = st.multiselect(
             "5分鐘進場觸發",
-            ["5m KD黃金交叉", "5m MA5上穿MA15", "5m KD黃金交叉+站上VWAP"],
-            default=["5m KD黃金交叉", "5m KD黃金交叉+站上VWAP"],
+            ["15m確認後首根5m", "5m KD黃金交叉", "5m MA5上穿MA15", "5m KD黃金交叉+站上VWAP"],
+            default=["15m確認後首根5m", "5m KD黃金交叉"],
         )
         mtf_modes = st.multiselect(
             "短線出場方式",
             ["當沖", "隔日", "2日"],
-            default=["當沖", "隔日"],
+            default=["當沖", "隔日", "2日"],
         )
     else:
         mtf_entry_rules = []
@@ -1339,7 +1351,7 @@ if research_mode == "多週期當沖/隔日驗證" and mtf_state:
             mime="text/csv",
             use_container_width=True,
         )
-    st.info("下一輪請提供這3個中文下載檔：①【多週期跨股票穩定度】②【多週期批次策略明細】③【多週期逐筆交易明細】。三個按鈕名稱與實際CSV檔名已統一。")
+    st.info("下一輪請提供：①【多週期跨股票穩定度】②【多週期批次策略明細】③【多週期逐筆交易明細】。本輪會比較「15m確認立即進場」與「再等5m KD」及當沖/隔日/2日。")
 
 state = st.session_state.get("st_v120")
 batch_state = st.session_state.get("st_v120_batch")
@@ -1614,6 +1626,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.3.2 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.3.3 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
