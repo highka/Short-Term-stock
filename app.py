@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.13.1
+黑嚕嚕－短線交易雷達 ST V1.13.2
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -38,13 +38,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.13.1"
+APP_VERSION = "ST V1.13.2"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.13.1"
-EXPORT_PREFIX = "ST_V1.13.1"
+APP_VERSION = "ST_V1.13.2"
+EXPORT_PREFIX = "ST_V1.13.2"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1160,6 +1160,70 @@ def download_daily_batches(symbols: List[str], period: str="2mo", batch_size: in
             continue
     return out
 
+
+
+
+def validate_fullmarket_candidate_groups(cost: CostConfig, period: str="3mo"):
+    """
+    V1.13.2 初步策略A/B：
+    1) 先用當前全市場資料建立核心TOP100 + 前20%流動性中的熱門增補；
+    2) 對兩組分別跑固定核心策略 60m KD黃金交叉 + K<30 + 5日；
+    3) 僅做結構驗證。由於股票組別是用『目前』資料定義，仍存在 current-selection bias，
+       不可視為最終walk-forward驗證。
+    """
+    pool, pool_summary, errors = build_full_market_pool_diagnostics(top_n=100)
+    if pool is None or pool.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pool_summary, errors
+
+    core = pool.loc[pool["核心TOP100"]=="是","股票"].dropna().astype(str).tolist()
+    hot = pool.loc[pool["熱門增補候選"]=="是","股票"].dropna().astype(str).tolist()
+    all_syms = list(dict.fromkeys(core + hot))
+    group_map={s:"核心TOP100" for s in core}
+    for s in hot:
+        group_map[s]="熱門增補"
+
+    summary, _, trades = run_oos_60m_5d(all_syms, cost, period, allow_overlap=False, train_ratio=0.60)
+    if trades is None or trades.empty:
+        return pd.DataFrame(), pd.DataFrame(), pool, pool_summary, errors
+
+    t=trades.copy()
+    t["股票池組別"]=t["股票"].map(group_map).fillna("其他")
+    rows=[]
+    for sample in ["全部","樣本內60%","樣本外40%"]:
+        xs=t if sample=="全部" else t[t["樣本"]==sample]
+        for group in ["核心TOP100","熱門增補","全部候選"]:
+            g=xs if group=="全部候選" else xs[xs["股票池組別"]==group]
+            m=aggregate_trade_metrics(g)
+            rows.append({
+                "樣本":sample,"組別":group,"股票數":int(g["股票"].nunique()) if len(g) else 0,
+                "交易數":len(g),**m
+            })
+    ab=pd.DataFrame(rows)
+
+    # 四段時間穩定度
+    ts=pd.to_datetime(t["訊號時間"],errors="coerce")
+    tb=[]
+    ok=ts.notna()
+    z=t.loc[ok].copy()
+    ts=ts.loc[ok]
+    if len(z):
+        edges=pd.date_range(ts.min(),ts.max(),periods=5)
+        labels=["第1段","第2段","第3段","第4段"]
+        z["時間段"]=pd.cut(ts,bins=edges,labels=labels,include_lowest=True,right=True)
+        for block in labels:
+            q=z[z["時間段"]==block]
+            for group in ["核心TOP100","熱門增補","全部候選"]:
+                g=q if group=="全部候選" else q[q["股票池組別"]==group]
+                m=aggregate_trade_metrics(g)
+                tb.append({
+                    "時間段":block,
+                    "起始":str(edges[labels.index(block)]),
+                    "結束":str(edges[labels.index(block)+1]),
+                    "組別":group,
+                    "股票數":int(g["股票"].nunique()) if len(g) else 0,
+                    "交易數":len(g),**m
+                })
+    return ab,pd.DataFrame(tb),pool,pool_summary,errors
 
 
 def summarize_liquidity_thresholds(full_df: pd.DataFrame):
@@ -2366,8 +2430,8 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["全市場股票池研究","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
-            if research_mode in ["全市場股票池研究","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
+                ["全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
+            if research_mode in ["全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
                 st.caption("本模式只分析股票池，不執行策略回測。")
             else:
                 code = st.text_input("股票代號", value="2330")
@@ -2382,7 +2446,7 @@ with st.sidebar:
                 "KD黃金交叉 + MA30向上","KD黃金交叉 + MA60向上","KD黃金交叉 + 量比>1.2",
                 "KD黃金交叉 + 量比>1.5","KD黃金交叉 + 站上VWAP","MA5>15 + KD + 站上VWAP"
             ]
-            if research_mode not in ["全市場股票池研究","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
+            if research_mode not in ["全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
                 selected_rules = st.multiselect("進場規則", all_rules, default=["KD黃金交叉 + K<30"])
                 selected_modes = st.multiselect("持有方式",
                     ["當沖","隔日","2日","3日","4日","5日","6日","7日"], default=["5日"])
@@ -2405,12 +2469,43 @@ with st.sidebar:
         slip_bp = st.number_input("單邊滑價（bp）", min_value=0.0, max_value=30.0, value=5.0, step=1.0)
     cost = CostConfig(fee_discount=fee_discount, slippage_pct=slip_bp / 10000)
 
-    _btn_label = "🔄 更新今日雷達" if simple_mode=="今日雷達" else ("🧭 開始股票池研究" if research_mode in ["全市場股票池研究","股票池2.0研究","股票池2.0歷史驗證","股票池健診"] else "🚀 開始策略健診")
+    _btn_label = "🔄 更新今日雷達" if simple_mode=="今日雷達" else ("🧭 開始股票池研究" if research_mode in ["全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"] else "🚀 開始策略健診")
     run = st.button(_btn_label, type="primary", use_container_width=True)
 
 
 if simple_mode == "今日雷達":
     st.markdown("""<style>div[data-baseweb="tab-list"]{display:none!important;}</style>""", unsafe_allow_html=True)
+
+if run and simple_mode=="進階研究" and research_mode=="全市場候選策略驗證":
+    st.subheader("🧪 全市場候選策略驗證")
+    st.caption("固定60m KD黃金交叉＋K<30＋持有5日；比較核心TOP100與熱門增補。此版為目前股票池定義的初步A/B，尚非最終Walk-Forward。")
+    with st.spinner("建立全市場候選池並下載60m資料進行固定策略驗證…"):
+        _ab,_blocks,_pool,_pool_sum,_errs=validate_fullmarket_candidate_groups(cost,period="3mo")
+    st.session_state["st_v1132_fullmarket_ab"]={
+        "ab":_ab,"blocks":_blocks,"pool":_pool,"pool_summary":_pool_sum,"errors":_errs
+    }
+
+_fab=st.session_state.get("st_v1132_fullmarket_ab")
+if simple_mode=="進階研究" and research_mode=="全市場候選策略驗證" and _fab:
+    _ab=_fab.get("ab",pd.DataFrame()); _bl=_fab.get("blocks",pd.DataFrame())
+    _pp=_fab.get("pool",pd.DataFrame()); _ps=_fab.get("pool_summary",pd.DataFrame()); _er=_fab.get("errors",[])
+    st.subheader("🧪 全市場候選策略驗證結果")
+    if _er:
+        st.warning("部分官方來源讀取異常："+"；".join(_er))
+    st.warning("重要：本版股票組別由『目前』全市場資料定義，因此仍有 current-selection bias。結果只用來判斷熱門增補是否值得進入下一階段Walk-Forward，不作最終策略結論。")
+    if not _ab.empty:
+        st.markdown("#### 核心TOP100 vs 熱門增補｜全部 / 樣本內 / 樣本外")
+        st.dataframe(_ab.round(3),use_container_width=True,hide_index=True)
+    if not _bl.empty:
+        st.markdown("#### 四段時間穩定度")
+        st.dataframe(_bl.round(3),use_container_width=True,hide_index=True)
+    st.download_button("⬇️ 下載【全市場候選策略A_B摘要】",_ab.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_全市場候選策略A_B摘要.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【全市場候選策略四段穩定度】",_bl.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_全市場候選策略四段穩定度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【全市場候選股票池】",_pp.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_全市場候選股票池.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.success("結果已保存；三份檔案可連續下載，不需重跑。")
 
 if run and simple_mode=="進階研究" and research_mode=="全市場股票池研究":
     st.subheader("🌐 全市場股票池研究")
@@ -2562,7 +2657,7 @@ if run:
         st.error("請至少選擇一個K棒週期、進場規則與持有方式。")
         st.stop()
 
-    if research_mode in ["全市場股票池研究","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
+    if research_mode in ["全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
         # 股票池研究已在上方獨立完成。：股票池健診已在上方獨立完成。
         # 初始化舊版共用變數，避免後續 session 儲存引用未定義的 summary。
         summary, data_map, trade_map = pd.DataFrame(), {}, {}
@@ -3100,6 +3195,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.13.1 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.13.2 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
