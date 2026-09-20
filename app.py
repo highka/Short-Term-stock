@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.10.1
+黑嚕嚕－短線交易雷達 ST V1.11.0
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,13 +36,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.10.1"
+APP_VERSION = "ST V1.11.0"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.10.1"
-EXPORT_PREFIX = "ST_V1.10.1"
+APP_VERSION = "ST_V1.11.0"
+EXPORT_PREFIX = "ST_V1.11.0"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1833,129 +1833,75 @@ def plot_chart(d: pd.DataFrame, interval: str):
 
 
 st.title(f"⚡ {APP_NAME}")
-st.caption(f"{APP_VERSION}｜獨立短線研究版｜MA5 / 15 / 30 / 60 / 200 + KD｜5m / 15m / 60m")
-
-st.info(
-    "本版先做『基準模型』：刻意不加入 VWAP、MACD、ATR、量比等其他指標。"
-    "先驗證 MA + KD 在不同K棒與持有方式的表現，再依結果決定新增什麼，避免一開始過度最佳化。"
-)
+st.caption(f"{APP_VERSION}｜今日60m短線雷達｜核心：KD黃金交叉 + K<30")
+st.info("主畫面只保留每天會看的雷達；研究參數與成本設定收進進階區，減少操作干擾。")
 
 with st.sidebar:
-    st.header("研究設定")
-    st.info("V1.5.0 預設進入【60m五日OOS驗證】；多週期當沖線已完成初步驗證，暫不繼續加參數。")
-    research_mode = st.radio("研究模式", ["單一股票", "跨股票批次", "多週期當沖/隔日驗證", "60m五日OOS驗證"], index=3, horizontal=True)
-    code = st.text_input("股票代號", value="2330")
-    pool_mode = st.radio(
-        "批次股票池",
-        ["手動輸入", "族群代表池", "動態短線TOP池"],
-        horizontal=True,
-        disabled=(research_mode != "跨股票批次"),
-    )
-    batch_text = st.text_area(
-        "批次股票代號",
-        value="2330,2357,3711,2317,2454,2382",
-        help="用逗號分隔。",
-        disabled=(research_mode != "跨股票批次" or pool_mode != "手動輸入"),
-    )
-    selected_sectors = st.multiselect(
-        "選擇族群",
-        list(SECTOR_POOLS.keys()),
-        default=["半導體/晶圓", "IC設計", "AI伺服器/ODM", "電腦品牌/板卡", "封測", "航運"],
-        disabled=(research_mode != "跨股票批次" or pool_mode != "族群代表池"),
-    )
-    per_sector = st.slider(
-        "每族群代表檔數",
-        1, 4, 3,
-        disabled=(research_mode != "跨股票批次" or pool_mode != "族群代表池"),
-    )
-    top_n = st.slider(
-        "動態短線池檔數",
-        10, 100, 50, step=10,
-        disabled=not (research_mode in ["多週期當沖/隔日驗證","60m五日OOS驗證"] or (research_mode == "跨股票批次" and pool_mode == "動態短線TOP池")),
-        help="先由候選母池用近期成交金額、成交量與振幅排序，再對入選股票執行分K策略健診。",
-    )
-    market = st.radio("市場", ["上市", "上櫃"], horizontal=True)
+    st.header("⚡ 今日雷達")
+    st.caption("標準研究設定已固定。日常使用只要按更新。")
+
+    simple_mode = st.radio("操作模式", ["今日雷達", "進階研究"], index=0)
+    research_mode = "60m五日OOS驗證"
+    top_n = st.slider("掃描股票數", 20, 100, 100, step=10)
+    period = st.selectbox("資料長度", ["60d", "1mo"], index=0)
+
+    selected_intervals = ["60m"]
+    selected_rules = ["KD黃金交叉 + K<30"]
+    selected_modes = ["5日"]
+    overlap_mode = "禁止重疊（較接近實際單一持倉）"
+    allow_overlap = False
+    code, market = "2330", "上市"
     symbol = normalize_symbol(code, market)
+    pool_mode = "動態短線TOP池"
+    batch_text = "2330,2357,3711,2317,2454,2382"
+    selected_sectors = ["半導體/晶圓", "IC設計", "AI伺服器/ODM"]
+    per_sector = 3
+    mtf_entry_rules, mtf_modes = [], []
 
-    selected_intervals = st.multiselect(
-        "K棒週期", INTERVALS, default=["60m"],
-        help="V1.2.7 預設只驗證目前最穩定的60m；需要對照時仍可自行加入15m/5m。"
-    )
-    period = st.selectbox("研究資料長度", ["60d", "1mo"], index=0)
+    with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
+        if simple_mode == "進階研究":
+            research_mode = st.radio("研究模式",
+                ["單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=3)
+            code = st.text_input("股票代號", value="2330")
+            market = st.radio("市場", ["上市","上櫃"], horizontal=True)
+            symbol = normalize_symbol(code, market)
+            selected_intervals = st.multiselect("K棒週期", INTERVALS, default=["60m"])
+            all_rules = [
+                "MA5上穿MA15","MA15上穿MA30","KD黃金交叉","MA5>15 + KD黃金交叉",
+                "MA5>15>30 + KD黃金交叉","MA5>15>30>60 + KD黃金交叉","完整多頭排列",
+                "完整多頭排列 + KD黃金交叉","站上MA200 + KD黃金交叉","KD黃金交叉 + K<30",
+                "KD黃金交叉 + K30-50","KD黃金交叉 + K50-80","KD黃金交叉 + K>80",
+                "KD黃金交叉 + MA30向上","KD黃金交叉 + MA60向上","KD黃金交叉 + 量比>1.2",
+                "KD黃金交叉 + 量比>1.5","KD黃金交叉 + 站上VWAP","MA5>15 + KD + 站上VWAP"
+            ]
+            selected_rules = st.multiselect("進場規則", all_rules, default=["KD黃金交叉 + K<30"])
+            selected_modes = st.multiselect("持有方式",
+                ["當沖","隔日","2日","3日","4日","5日","6日","7日"], default=["5日"])
+            overlap_mode = st.radio("持倉期間新訊號",
+                ["禁止重疊（較接近實際單一持倉）","允許重疊（訊號事件研究）"])
+            allow_overlap = overlap_mode.startswith("允許")
+            if research_mode == "跨股票批次":
+                pool_mode = st.radio("批次股票池", ["手動輸入","族群代表池","動態短線TOP池"], index=2)
+                batch_text = st.text_area("批次股票代號", value=batch_text)
+                selected_sectors = st.multiselect("選擇族群", list(SECTOR_POOLS.keys()), default=selected_sectors)
+                per_sector = st.slider("每族群代表檔數",1,4,3)
+            if research_mode == "多週期當沖/隔日驗證":
+                mtf_entry_rules = st.multiselect("5分鐘進場觸發",
+                    ["15m確認後首根5m","5m KD黃金交叉","5m MA5上穿MA15","5m KD黃金交叉+站上VWAP"],
+                    default=["15m確認後首根5m","5m KD黃金交叉"])
+                mtf_modes = st.multiselect("短線出場方式", ["當沖","隔日","2日"], default=["當沖","隔日","2日"])
 
-    all_rules = [
-        "MA5上穿MA15",
-        "MA15上穿MA30",
-        "KD黃金交叉",
-        "MA5>15 + KD黃金交叉",
-        "MA5>15>30 + KD黃金交叉",
-        "MA5>15>30>60 + KD黃金交叉",
-        "完整多頭排列",
-        "完整多頭排列 + KD黃金交叉",
-        "站上MA200 + KD黃金交叉",
-        "KD黃金交叉 + K<30",
-        "KD黃金交叉 + K30-50",
-        "KD黃金交叉 + K50-80",
-        "KD黃金交叉 + K>80",
-        "KD黃金交叉 + MA30向上",
-        "KD黃金交叉 + MA60向上",
-        "KD黃金交叉 + 量比>1.2",
-        "KD黃金交叉 + 量比>1.5",
-        "KD黃金交叉 + 站上VWAP",
-        "MA5>15 + KD + 站上VWAP",
-    ]
-    selected_rules = st.multiselect(
-        "進場規則",
-        all_rules,
-        default=["KD黃金交叉 + K<30"],
-        help="V1.2.7 先鎖定已通過30檔驗證的核心規則，避免同時測太多條件造成多重比較偏誤。",
-    )
-    overlap_mode = st.radio(
-        "持倉期間新訊號處理",
-        ["禁止重疊（較接近實際單一持倉）", "允許重疊（訊號事件研究）"],
-        horizontal=True,
-        help="禁止重疊：同一股票持倉尚未結束時忽略新訊號；允許重疊：保留舊版訊號事件統計。",
-    )
-    allow_overlap = overlap_mode.startswith("允許")
-
-    selected_modes = st.multiselect(
-        "持有方式",
-        ["當沖", "隔日", "2日", "3日", "4日", "5日", "6日", "7日"],
-        default=["4日", "5日", "6日", "7日"],
-    )
-
-    if research_mode == "跨股票批次":
-        st.caption("V1.2.7 驗證門檻：優先觀察 60m｜KD黃金交叉+K<30｜4~7日；若TOP50仍維持正期望股票比例≥70%、期望中位數>0、PF中位數>1.2，再進入下一階段。")
-
-    if research_mode == "多週期當沖/隔日驗證":
-        st.markdown("#### V1.3.0 多週期進場")
-        st.caption("固定60m K<30＋15m KD黃金交叉；V1.3.3加入「15m確認後首根5m」對照組，檢查等待5m KD是否反而延遲進場。")
-        mtf_entry_rules = st.multiselect(
-            "5分鐘進場觸發",
-            ["15m確認後首根5m", "5m KD黃金交叉", "5m MA5上穿MA15", "5m KD黃金交叉+站上VWAP"],
-            default=["15m確認後首根5m", "5m KD黃金交叉"],
-        )
-        mtf_modes = st.multiselect(
-            "短線出場方式",
-            ["當沖", "隔日", "2日"],
-            default=["當沖", "隔日", "2日"],
-        )
-    else:
-        mtf_entry_rules = []
-        mtf_modes = []
-
-    st.divider()
-    st.subheader("交易成本")
-    fee_discount = st.number_input("手續費折數", min_value=0.1, max_value=1.0, value=0.28, step=0.01)
-    slip_bp = st.number_input("單邊滑價（bp）", min_value=0.0, max_value=30.0, value=5.0, step=1.0)
+    with st.expander("💰 成本設定"):
+        fee_discount = st.number_input("手續費折數", min_value=0.1, max_value=1.0, value=0.28, step=0.01)
+        slip_bp = st.number_input("單邊滑價（bp）", min_value=0.0, max_value=30.0, value=5.0, step=1.0)
     cost = CostConfig(fee_discount=fee_discount, slippage_pct=slip_bp / 10000)
 
-    combo_est = max(1, len(selected_intervals)) * max(1, len(selected_rules)) * max(1, len(selected_modes))
-    if research_mode == "跨股票批次" and pool_mode == "動態短線TOP池":
-        st.info(f"本次預計：TOP {top_n} × {len(selected_intervals)}週期 × {len(selected_rules)}規則 × {len(selected_modes)}持有方式。V1.2.7 建議 TOP50，用來確認30檔結果的樣本穩健度。")
-        if top_n > 50:
-            st.warning("目前仍使用 yfinance。若超過50檔遇到下載限制或執行時間過長，先維持50檔即可。")
-    run = st.button("🚀 開始策略健診", type="primary", use_container_width=True)
+    run = st.button("🔄 更新今日雷達" if simple_mode=="今日雷達" else "🚀 開始策略健診",
+                    type="primary", use_container_width=True)
+
+
+if simple_mode == "今日雷達":
+    st.markdown("""<style>div[data-baseweb="tab-list"]{display:none!important;}</style>""", unsafe_allow_html=True)
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 單股總表", "🌐 跨股穩定度", "🔥 動態短線池", "🏭 族群比較", "🧬 狀態分類", "📈 K線/KD", "🔬 KD分區", "📦 量價/斜率", "🧾 交易明細"])
 
@@ -2002,7 +1948,7 @@ if run:
         latest_signal = pd.to_datetime(oos_trades["訊號時間"],utc=True,errors="coerce").max() if not oos_trades.empty else pd.NaT
         with st.spinner("掃描100檔最新60m行情，建立今日雷達…"):
             live_radar, live_diag = scan_latest_60m_radar(symbols, ranked_pool, period=period, observe_days=5)
-        st.session_state["st_v1101_oos"] = {
+        st.session_state["st_v1110_oos"] = {
             "detail": oos_detail, "summary": oos_summary, "trades": oos_trades,
             "blocks": block_summary, "state_diag": state_diag,
             "filter_robust": filter_robust, "market_diag": market_diag,
@@ -2090,7 +2036,7 @@ if run:
         "trade_map": trade_map,
     }
 
-oos_state = st.session_state.get("st_v1101_oos")
+oos_state = st.session_state.get("st_v1110_oos")
 if research_mode == "60m五日OOS驗證" and oos_state:
     st.markdown("## 🧪 60m＋K<30＋5日｜時間穩定度驗證")
     st.caption("規則完全固定；所有股票共用同一個全市場時間切點，前60%時間區段為樣本內、後40%為樣本外。股票池仍由近期流動性建立，因此仍屬固定股票池時間OOS。")
@@ -2114,7 +2060,7 @@ if research_mode == "60m五日OOS驗證" and oos_state:
     olive_diag=oos_state.get("live_diag",pd.DataFrame())
 
     st.markdown("## 📡 今日60m短線雷達")
-    st.caption("直接掃描最新60m行情。V1.10.1以『行情最後交易日』判斷新訊號，週末執行時週五訊號仍會標成🟢；只使用已完成60m K棒。")
+    st.caption("直接掃描最新60m行情。以行情最後交易日判斷新訊號；週末仍保留週五新訊號。只使用已完成60m K棒。")
     if not olive_diag.empty:
         _ok=int((olive_diag["狀態"]=="掃描完成").sum())
         _last=pd.to_datetime(olive_diag["行情最後K棒"],errors="coerce").max()
@@ -2128,108 +2074,32 @@ if research_mode == "60m五日OOS驗證" and oos_state:
         st.info("本次最新60m掃描沒有找到KD黃金交叉＋K<30的近期訊號。這不代表程式失敗；請同時查看掃描診斷。")
     else:
         _active=olive[olive["目前狀態"].isin(["🟢 新訊號","🟡 觀察中"])]
-        st.dataframe(_active if not _active.empty else olive.head(20),use_container_width=True,hide_index=True)
+        _show=_active if not _active.empty else olive.head(20)
+        _cols=[c for c in ["股票","研究主題","目前狀態","訊號時間","訊號K","目前K","目前D","預計觀察至","目前短線可交易分"] if c in _show.columns]
+        st.dataframe(_show[_cols],use_container_width=True,hide_index=True)
         st.download_button("⬇️ 下載【今日60m短線雷達】",olive.to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"{APP_VERSION}_今日60m短線雷達.csv",mime="text/csv",use_container_width=True)
-    if not olive_diag.empty:
-        with st.expander("查看最新60m掃描診斷"):
+    if not olive_diag.empty and simple_mode=="進階研究":
+        with st.expander("🔧 掃描診斷"):
             st.dataframe(olive_diag,use_container_width=True,hide_index=True)
-        st.download_button("⬇️ 下載【今日60m掃描診斷】",olive_diag.to_csv(index=False).encode("utf-8-sig"),
-                           file_name=f"{APP_VERSION}_今日60m掃描診斷.csv",mime="text/csv",use_container_width=True)
+            st.download_button("⬇️ 下載【今日60m掃描診斷】",olive_diag.to_csv(index=False).encode("utf-8-sig"),
+                               file_name=f"{APP_VERSION}_今日60m掃描診斷.csv",mime="text/csv",use_container_width=True)
 
-    st.markdown("---")
-    st.markdown("### 歷史回測衍生雷達（研究對照）")
-    if not odaily.empty:
-        st.markdown("## 📡 每日短線雷達")
-        st.caption("固定研究主線：60m KD黃金交叉＋K<30／5日觀察／不做預測性總分。V1.9.1狀態改以台灣目前時間判斷，不再把最後一筆歷史訊號誤當成現在。")
-        if pd.notna(olatest):
-            _ls = pd.Timestamp(olatest).tz_convert("Asia/Taipei")
-            st.info(f"本批回測最後一筆策略訊號：{_ls:%Y-%m-%d %H:%M}（台灣時間）。注意：這是『最後訊號時間』，不是行情資料最後更新時間。")
-        active = odaily[odaily["目前狀態"].isin(["🟢 新訊號","🟡 觀察中"])].copy()
-        c1,c2,c3 = st.columns(3)
-        c1.metric("新訊號", int((odaily["目前狀態"]=="🟢 新訊號").sum()))
-        c2.metric("觀察中", int((odaily["目前狀態"]=="🟡 觀察中").sum()))
-        c3.metric("目前有效雷達", len(active))
-        if active.empty:
-            st.info("目前資料中沒有位於5日研究觀察窗內的有效雷達訊號。")
-        else:
-            st.dataframe(active.round(3), use_container_width=True, hide_index=True)
-        with st.expander("查看已逾期訊號"):
-            expired=odaily[odaily["目前狀態"]=="⚪ 已逾期"]
-            st.dataframe(expired.round(3), use_container_width=True, hide_index=True)
-        st.download_button("⬇️ 下載【每日短線雷達】",odaily.to_csv(index=False).encode("utf-8-sig"),
-                           file_name=f"{APP_VERSION}_每日短線雷達.csv",mime="text/csv",use_container_width=True)
-    if not osum.empty:
-        st.dataframe(osum.round(3),use_container_width=True,hide_index=True)
-        st.download_button("⬇️ 下載【OOS驗證總表】",osum.to_csv(index=False).encode("utf-8-sig"),
-                           file_name=f"{APP_VERSION}_OOS驗證總表.csv",mime="text/csv",use_container_width=True)
-    if not oblocks.empty:
-        st.markdown("### 四段時間穩定度")
-        st.dataframe(oblocks.round(3),use_container_width=True,hide_index=True)
-        st.download_button("⬇️ 下載【四段時間穩定度】",oblocks.to_csv(index=False).encode("utf-8-sig"),
-                           file_name=f"{APP_VERSION}_四段時間穩定度.csv",mime="text/csv",use_container_width=True)
-    if not ostate.empty:
-        st.markdown("### 訊號當下狀態診斷")
-        st.caption("這張表只找失效環境，不會自動把表現最好的分組變成新策略，避免事後挑條件。")
-        st.dataframe(ostate.round(3),use_container_width=True,hide_index=True)
-        st.download_button("⬇️ 下載【訊號狀態診斷】",ostate.to_csv(index=False).encode("utf-8-sig"),
-                           file_name=f"{APP_VERSION}_訊號狀態診斷.csv",mime="text/csv",use_container_width=True)
-    if not ofilter.empty:
-        st.markdown("### 候選市場狀態跨時間驗證")
-        st.caption("候選A~D只是V1.5.1產生的假說。這裡檢查各候選在四段時間的交易數、涵蓋率、PF與報酬，不會自動選冠軍或直接變成正式策略。")
-        st.dataframe(ofilter.round(3),use_container_width=True,hide_index=True)
-        st.download_button("⬇️ 下載【候選市場狀態驗證】",ofilter.to_csv(index=False).encode("utf-8-sig"),
-                           file_name=f"{APP_VERSION}_候選市場狀態驗證.csv",mime="text/csv",use_container_width=True)
-    if not omarket.empty:
-        st.markdown("### 大盤環境診斷")
-        st.caption("使用 ^TWII 前一個已完成交易日的日線，只做市場regime診斷，不直接最佳化成濾網。")
-        st.dataframe(omarket.round(3),use_container_width=True,hide_index=True)
-        st.download_button("⬇️ 下載【大盤環境診斷】",omarket.to_csv(index=False).encode("utf-8-sig"),
-                           file_name=f"{APP_VERSION}_大盤環境診斷.csv",mime="text/csv",use_container_width=True)
-    if not omarket_blocks.empty:
-        st.markdown("### 大盤環境 × 四段時間")
-        st.caption("直接檢查每一時間區段內的大盤regime與策略績效，避免把全期間相關性誤認成失效原因。")
-        st.dataframe(omarket_blocks.round(3),use_container_width=True,hide_index=True)
-        st.download_button("⬇️ 下載【大盤環境四段交叉驗證】",omarket_blocks.to_csv(index=False).encode("utf-8-sig"),
-                           file_name=f"{APP_VERSION}_大盤環境四段交叉驗證.csv",mime="text/csv",use_container_width=True)
-    st.markdown("### Walk-Forward 歷史可交易性驗證")
-    if owf.empty:
-        st.error(f"Walk-Forward未產生結果：{owf_status}")
-    else:
-        st.success(owf_status)
-    if not owf.empty:
-        st.caption("每筆訊號只使用訊號日前一交易日以前的20日日線資訊，重建當時的成交金額/成交量/振幅相對排名。這是在目前候選universe內的歷史重建，不宣稱等同完整歷史上市櫃成分。")
-        st.dataframe(owf.round(3),use_container_width=True,hide_index=True)
-        st.download_button("⬇️ 下載【WalkForward股票池驗證】",owf.to_csv(index=False).encode("utf-8-sig"),
-                           file_name=f"{APP_VERSION}_WalkForward股票池驗證.csv",mime="text/csv",use_container_width=True)
-    if not owfd.empty:
-        st.download_button("⬇️ 下載【WalkForward逐筆明細】",owfd.to_csv(index=False).encode("utf-8-sig"),
-                           file_name=f"{APP_VERSION}_WalkForward逐筆明細.csv",mime="text/csv",use_container_width=True)
-    if not owf_time.empty:
-        st.markdown("### Walk-Forward 分層 × 四段時間")
-        st.caption("檢查低/中/高可交易性分層是否跨時間一致；不因全期間某一層績效漂亮就直接改股票池。")
-        st.dataframe(owf_time.round(3),use_container_width=True,hide_index=True)
-        st.download_button("⬇️ 下載【WalkForward分層四段驗證】",owf_time.to_csv(index=False).encode("utf-8-sig"),
-                           file_name=f"{APP_VERSION}_WalkForward分層四段驗證.csv",mime="text/csv",use_container_width=True)
-    if not oradar_val.empty:
-        st.markdown("### V1.8.0 雷達排序驗證")
-        st.caption("檢查舊版『新鮮度70%＋K深度30%』是否真的能把較佳結果排前面；本版不再把此分數當正式排序。")
-        st.dataframe(oradar_val.round(3),use_container_width=True,hide_index=True)
-        st.download_button("⬇️ 下載【雷達排序驗證】",oradar_val.to_csv(index=False).encode("utf-8-sig"),
-                           file_name=f"{APP_VERSION}_雷達排序驗證.csv",mime="text/csv",use_container_width=True)
-    if not oradar.empty:
-        st.markdown("### 研究雷達候選")
-        st.caption("核心規則仍固定60m KD黃金交叉＋K<30。V1.8.1取消預測性綜合分數，候選只按訊號時間由新到舊；WF、K深度與新鮮度保留為描述欄位。")
-        st.dataframe(oradar.head(100).round(3),use_container_width=True,hide_index=True)
-        st.download_button("⬇️ 下載【研究雷達候選】",oradar.to_csv(index=False).encode("utf-8-sig"),
-                           file_name=f"{APP_VERSION}_研究雷達候選.csv",mime="text/csv",use_container_width=True)
-    if not odet.empty:
-        st.download_button("⬇️ 下載【OOS個股策略明細】",odet.to_csv(index=False).encode("utf-8-sig"),
-                           file_name=f"{APP_VERSION}_OOS個股策略明細.csv",mime="text/csv",use_container_width=True)
-    if not otr.empty:
-        st.download_button("⬇️ 下載【OOS逐筆交易明細】",otr.to_csv(index=False).encode("utf-8-sig"),
-                           file_name=f"{APP_VERSION}_OOS逐筆交易明細.csv",mime="text/csv",use_container_width=True)
-    st.info("下一輪請提供：①【今日60m短線雷達】②【今日60m掃描診斷】。本版修正週末新訊號判定；若最新K棒與狀態一致，下一版開始建立Shioaji即時行情接入層與Yahoo備援模式。")
+    if simple_mode=="進階研究":
+        st.markdown("---")
+        st.caption("歷史OOS、Walk-Forward、狀態診斷等研究資料仍保留在程式內；主畫面不再重複鋪滿舊版研究表格。")
+        if not osum.empty:
+            with st.expander("🧪 OOS研究摘要"):
+                st.dataframe(osum.round(3),use_container_width=True,hide_index=True)
+                st.download_button("⬇️ 下載【OOS驗證總表】",osum.to_csv(index=False).encode("utf-8-sig"),
+                                   file_name=f"{APP_VERSION}_OOS驗證總表.csv",mime="text/csv")
+        if not owfd.empty:
+            with st.expander("📦 研究資料下載"):
+                st.download_button("⬇️ 下載【WalkForward逐筆明細】",owfd.to_csv(index=False).encode("utf-8-sig"),
+                                   file_name=f"{APP_VERSION}_WalkForward逐筆明細.csv",mime="text/csv")
+                st.download_button("⬇️ 下載【OOS逐筆交易明細】",otr.to_csv(index=False).encode("utf-8-sig"),
+                                   file_name=f"{APP_VERSION}_OOS逐筆交易明細.csv",mime="text/csv")
+
 
 mtf_state = st.session_state.get("st_v130_mtf")
 if research_mode == "多週期當沖/隔日驗證" and mtf_state:
@@ -2553,6 +2423,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.10.1 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.11.0 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
