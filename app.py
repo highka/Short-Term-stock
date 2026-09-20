@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.9.1
+黑嚕嚕－短線交易雷達 ST V1.10.0
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,13 +36,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.9.1"
+APP_VERSION = "ST V1.10.0"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.9.1"
-EXPORT_PREFIX = "ST_V1.9.1"
+APP_VERSION = "ST_V1.10.0"
+EXPORT_PREFIX = "ST_V1.10.0"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -832,6 +832,100 @@ def build_daily_radar_status(trades: pd.DataFrame, wf_detail: pd.DataFrame, obse
     x["_status_order"] = x["目前狀態"].map(status_order).fillna(9)
     x = x.sort_values(["_status_order","_dt"], ascending=[True,False])
     return x[cols].reset_index(drop=True)
+
+
+def scan_latest_60m_radar(symbols: List[str], ranked_pool: pd.DataFrame, period: str = "3mo",
+                            observe_days: int = 5) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    V1.10.0 真正的最新60m雷達：
+    直接掃描最新60m行情，不從歷史回測交易表反推「今天」。
+    規則固定：KD黃金交叉 + K<30。
+    回傳：(有效/近期雷達, 掃描診斷)
+    """
+    if not symbols:
+        return pd.DataFrame(), pd.DataFrame()
+
+    raw_map = download_intraday_batch(symbols, "60m", period)
+    now_tw = pd.Timestamp.now(tz="Asia/Taipei")
+    rows, diag = [], []
+
+    pool_map = {}
+    if ranked_pool is not None and not ranked_pool.empty and "股票" in ranked_pool.columns:
+        pool_map = ranked_pool.set_index("股票").to_dict("index")
+
+    for symbol in symbols:
+        d = raw_map.get(symbol, pd.DataFrame())
+        if d is None or d.empty:
+            diag.append({"股票":symbol,"狀態":"無60m資料","行情最後K棒":pd.NaT,"有效K棒數":0})
+            continue
+        x = add_indicators(d)
+        if x.empty:
+            diag.append({"股票":symbol,"狀態":"指標資料不足","行情最後K棒":pd.NaT,"有效K棒數":0})
+            continue
+
+        # 保守處理：只使用已開始至少60分鐘的bar，避免盤中未完成K棒觸發假訊號。
+        idx = pd.DatetimeIndex(x.index)
+        if idx.tz is None:
+            idx_tw = idx.tz_localize("Asia/Taipei")
+        else:
+            idx_tw = idx.tz_convert("Asia/Taipei")
+        complete = (idx_tw + pd.Timedelta(minutes=60)) <= now_tw
+        xc = x.loc[complete].copy()
+        if xc.empty:
+            diag.append({"股票":symbol,"狀態":"沒有已完成60m K棒","行情最後K棒":pd.NaT,"有效K棒數":0})
+            continue
+
+        last_bar = pd.Timestamp(xc.index[-1])
+        last_bar_tw = last_bar.tz_localize("Asia/Taipei") if last_bar.tzinfo is None else last_bar.tz_convert("Asia/Taipei")
+        mask = xc["KD_GOLD"].fillna(False) & (pd.to_numeric(xc["K"],errors="coerce") < 30)
+        sig = xc.loc[mask]
+        diag.append({
+            "股票":symbol,"狀態":"掃描完成","行情最後K棒":last_bar_tw.strftime("%Y-%m-%d %H:%M"),
+            "有效K棒數":len(xc),"目前K":float(xc["K"].iloc[-1]) if pd.notna(xc["K"].iloc[-1]) else np.nan,
+            "目前D":float(xc["D"].iloc[-1]) if pd.notna(xc["D"].iloc[-1]) else np.nan
+        })
+        if sig.empty:
+            continue
+
+        srow=sig.iloc[-1]
+        stime=pd.Timestamp(sig.index[-1])
+        stime_tw=stime.tz_localize("Asia/Taipei") if stime.tzinfo is None else stime.tz_convert("Asia/Taipei")
+        sdate=stime_tw.date()
+        observe_to=pd.Timestamp(np.busday_offset(sdate, observe_days, roll="forward")).date()
+        age_h=(now_tw-stime_tw).total_seconds()/3600
+        if age_h <= 24 and age_h >= 0:
+            status="🟢 新訊號"
+        elif pd.Timestamp(observe_to) >= pd.Timestamp(now_tw.date()):
+            status="🟡 觀察中"
+        else:
+            status="⚪ 已逾期"
+
+        pm=pool_map.get(symbol,{})
+        rows.append({
+            "股票":symbol,
+            "研究主題":research_theme(symbol),
+            "目前狀態":status,
+            "訊號時間":stime_tw.strftime("%Y-%m-%d %H:%M"),
+            "訊號K":round(float(srow["K"]),2) if pd.notna(srow["K"]) else np.nan,
+            "訊號D":round(float(srow["D"]),2) if pd.notna(srow["D"]) else np.nan,
+            "目前K":round(float(xc["K"].iloc[-1]),2) if pd.notna(xc["K"].iloc[-1]) else np.nan,
+            "目前D":round(float(xc["D"].iloc[-1]),2) if pd.notna(xc["D"].iloc[-1]) else np.nan,
+            "行情最後K棒":last_bar_tw.strftime("%Y-%m-%d %H:%M"),
+            "距訊號小時":round(age_h,1),
+            "預計觀察至":observe_to,
+            "目前短線可交易分":pm.get("短線可交易分",np.nan),
+            "核心規則":"60m KD黃金交叉 + K<30｜5日研究觀察"
+        })
+
+    radar=pd.DataFrame(rows)
+    diagnostics=pd.DataFrame(diag)
+    if radar.empty:
+        return radar, diagnostics
+
+    order={"🟢 新訊號":0,"🟡 觀察中":1,"⚪ 已逾期":2}
+    radar["_o"]=radar["目前狀態"].map(order).fillna(9)
+    radar=radar.sort_values(["_o","訊號時間"],ascending=[True,False]).drop(columns="_o").reset_index(drop=True)
+    return radar, diagnostics
 
 
 def time_block_stability(trades: pd.DataFrame, blocks: int = 4) -> pd.DataFrame:
@@ -1898,13 +1992,15 @@ if run:
         radar_validation = validate_radar_ranking(radar_for_validation, oos_trades)
         daily_radar = build_daily_radar_status(oos_trades, wf_detail, observe_days=5)
         latest_signal = pd.to_datetime(oos_trades["訊號時間"],utc=True,errors="coerce").max() if not oos_trades.empty else pd.NaT
-        st.session_state["st_v191_oos"] = {
+        with st.spinner("掃描100檔最新60m行情，建立今日雷達…"):
+            live_radar, live_diag = scan_latest_60m_radar(symbols, ranked_pool, period=period, observe_days=5)
+        st.session_state["st_v1100_oos"] = {
             "detail": oos_detail, "summary": oos_summary, "trades": oos_trades,
             "blocks": block_summary, "state_diag": state_diag,
             "filter_robust": filter_robust, "market_diag": market_diag,
             "market_blocks": market_blocks,
             "wf_summary": wf_summary, "wf_detail": wf_detail, "wf_status": wf_status, "wf_time": wf_time,
-            "radar_candidates": radar_candidates, "radar_validation": radar_validation, "daily_radar": daily_radar, "latest_signal": latest_signal,
+            "radar_candidates": radar_candidates, "radar_validation": radar_validation, "daily_radar": daily_radar, "latest_signal": latest_signal, "live_radar": live_radar, "live_diag": live_diag,
             "pool": ranked_pool, "symbols": symbols
         }
         summary, data_map, trade_map = pd.DataFrame(), {}, {}
@@ -1986,7 +2082,7 @@ if run:
         "trade_map": trade_map,
     }
 
-oos_state = st.session_state.get("st_v191_oos")
+oos_state = st.session_state.get("st_v1100_oos")
 if research_mode == "60m五日OOS驗證" and oos_state:
     st.markdown("## 🧪 60m＋K<30＋5日｜時間穩定度驗證")
     st.caption("規則完全固定；所有股票共用同一個全市場時間切點，前60%時間區段為樣本內、後40%為樣本外。股票池仍由近期流動性建立，因此仍屬固定股票池時間OOS。")
@@ -2006,6 +2102,35 @@ if research_mode == "60m五日OOS驗證" and oos_state:
     oradar_val=oos_state.get("radar_validation",pd.DataFrame())
     odaily=oos_state.get("daily_radar",pd.DataFrame())
     olatest=oos_state.get("latest_signal",pd.NaT)
+    olive=oos_state.get("live_radar",pd.DataFrame())
+    olive_diag=oos_state.get("live_diag",pd.DataFrame())
+
+    st.markdown("## 📡 今日60m短線雷達")
+    st.caption("V1.10.0起，這裡直接掃描最新60m行情，不再從歷史回測交易表反推今天。規則固定：KD黃金交叉＋K<30；只把已完成60m K棒納入判斷。")
+    if not olive_diag.empty:
+        _ok=int((olive_diag["狀態"]=="掃描完成").sum())
+        _last=pd.to_datetime(olive_diag["行情最後K棒"],errors="coerce").max()
+        c1,c2,c3=st.columns(3)
+        c1.metric("成功掃描",f"{_ok}/{len(olive_diag)}")
+        c2.metric("新訊號",int((olive.get("目前狀態",pd.Series(dtype=str))=="🟢 新訊號").sum()) if not olive.empty else 0)
+        c3.metric("觀察中",int((olive.get("目前狀態",pd.Series(dtype=str))=="🟡 觀察中").sum()) if not olive.empty else 0)
+        if pd.notna(_last):
+            st.info(f"本批行情最後60m K棒：{_last:%Y-%m-%d %H:%M}（台灣時間欄位）。")
+    if olive.empty:
+        st.info("本次最新60m掃描沒有找到KD黃金交叉＋K<30的近期訊號。這不代表程式失敗；請同時查看掃描診斷。")
+    else:
+        _active=olive[olive["目前狀態"].isin(["🟢 新訊號","🟡 觀察中"])]
+        st.dataframe(_active if not _active.empty else olive.head(20),use_container_width=True,hide_index=True)
+        st.download_button("⬇️ 下載【今日60m短線雷達】",olive.to_csv(index=False).encode("utf-8-sig"),
+                           file_name=f"{APP_VERSION}_今日60m短線雷達.csv",mime="text/csv",use_container_width=True)
+    if not olive_diag.empty:
+        with st.expander("查看最新60m掃描診斷"):
+            st.dataframe(olive_diag,use_container_width=True,hide_index=True)
+        st.download_button("⬇️ 下載【今日60m掃描診斷】",olive_diag.to_csv(index=False).encode("utf-8-sig"),
+                           file_name=f"{APP_VERSION}_今日60m掃描診斷.csv",mime="text/csv",use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("### 歷史回測衍生雷達（研究對照）")
     if not odaily.empty:
         st.markdown("## 📡 每日短線雷達")
         st.caption("固定研究主線：60m KD黃金交叉＋K<30／5日觀察／不做預測性總分。V1.9.1狀態改以台灣目前時間判斷，不再把最後一筆歷史訊號誤當成現在。")
@@ -2096,7 +2221,7 @@ if research_mode == "60m五日OOS驗證" and oos_state:
     if not otr.empty:
         st.download_button("⬇️ 下載【OOS逐筆交易明細】",otr.to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"{APP_VERSION}_OOS逐筆交易明細.csv",mime="text/csv",use_container_width=True)
-    st.info("下一輪請提供：①【每日短線雷達】。本版先修正狀態時間基準；若狀態正確，下一版把雷達訊號掃描與歷史回測正式拆開，直接從最新60m行情建立當日雷達。")
+    st.info("下一輪請提供：①【今日60m短線雷達】②【今日60m掃描診斷】。本版已把今日雷達與歷史回測拆開；下一步檢查最新K棒時間、訊號完整性與Yahoo資料延遲，再決定Shioaji接入層。")
 
 mtf_state = st.session_state.get("st_v130_mtf")
 if research_mode == "多週期當沖/隔日驗證" and mtf_state:
@@ -2420,6 +2545,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.9.1 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.10.0 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
