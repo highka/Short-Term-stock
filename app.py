@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.15.0
+黑嚕嚕－短線交易雷達 ST V1.15.1
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -38,13 +38,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.15.0"
+APP_VERSION = "ST V1.15.1"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.15.0"
-EXPORT_PREFIX = "ST_V1.15.0"
+APP_VERSION = "ST_V1.15.1"
+EXPORT_PREFIX = "ST_V1.15.1"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1318,6 +1318,109 @@ def build_market_regime_context(period: str="6mo"):
                     "市場在MA15之上","市場MA15向上","市場5日報酬區間","市場狀態"]]
     except Exception:
         return pd.DataFrame()
+
+
+
+def validate_top50_signal_quality(cost: CostConfig, period: str="3mo"):
+    """
+    V1.15.1：
+    固定真正Walk-Forward TOP50 + 固定60m KD黃金交叉/K<30/5日，
+    只診斷既有訊號內部品質，不新增指標、不改買進規則。
+    診斷項目：K深度、量比20、MA30/MA60斜率、60m訊號時段。
+    """
+    elig, _, errors = build_fullmarket_walkforward_eligibility(lookback_months=6, top_n=100)
+    if elig is None or elig.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    union=sorted(elig.loc[elig["流動性排名"]<=50,"股票"].dropna().astype(str).unique().tolist())
+    if not union:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    _,_,trades=run_oos_60m_5d(union,cost,period,allow_overlap=False,train_ratio=0.60)
+    if trades is None or trades.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    t=trades.copy()
+    sig=pd.to_datetime(t["訊號時間"],utc=True,errors="coerce").dt.tz_convert("Asia/Taipei")
+    t["訊號日期"]=sig.dt.date
+    t["訊號小時"]=sig.dt.hour
+
+    # 歷史TOP50資格
+    keep=[]; ranks=[]; pool_dates=[]
+    for _,r in t.iterrows():
+        q=elig[(elig["股票"]==r["股票"])&(elig["基準完成日"]<r["訊號日期"])]
+        if q.empty:
+            keep.append(False); ranks.append(np.nan); pool_dates.append(None)
+        else:
+            z=q.sort_values("基準完成日").iloc[-1]
+            rank=float(z["流動性排名"])
+            keep.append(rank<=50); ranks.append(rank); pool_dates.append(z["基準完成日"])
+    t["WF流動性排名"]=ranks
+    t["WF股票池基準日"]=pool_dates
+    t=t[pd.Series(keep,index=t.index)].copy()
+
+    # 預先固定分桶，避免看完績效後再微調邊界。
+    t["K深度"]=pd.cut(pd.to_numeric(t["訊號K"],errors="coerce"),
+                       bins=[-np.inf,10,20,30],labels=["K<10","K10-20","K20-30"]).astype(str)
+    vr=pd.to_numeric(t.get("量比20"),errors="coerce")
+    t["量比區間"]=pd.cut(vr,bins=[-np.inf,0.8,1.0,1.5,np.inf],
+                         labels=["<0.8","0.8-1.0","1.0-1.5",">=1.5"]).astype(str)
+    ma30=pd.to_numeric(t.get("MA30斜率3"),errors="coerce")
+    ma60=pd.to_numeric(t.get("MA60斜率3"),errors="coerce")
+    t["MA30方向"]=np.where(ma30>0,"向上","未向上")
+    t["MA60方向"]=np.where(ma60>0,"向上","未向上")
+    t["60m時段"]=t["訊號小時"].map(lambda h:f"{int(h):02d}:00" if pd.notna(h) else "資料不足")
+
+    specs=[
+        ("K深度",["K<10","K10-20","K20-30"]),
+        ("量比區間",["<0.8","0.8-1.0","1.0-1.5",">=1.5"]),
+        ("MA30方向",["向上","未向上"]),
+        ("MA60方向",["向上","未向上"]),
+        ("60m時段",["09:00","10:00","11:00","12:00","13:00"]),
+    ]
+
+    rows=[]
+    for sample in ["全部","樣本內60%","樣本外40%"]:
+        xs=t if sample=="全部" else t[t["樣本"]==sample]
+        for col,vals in specs:
+            for val in vals:
+                g=xs[xs[col]==val]
+                m=aggregate_trade_metrics(g)
+                rows.append({
+                    "樣本":sample,"診斷分類":col,"分組":val,
+                    "股票數":int(g["股票"].nunique()) if len(g) else 0,
+                    "交易數":len(g),**m
+                })
+    summary=pd.DataFrame(rows)
+
+    # 四段時間只追三個最核心既有結構：K深度、量比、MA60方向。
+    blocks=[]
+    ts=pd.to_datetime(t["訊號時間"],errors="coerce")
+    ok=ts.notna()
+    z=t.loc[ok].copy(); ts=ts.loc[ok]
+    if len(z):
+        edges=pd.date_range(ts.min(),ts.max(),periods=5)
+        labels=["第1段","第2段","第3段","第4段"]
+        z["時間段"]=pd.cut(ts,bins=edges,labels=labels,include_lowest=True,right=True)
+        for block in labels:
+            q=z[z["時間段"]==block]
+            for col,vals in [
+                ("K深度",["K<10","K10-20","K20-30"]),
+                ("量比區間",["<0.8","0.8-1.0","1.0-1.5",">=1.5"]),
+                ("MA60方向",["向上","未向上"]),
+            ]:
+                for val in vals:
+                    g=q[q[col]==val]
+                    m=aggregate_trade_metrics(g)
+                    blocks.append({
+                        "時間段":block,
+                        "起始":str(edges[labels.index(block)]),
+                        "結束":str(edges[labels.index(block)+1]),
+                        "診斷分類":col,"分組":val,
+                        "股票數":int(g["股票"].nunique()) if len(g) else 0,
+                        "交易數":len(g),**m
+                    })
+    return summary,pd.DataFrame(blocks),t,errors
 
 
 def validate_market_regime_top50(cost: CostConfig, period: str="3mo"):
@@ -2865,8 +2968,10 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
-            if research_mode == "市場環境健診_TOP50":
+                ["TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
+            if research_mode == "TOP50訊號品質健診":
+                st.caption("固定真正Walk-Forward TOP50與核心策略，只診斷K深度、量比20、MA30/60方向與60m訊號時段。")
+            elif research_mode == "市場環境健診_TOP50":
                 st.caption("固定真正Walk-Forward TOP50與核心策略，只診斷訊號前一完成日的TAIEX MA15與5日市場狀態。")
             elif research_mode == "核心池規模WalkForward":
                 st.caption("真正歷史Walk-Forward比較每日流動性TOP50 / TOP100 / TOP150 / TOP200；不使用熱門增補。")
@@ -2889,7 +2994,7 @@ with st.sidebar:
                 "KD黃金交叉 + MA30向上","KD黃金交叉 + MA60向上","KD黃金交叉 + 量比>1.2",
                 "KD黃金交叉 + 量比>1.5","KD黃金交叉 + 站上VWAP","MA5>15 + KD + 站上VWAP"
             ]
-            if research_mode not in ["市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
+            if research_mode not in ["TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
                 selected_rules = st.multiselect("進場規則", all_rules, default=["KD黃金交叉 + K<30"])
                 selected_modes = st.multiselect("持有方式",
                     ["當沖","隔日","2日","3日","4日","5日","6日","7日"], default=["5日"])
@@ -2916,6 +3021,7 @@ with st.sidebar:
         _btn_label="🔄 更新今日雷達"
     else:
         _btn_label={
+            "TOP50訊號品質健診":"🔬 執行TOP50訊號品質健診",
             "市場環境健診_TOP50":"🌤️ 執行TOP50市場環境健診",
             "核心池規模WalkForward":"📏 驗證核心池TOP50/100/150/200",
             "全市場WalkForward驗證":"🧭 執行全市場Walk-Forward",
@@ -2930,6 +3036,41 @@ with st.sidebar:
 
 if simple_mode == "今日雷達":
     st.markdown("""<style>div[data-baseweb="tab-list"]{display:none!important;}</style>""", unsafe_allow_html=True)
+
+if simple_mode=="進階研究" and research_mode=="TOP50訊號品質健診" and not run:
+    st.info("V1.15.0 顯示MA15/市場狀態無法穩定解釋第1段失效，且部分關係在樣本內外反轉。這一版不加市場Gate，改固定TOP50檢查訊號本身品質。")
+
+if run and simple_mode=="進階研究" and research_mode=="TOP50訊號品質健診":
+    st.subheader("🔬 TOP50訊號品質健診")
+    with st.spinner("重建真正Walk-Forward TOP50交易，檢查K深度、量比20、MA30/60方向與60m時段…"):
+        _sq_sum,_sq_blocks,_sq_trades,_sq_errs=validate_top50_signal_quality(cost,period="3mo")
+    st.session_state["st_v1151_signal_quality"]={
+        "summary":_sq_sum,"blocks":_sq_blocks,"trades":_sq_trades,"errors":_sq_errs
+    }
+
+_sq=st.session_state.get("st_v1151_signal_quality")
+if simple_mode=="進階研究" and research_mode=="TOP50訊號品質健診" and _sq:
+    _qs=_sq.get("summary",pd.DataFrame()); _qb=_sq.get("blocks",pd.DataFrame())
+    _qt=_sq.get("trades",pd.DataFrame()); _qe=_sq.get("errors",[])
+    st.subheader("🔬 TOP50訊號品質健診結果")
+    if _qe:
+        st.warning("資料來源異常："+"；".join(_qe))
+    st.info("這一版仍然只做診斷；不會因單一分桶績效最好就直接改策略。")
+    if not _qs.empty:
+        st.markdown("#### 訊號品質分組｜全部 / 樣本內 / 樣本外")
+        st.dataframe(_qs.round(3),use_container_width=True,hide_index=True)
+    if not _qb.empty:
+        st.markdown("#### 四段時間穩定度")
+        st.dataframe(_qb.round(3),use_container_width=True,hide_index=True)
+    with st.expander("查看逐筆交易品質標籤"):
+        st.dataframe(_qt.round(3),use_container_width=True,hide_index=True)
+    st.download_button("⬇️ 下載【TOP50訊號品質健診摘要】",_qs.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_TOP50訊號品質健診摘要.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【TOP50訊號品質四段穩定度】",_qb.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_TOP50訊號品質四段穩定度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【TOP50訊號品質逐筆交易】",_qt.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_TOP50訊號品質逐筆交易.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.success("三份檔案可連續下載，不需重跑。")
 
 if simple_mode=="進階研究" and research_mode=="市場環境健診_TOP50" and not run:
     st.info("V1.14.1 顯示TOP50在全部、樣本外與第2~4段皆優於更大的核心池，但第1段所有規模都失效。這一版固定TOP50，不再調股票池，只檢查市場環境。")
@@ -3231,7 +3372,7 @@ if run:
         st.error("請至少選擇一個K棒週期、進場規則與持有方式。")
         st.stop()
 
-    if research_mode in ["市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
+    if research_mode in ["TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
         # 股票池研究已在上方獨立完成。：股票池健診已在上方獨立完成。
         # 初始化舊版共用變數，避免後續 session 儲存引用未定義的 summary。
         summary, data_map, trade_map = pd.DataFrame(), {}, {}
@@ -3769,6 +3910,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.15.0 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.15.1 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
