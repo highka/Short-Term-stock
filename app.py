@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.7.1
+黑嚕嚕－短線交易雷達 ST V1.7.2
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,13 +36,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.7.1"
+APP_VERSION = "ST V1.7.2"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.7.1"
-EXPORT_PREFIX = "ST_V1.7.1"
+APP_VERSION = "ST_V1.7.2"
+EXPORT_PREFIX = "ST_V1.7.2"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -652,6 +652,37 @@ def walkforward_tradability_validation(trades: pd.DataFrame, daily_lookback: int
         "振幅百分位","WF可交易分數","WF分層"
     ] if c in x.columns]
     return pd.DataFrame(summary),x[detail_cols].sort_values("訊號時間").reset_index(drop=True), f"成功：{x['股票'].nunique()}檔、{len(x)}筆交易完成Walk-Forward歷史可交易性配對。"
+
+
+def walkforward_layer_time_validation(wf_detail: pd.DataFrame, blocks: int = 4) -> pd.DataFrame:
+    """固定WF分層 × 連續四段時間；避免只看全期間平均後誤判股票池規則。"""
+    if wf_detail is None or wf_detail.empty:
+        return pd.DataFrame()
+    x=wf_detail.copy()
+    x["_dt"]=pd.to_datetime(x["訊號時間"],utc=True,errors="coerce")
+    x=x.dropna(subset=["_dt"]).sort_values("_dt").reset_index(drop=True)
+    if len(x)<blocks:
+        return pd.DataFrame()
+    bounds=x["_dt"].quantile(np.linspace(0,1,blocks+1)).tolist()
+    rows=[]
+    order=["低於40","40-60","60-80","80以上"]
+    for i in range(blocks):
+        lo,hi=bounds[i],bounds[i+1]
+        tm=(x["_dt"]>=lo) & ((x["_dt"]<=hi) if i==blocks-1 else (x["_dt"]<hi))
+        for layer in order:
+            g=x[tm & x["WF分層"].astype(str).eq(layer)]
+            r=pd.to_numeric(g["淨報酬%"],errors="coerce").dropna()
+            if r.empty: continue
+            gp=r[r>0].sum(); gl=-r[r<0].sum()
+            pf=np.inf if gl==0 and gp>0 else (gp/gl if gl>0 else np.nan)
+            rows.append({
+                "區段":f"時間區段{i+1}/{blocks}","開始":lo,"結束":hi,
+                "歷史可交易性分層":layer,"交易數":len(r),
+                "勝率%":float((r>0).mean()*100),
+                "平均淨報酬%":float(r.mean()),"中位淨報酬%":float(r.median()),
+                "整體PF":pf
+            })
+    return pd.DataFrame(rows)
 
 
 def time_block_stability(trades: pd.DataFrame, blocks: int = 4) -> pd.DataFrame:
@@ -1705,12 +1736,13 @@ if run:
         market_diag = market_regime_diagnostics(oos_trades, period)
         market_blocks = market_regime_by_timeblock(oos_trades, blocks=4)
         wf_summary, wf_detail, wf_status = walkforward_tradability_validation(oos_trades, daily_lookback=20)
-        st.session_state["st_v171_oos"] = {
+        wf_time = walkforward_layer_time_validation(wf_detail, blocks=4)
+        st.session_state["st_v172_oos"] = {
             "detail": oos_detail, "summary": oos_summary, "trades": oos_trades,
             "blocks": block_summary, "state_diag": state_diag,
             "filter_robust": filter_robust, "market_diag": market_diag,
             "market_blocks": market_blocks,
-            "wf_summary": wf_summary, "wf_detail": wf_detail, "wf_status": wf_status,
+            "wf_summary": wf_summary, "wf_detail": wf_detail, "wf_status": wf_status, "wf_time": wf_time,
             "pool": ranked_pool, "symbols": symbols
         }
         summary, data_map, trade_map = pd.DataFrame(), {}, {}
@@ -1792,7 +1824,7 @@ if run:
         "trade_map": trade_map,
     }
 
-oos_state = st.session_state.get("st_v171_oos")
+oos_state = st.session_state.get("st_v172_oos")
 if research_mode == "60m五日OOS驗證" and oos_state:
     st.markdown("## 🧪 60m＋K<30＋5日｜時間穩定度驗證")
     st.caption("規則完全固定；所有股票共用同一個全市場時間切點，前60%時間區段為樣本內、後40%為樣本外。股票池仍由近期流動性建立，因此仍屬固定股票池時間OOS。")
@@ -1807,6 +1839,7 @@ if research_mode == "60m五日OOS驗證" and oos_state:
     owf=oos_state.get("wf_summary",pd.DataFrame())
     owfd=oos_state.get("wf_detail",pd.DataFrame())
     owf_status=oos_state.get("wf_status","尚未執行Walk-Forward診斷。")
+    owf_time=oos_state.get("wf_time",pd.DataFrame())
     if not osum.empty:
         st.dataframe(osum.round(3),use_container_width=True,hide_index=True)
         st.download_button("⬇️ 下載【OOS驗證總表】",osum.to_csv(index=False).encode("utf-8-sig"),
@@ -1853,13 +1886,19 @@ if research_mode == "60m五日OOS驗證" and oos_state:
     if not owfd.empty:
         st.download_button("⬇️ 下載【WalkForward逐筆明細】",owfd.to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"{APP_VERSION}_WalkForward逐筆明細.csv",mime="text/csv",use_container_width=True)
+    if not owf_time.empty:
+        st.markdown("### Walk-Forward 分層 × 四段時間")
+        st.caption("檢查低/中/高可交易性分層是否跨時間一致；不因全期間某一層績效漂亮就直接改股票池。")
+        st.dataframe(owf_time.round(3),use_container_width=True,hide_index=True)
+        st.download_button("⬇️ 下載【WalkForward分層四段驗證】",owf_time.to_csv(index=False).encode("utf-8-sig"),
+                           file_name=f"{APP_VERSION}_WalkForward分層四段驗證.csv",mime="text/csv",use_container_width=True)
     if not odet.empty:
         st.download_button("⬇️ 下載【OOS個股策略明細】",odet.to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"{APP_VERSION}_OOS個股策略明細.csv",mime="text/csv",use_container_width=True)
     if not otr.empty:
         st.download_button("⬇️ 下載【OOS逐筆交易明細】",otr.to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"{APP_VERSION}_OOS逐筆交易明細.csv",mime="text/csv",use_container_width=True)
-    st.info("下一輪請提供：①【WalkForward股票池驗證】②【WalkForward逐筆明細】③【四段時間穩定度】。這輪不再調均線或Regime Gate，直接檢查目前TOP股票池的歷史選擇偏誤。")
+    st.info("下一輪請提供：①【WalkForward分層四段驗證】②【WalkForward股票池驗證】③【WalkForward逐筆明細】。這輪確認「高活躍層反而較弱」是否跨時間成立，再決定是否修改股票池排名公式。")
 
 mtf_state = st.session_state.get("st_v130_mtf")
 if research_mode == "多週期當沖/隔日驗證" and mtf_state:
@@ -2183,6 +2222,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.7.1 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.7.2 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
