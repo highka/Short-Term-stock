@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.5.2
+黑嚕嚕－短線交易雷達 ST V1.6.0
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,13 +36,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.5.2"
+APP_VERSION = "ST V1.6.0"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.5.2"
-EXPORT_PREFIX = "ST_V1.5.2"
+APP_VERSION = "ST_V1.6.0"
+EXPORT_PREFIX = "ST_V1.6.0"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -414,6 +414,65 @@ def state_filter_robustness(trades: pd.DataFrame, blocks: int = 4) -> pd.DataFra
                 "中位淨報酬%":float(r.median()) if len(r) else np.nan,
                 "整體PF":m["整體PF"],
             })
+    return pd.DataFrame(rows)
+
+
+def market_regime_diagnostics(trades: pd.DataFrame, period: str) -> pd.DataFrame:
+    """
+    V1.6.0：用台股加權指數 ^TWII 的日線，描述每筆60m訊號當時的大盤環境。
+    僅做診斷，不把結果直接變成交易濾網。
+    使用前一個已完成交易日的日線，避免把訊號之後才知道的資料帶入。
+    """
+    if trades is None or trades.empty:
+        return pd.DataFrame()
+    try:
+        idx=yf.download("^TWII", period="6mo", interval="1d", auto_adjust=False,
+                        progress=False, threads=False)
+    except Exception:
+        return pd.DataFrame()
+    if idx is None or idx.empty:
+        return pd.DataFrame()
+    if isinstance(idx.columns,pd.MultiIndex):
+        # yfinance 單一ticker在不同版本可能仍回傳MultiIndex
+        try:
+            idx=idx.xs("^TWII",axis=1,level=-1)
+        except Exception:
+            idx.columns=[c[0] if isinstance(c,tuple) else c for c in idx.columns]
+    idx=idx.rename(columns={c:str(c).title() for c in idx.columns})
+    if "Close" not in idx.columns:
+        return pd.DataFrame()
+    idx=idx.copy()
+    idx.index=pd.to_datetime(idx.index,utc=True,errors="coerce")
+    idx=idx[~idx.index.isna()].sort_index()
+    idx["MKT_MA5"]=idx["Close"].rolling(5).mean()
+    idx["MKT_MA20"]=idx["Close"].rolling(20).mean()
+    idx["MKT_RET5"]=idx["Close"].pct_change(5)*100
+    idx["MKT_RET20"]=idx["Close"].pct_change(20)*100
+    idx["MKT_MA20_SLOPE"]=idx["MKT_MA20"].diff(3)
+    # shift(1)：訊號當天只使用前一個完成日
+    m=idx[["Close","MKT_MA5","MKT_MA20","MKT_RET5","MKT_RET20","MKT_MA20_SLOPE"]].shift(1).dropna().reset_index()
+    m=m.rename(columns={m.columns[0]:"_mkt_dt","Close":"大盤收盤"})
+    m["_mkt_dt"]=pd.to_datetime(m["_mkt_dt"],utc=True,errors="coerce")
+
+    t=trades.copy()
+    t["_dt"]=pd.to_datetime(t["訊號時間"],utc=True,errors="coerce")
+    t=t.dropna(subset=["_dt"]).sort_values("_dt")
+    x=pd.merge_asof(t,m.sort_values("_mkt_dt"),left_on="_dt",right_on="_mkt_dt",direction="backward")
+    x["大盤站上MA20"]=x["大盤收盤"]>=x["MKT_MA20"]
+    x["大盤MA20上彎"]=x["MKT_MA20_SLOPE"]>0
+    x["大盤5日報酬正"]=x["MKT_RET5"]>0
+
+    rows=[]
+    for factor,col in [("大盤位置","大盤站上MA20"),("大盤趨勢","大盤MA20上彎"),("大盤短動能","大盤5日報酬正")]:
+        for val,label in [(True,"是"),(False,"否")]:
+            g=x[x[col].eq(val)]
+            if g.empty: continue
+            r=pd.to_numeric(g["淨報酬%"],errors="coerce").dropna()
+            gp=r[r>0].sum(); gl=-r[r<0].sum()
+            pf=np.inf if gl==0 and gp>0 else (gp/gl if gl>0 else np.nan)
+            rows.append({"市場因子":factor,"狀態":label,"交易數":len(r),
+                         "股票數":int(g["股票"].nunique()),"勝率%":float((r>0).mean()*100),
+                         "平均淨報酬%":float(r.mean()),"中位淨報酬%":float(r.median()),"整體PF":pf})
     return pd.DataFrame(rows)
 
 
@@ -1465,10 +1524,11 @@ if run:
         block_summary = time_block_stability(oos_trades, blocks=4)
         state_diag = state_at_entry_diagnostics(oos_trades)
         filter_robust = state_filter_robustness(oos_trades, blocks=4)
-        st.session_state["st_v152_oos"] = {
+        market_diag = market_regime_diagnostics(oos_trades, period)
+        st.session_state["st_v160_oos"] = {
             "detail": oos_detail, "summary": oos_summary, "trades": oos_trades,
             "blocks": block_summary, "state_diag": state_diag,
-            "filter_robust": filter_robust,
+            "filter_robust": filter_robust, "market_diag": market_diag,
             "pool": ranked_pool, "symbols": symbols
         }
         summary, data_map, trade_map = pd.DataFrame(), {}, {}
@@ -1550,7 +1610,7 @@ if run:
         "trade_map": trade_map,
     }
 
-oos_state = st.session_state.get("st_v152_oos")
+oos_state = st.session_state.get("st_v160_oos")
 if research_mode == "60m五日OOS驗證" and oos_state:
     st.markdown("## 🧪 60m＋K<30＋5日｜時間穩定度驗證")
     st.caption("規則完全固定；所有股票共用同一個全市場時間切點，前60%時間區段為樣本內、後40%為樣本外。股票池仍由近期流動性建立，因此仍屬固定股票池時間OOS。")
@@ -1560,6 +1620,7 @@ if research_mode == "60m五日OOS驗證" and oos_state:
     oblocks=oos_state.get("blocks",pd.DataFrame())
     ostate=oos_state.get("state_diag",pd.DataFrame())
     ofilter=oos_state.get("filter_robust",pd.DataFrame())
+    omarket=oos_state.get("market_diag",pd.DataFrame())
     if not osum.empty:
         st.dataframe(osum.round(3),use_container_width=True,hide_index=True)
         st.download_button("⬇️ 下載【OOS驗證總表】",osum.to_csv(index=False).encode("utf-8-sig"),
@@ -1581,13 +1642,19 @@ if research_mode == "60m五日OOS驗證" and oos_state:
         st.dataframe(ofilter.round(3),use_container_width=True,hide_index=True)
         st.download_button("⬇️ 下載【候選市場狀態驗證】",ofilter.to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"{APP_VERSION}_候選市場狀態驗證.csv",mime="text/csv",use_container_width=True)
+    if not omarket.empty:
+        st.markdown("### 大盤環境診斷")
+        st.caption("使用 ^TWII 前一個已完成交易日的日線，只做市場regime診斷，不直接最佳化成濾網。")
+        st.dataframe(omarket.round(3),use_container_width=True,hide_index=True)
+        st.download_button("⬇️ 下載【大盤環境診斷】",omarket.to_csv(index=False).encode("utf-8-sig"),
+                           file_name=f"{APP_VERSION}_大盤環境診斷.csv",mime="text/csv",use_container_width=True)
     if not odet.empty:
         st.download_button("⬇️ 下載【OOS個股策略明細】",odet.to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"{APP_VERSION}_OOS個股策略明細.csv",mime="text/csv",use_container_width=True)
     if not otr.empty:
         st.download_button("⬇️ 下載【OOS逐筆交易明細】",otr.to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"{APP_VERSION}_OOS逐筆交易明細.csv",mime="text/csv",use_container_width=True)
-    st.info("下一輪請提供：①【候選市場狀態驗證】②【四段時間穩定度】③【OOS逐筆交易明細】。訊號狀態診斷這輪不用再給；重點是候選狀態能否跨四段維持，而不是單看全期間漂亮數字。")
+    st.info("下一輪請提供：①【大盤環境診斷】②【四段時間穩定度】③【OOS逐筆交易明細】。候選市場狀態驗證這輪不用再給；重點改成確認第1段失效是否來自大盤regime。")
 
 mtf_state = st.session_state.get("st_v130_mtf")
 if research_mode == "多週期當沖/隔日驗證" and mtf_state:
@@ -1911,6 +1978,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.5.2 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.6.0 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
