@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.9.0
+黑嚕嚕－短線交易雷達 ST V1.9.1
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,13 +36,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.9.0"
+APP_VERSION = "ST V1.9.1"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.9.0"
-EXPORT_PREFIX = "ST_V1.9.0"
+APP_VERSION = "ST_V1.9.1"
+EXPORT_PREFIX = "ST_V1.9.1"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -793,18 +793,21 @@ def build_daily_radar_status(trades: pd.DataFrame, wf_detail: pd.DataFrame, obse
 
     # 每檔只留最新一個有效歷史訊號，避免雷達同股重複
     x = x.sort_values("_dt").groupby("股票", as_index=False).tail(1).copy()
-    latest_market_time = x["_dt"].max()
+    latest_signal_time = x["_dt"].max()
+    now_tw = pd.Timestamp.now(tz="Asia/Taipei")
+    now_utc = now_tw.tz_convert("UTC")
 
-    # 以工作日估算5日研究觀察窗；後續接Shioaji/交易日曆時再換正式交易日。
+    # 以工作日估算5日研究觀察窗；後續接正式交易日曆/Shioaji時再處理國定假日。
     sig_date = x["_dt"].dt.tz_convert("Asia/Taipei").dt.date
     x["預計觀察至"] = [pd.Timestamp(np.busday_offset(d, observe_days, roll="forward")).date() for d in sig_date]
-    current_date = latest_market_time.tz_convert("Asia/Taipei").date()
+    current_date = now_tw.date()
 
-    # 新訊號：與目前資料最新時間相距 <= 1個60m bar；觀察中：仍在5工作日窗；否則逾期。
-    age_hours = (latest_market_time - x["_dt"]).dt.total_seconds() / 3600
-    x["距最新資料小時"] = age_hours.round(1)
+    # V1.9.1：狀態必須相對「現在」而不是相對「最後一筆訊號」。
+    # 新訊號暫定24小時內；觀察中則依5工作日觀察窗。
+    age_hours = (now_utc - x["_dt"]).dt.total_seconds() / 3600
+    x["距現在小時"] = age_hours.round(1)
     x["目前狀態"] = np.where(
-        age_hours <= 1.5, "🟢 新訊號",
+        (age_hours >= 0) & (age_hours <= 24), "🟢 新訊號",
         np.where(pd.to_datetime(x["預計觀察至"]) >= pd.Timestamp(current_date), "🟡 觀察中", "⚪ 已逾期")
     )
 
@@ -821,7 +824,7 @@ def build_daily_radar_status(trades: pd.DataFrame, wf_detail: pd.DataFrame, obse
     x["核心規則"] = "60m KD黃金交叉 + K<30｜5日研究觀察"
 
     cols = [c for c in [
-        "股票","研究主題","60m K值","KD狀態","訊號時間","距最新資料小時",
+        "股票","研究主題","60m K值","KD狀態","訊號時間","距現在小時",
         "預計觀察至","WF分層","WF可交易分數","目前狀態","核心規則"
     ] if c in x.columns]
 
@@ -1894,13 +1897,14 @@ if run:
             )
         radar_validation = validate_radar_ranking(radar_for_validation, oos_trades)
         daily_radar = build_daily_radar_status(oos_trades, wf_detail, observe_days=5)
-        st.session_state["st_v190_oos"] = {
+        latest_signal = pd.to_datetime(oos_trades["訊號時間"],utc=True,errors="coerce").max() if not oos_trades.empty else pd.NaT
+        st.session_state["st_v191_oos"] = {
             "detail": oos_detail, "summary": oos_summary, "trades": oos_trades,
             "blocks": block_summary, "state_diag": state_diag,
             "filter_robust": filter_robust, "market_diag": market_diag,
             "market_blocks": market_blocks,
             "wf_summary": wf_summary, "wf_detail": wf_detail, "wf_status": wf_status, "wf_time": wf_time,
-            "radar_candidates": radar_candidates, "radar_validation": radar_validation, "daily_radar": daily_radar,
+            "radar_candidates": radar_candidates, "radar_validation": radar_validation, "daily_radar": daily_radar, "latest_signal": latest_signal,
             "pool": ranked_pool, "symbols": symbols
         }
         summary, data_map, trade_map = pd.DataFrame(), {}, {}
@@ -1982,7 +1986,7 @@ if run:
         "trade_map": trade_map,
     }
 
-oos_state = st.session_state.get("st_v190_oos")
+oos_state = st.session_state.get("st_v191_oos")
 if research_mode == "60m五日OOS驗證" and oos_state:
     st.markdown("## 🧪 60m＋K<30＋5日｜時間穩定度驗證")
     st.caption("規則完全固定；所有股票共用同一個全市場時間切點，前60%時間區段為樣本內、後40%為樣本外。股票池仍由近期流動性建立，因此仍屬固定股票池時間OOS。")
@@ -2001,9 +2005,13 @@ if research_mode == "60m五日OOS驗證" and oos_state:
     oradar=oos_state.get("radar_candidates",pd.DataFrame())
     oradar_val=oos_state.get("radar_validation",pd.DataFrame())
     odaily=oos_state.get("daily_radar",pd.DataFrame())
+    olatest=oos_state.get("latest_signal",pd.NaT)
     if not odaily.empty:
         st.markdown("## 📡 每日短線雷達")
-        st.caption("固定研究主線：60m KD黃金交叉＋K<30／5日觀察／不做預測性總分。優先顯示新訊號與觀察中標的。")
+        st.caption("固定研究主線：60m KD黃金交叉＋K<30／5日觀察／不做預測性總分。V1.9.1狀態改以台灣目前時間判斷，不再把最後一筆歷史訊號誤當成現在。")
+        if pd.notna(olatest):
+            _ls = pd.Timestamp(olatest).tz_convert("Asia/Taipei")
+            st.info(f"本批回測最後一筆策略訊號：{_ls:%Y-%m-%d %H:%M}（台灣時間）。注意：這是『最後訊號時間』，不是行情資料最後更新時間。")
         active = odaily[odaily["目前狀態"].isin(["🟢 新訊號","🟡 觀察中"])].copy()
         c1,c2,c3 = st.columns(3)
         c1.metric("新訊號", int((odaily["目前狀態"]=="🟢 新訊號").sum()))
@@ -2088,7 +2096,7 @@ if research_mode == "60m五日OOS驗證" and oos_state:
     if not otr.empty:
         st.download_button("⬇️ 下載【OOS逐筆交易明細】",otr.to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"{APP_VERSION}_OOS逐筆交易明細.csv",mime="text/csv",use_container_width=True)
-    st.info("下一輪請提供：①【每日短線雷達】②【WalkForward逐筆明細】。本版開始驗證每日實用雷達的訊號狀態；研究主線固定，不再調雷達總分。")
+    st.info("下一輪請提供：①【每日短線雷達】。本版先修正狀態時間基準；若狀態正確，下一版把雷達訊號掃描與歷史回測正式拆開，直接從最新60m行情建立當日雷達。")
 
 mtf_state = st.session_state.get("st_v130_mtf")
 if research_mode == "多週期當沖/隔日驗證" and mtf_state:
@@ -2412,6 +2420,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.9.0 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.9.1 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
