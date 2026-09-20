@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.3.1
+黑嚕嚕－短線交易雷達 ST V1.3.2
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,13 +36,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.3.1"
+APP_VERSION = "ST V1.3.2"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.3.1"
-EXPORT_PREFIX = "ST_V1.3.1"
+APP_VERSION = "ST_V1.3.2"
+EXPORT_PREFIX = "ST_V1.3.2"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -261,12 +261,25 @@ def build_multitimeframe_5m_signal(
 
     base = x5.reset_index()
     time_col = base.columns[0]
-    base = base.rename(columns={time_col: "_time"}).sort_values("_time")
+    base = base.rename(columns={time_col: "_time"})
 
     z15 = a15.reset_index()
-    z15 = z15.rename(columns={z15.columns[0]: "_time"}).sort_values("_time")
+    z15 = z15.rename(columns={z15.columns[0]: "_time"})
     z60 = a60.reset_index()
-    z60 = z60.rename(columns={z60.columns[0]: "_time"}).sort_values("_time")
+    z60 = z60.rename(columns={z60.columns[0]: "_time"})
+
+    # V1.3.2：Yahoo 不同 interval 可能回傳 datetime64[ns] / datetime64[us]，
+    # merge_asof 要求完全相同 dtype。統一轉為 UTC datetime64[ns] 後再合併。
+    def _normalize_merge_time(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        ts = pd.to_datetime(out["_time"], utc=True, errors="coerce")
+        out["_time"] = ts.astype("datetime64[ns, UTC]")
+        out = out.dropna(subset=["_time"]).sort_values("_time").reset_index(drop=True)
+        return out
+
+    base = _normalize_merge_time(base)
+    z15 = _normalize_merge_time(z15)
+    z60 = _normalize_merge_time(z60)
 
     base = pd.merge_asof(base, z15, on="_time", direction="backward")
     base = pd.merge_asof(base, z60, on="_time", direction="backward")
@@ -312,7 +325,18 @@ def run_multitimeframe_batch(
     diagnostics = []
     for iv, raw in [("5m", raw5), ("15m", raw15), ("60m", raw60)]:
         ok = sum(1 for s in symbols if s in raw and not raw[s].empty)
-        diagnostics.append({"週期": iv, "要求股票數": len(symbols), "成功下載": ok, "失敗/空資料": len(symbols)-ok})
+        sample_dtype = ""
+        for s in symbols:
+            if s in raw and not raw[s].empty:
+                sample_dtype = str(raw[s].index.dtype)
+                break
+        diagnostics.append({
+            "週期": iv,
+            "要求股票數": len(symbols),
+            "成功下載": ok,
+            "失敗/空資料": len(symbols)-ok,
+            "原始時間型別": sample_dtype,
+        })
 
     for n, symbol in enumerate(symbols, 1):
         if symbol not in raw5 or symbol not in raw15 or symbol not in raw60:
@@ -1590,6 +1614,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.3.1 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.3.2 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
