@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.6.2
+黑嚕嚕－短線交易雷達 ST V1.6.3
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
-1. 統一指標：MA5 / MA15 / MA30 / MA60 / MA150 + KD(9,3,3)
+1. 統一指標：MA5 / MA15 / MA30 / MA60 / MA200 + KD(9,3,3)
 2. 比較 5m / 15m / 60m
 3. 比較當沖、隔日、2日、3日、5日持有
 4. 先做研究與回測，不下真單
@@ -36,13 +36,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.6.2"
+APP_VERSION = "ST V1.6.3"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.6.2"
-EXPORT_PREFIX = "ST_V1.6.2"
+APP_VERSION = "ST_V1.6.3"
+EXPORT_PREFIX = "ST_V1.6.3"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -155,9 +155,9 @@ def add_indicators(d: pd.DataFrame) -> pd.DataFrame:
         (x["MA5"] > x["MA15"]) &
         (x["MA15"] > x["MA30"]) &
         (x["MA30"] > x["MA60"]) &
-        (x["MA60"] > x["MA150"])
+        (x["MA60"] > x["MA200"])
     )
-    x["PRICE_GT_MA150"] = x["Close"] > x["MA150"]
+    x["PRICE_GT_MA200"] = x["Close"] > x["MA200"]
 
     x["MA5_XUP_MA15"] = (x["MA5"] > x["MA15"]) & (x["MA5"].shift(1) <= x["MA15"].shift(1))
     x["MA15_XUP_MA30"] = (x["MA15"] > x["MA30"]) & (x["MA15"].shift(1) <= x["MA30"].shift(1))
@@ -175,8 +175,8 @@ def add_indicators(d: pd.DataFrame) -> pd.DataFrame:
         x[f"MA{n}_SLOPE3"] = x[f"MA{n}"] - x[f"MA{n}"].shift(3)
 
     # V1.1：量能比 = 當根成交量 / 前20期平均量（shift 1 避免把當根放入基準）。
-    x["VOL_MA15_PREV"] = x["Volume"].shift(1).rolling(20, min_periods=20).mean()
-    x["VOL_RATIO20"] = x["Volume"] / x["VOL_MA15_PREV"].replace(0, np.nan)
+    x["VOL_MA20_PREV"] = x["Volume"].shift(1).rolling(20, min_periods=20).mean()
+    x["VOL_RATIO20"] = x["Volume"] / x["VOL_MA20_PREV"].replace(0, np.nan)
 
     # V1.1：日內 VWAP，每個交易日重新累積。
     tp = (x["High"] + x["Low"] + x["Close"]) / 3.0
@@ -210,7 +210,7 @@ def signal_mask(d: pd.DataFrame, rule: str) -> pd.Series:
         ),
         "完整多頭排列": d.get("FULL_BULL", false) & (~d.get("FULL_BULL", false).shift(1).fillna(False)),
         "完整多頭排列 + KD黃金交叉": d.get("FULL_BULL", false) & d.get("KD_GOLD", false),
-        "站上MA150 + KD黃金交叉": d.get("PRICE_GT_MA150", false) & d.get("KD_GOLD", false),
+        "站上MA200 + KD黃金交叉": d.get("PRICE_GT_MA200", false) & d.get("KD_GOLD", false),
         "KD黃金交叉 + K<30": d.get("KD_GOLD", false) & (d.get("K", pd.Series(np.nan, index=d.index)) < 30),
         "KD黃金交叉 + K30-50": d.get("KD_GOLD", false) & (d.get("K", pd.Series(np.nan, index=d.index)) >= 30) & (d.get("K", pd.Series(np.nan, index=d.index)) < 50),
         "KD黃金交叉 + K50-80": d.get("KD_GOLD", false) & (d.get("K", pd.Series(np.nan, index=d.index)) >= 50) & (d.get("K", pd.Series(np.nan, index=d.index)) < 80),
@@ -938,7 +938,7 @@ def classify_stock_state(data_map: Dict[str, pd.DataFrame]) -> Dict[str, object]
         trend_score += 1
     if pd.notna(last.get("MA60_SLOPE3")) and last["MA60_SLOPE3"] > 0:
         trend_score += 1
-    if bool(last.get("PRICE_GT_MA150", False)):
+    if bool(last.get("PRICE_GT_MA200", False)):
         trend_score += 1
     if bool(last.get("MA_BULL_5_15", False)) and bool(last.get("MA_BULL_15_30", False)):
         trend_score += 1
@@ -1412,7 +1412,7 @@ def plot_chart(d: pd.DataFrame, interval: str):
         return
     show = d.tail(300)
     if not PLOTLY_OK:
-        st.line_chart(show[["Close", "MA5", "MA15", "MA30", "MA60", "MA150"]])
+        st.line_chart(show[["Close", "MA5", "MA15", "MA30", "MA60", "MA200"]])
         st.line_chart(show[["K", "D"]])
         return
 
@@ -1492,7 +1492,7 @@ with st.sidebar:
         "MA5>15>30>60 + KD黃金交叉",
         "完整多頭排列",
         "完整多頭排列 + KD黃金交叉",
-        "站上MA150 + KD黃金交叉",
+        "站上MA200 + KD黃金交叉",
         "KD黃金交叉 + K<30",
         "KD黃金交叉 + K30-50",
         "KD黃金交叉 + K50-80",
@@ -1586,7 +1586,7 @@ if run:
         filter_robust = state_filter_robustness(oos_trades, blocks=4)
         market_diag = market_regime_diagnostics(oos_trades, period)
         market_blocks = market_regime_by_timeblock(oos_trades, blocks=4)
-        st.session_state["st_v162_oos"] = {
+        st.session_state["st_v163_oos"] = {
             "detail": oos_detail, "summary": oos_summary, "trades": oos_trades,
             "blocks": block_summary, "state_diag": state_diag,
             "filter_robust": filter_robust, "market_diag": market_diag,
@@ -1672,7 +1672,7 @@ if run:
         "trade_map": trade_map,
     }
 
-oos_state = st.session_state.get("st_v162_oos")
+oos_state = st.session_state.get("st_v163_oos")
 if research_mode == "60m五日OOS驗證" and oos_state:
     st.markdown("## 🧪 60m＋K<30＋5日｜時間穩定度驗證")
     st.caption("規則完全固定；所有股票共用同一個全市場時間切點，前60%時間區段為樣本內、後40%為樣本外。股票池仍由近期流動性建立，因此仍屬固定股票池時間OOS。")
@@ -2047,6 +2047,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.6.2 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.6.3 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
