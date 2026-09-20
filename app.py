@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.3.0
+黑嚕嚕－短線交易雷達 ST V1.3.1
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,13 +36,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.3.0"
+APP_VERSION = "ST V1.3.1"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.3.0"
-EXPORT_PREFIX = "ST_V1.3.0"
+APP_VERSION = "ST_V1.3.1"
+EXPORT_PREFIX = "ST_V1.3.1"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1069,7 +1069,8 @@ st.info(
 
 with st.sidebar:
     st.header("研究設定")
-    research_mode = st.radio("研究模式", ["單一股票", "跨股票批次", "多週期當沖/隔日驗證"], horizontal=True)
+    st.info("V1.3.1 預設直接進入【多週期當沖/隔日驗證】。本輪請不要切回舊的跨股票批次。")
+    research_mode = st.radio("研究模式", ["單一股票", "跨股票批次", "多週期當沖/隔日驗證"], index=2, horizontal=True)
     code = st.text_input("股票代號", value="2330")
     pool_mode = st.radio(
         "批次股票池",
@@ -1097,7 +1098,7 @@ with st.sidebar:
     top_n = st.slider(
         "動態短線池檔數",
         10, 100, 50, step=10,
-        disabled=(research_mode != "跨股票批次" or pool_mode != "動態短線TOP池"),
+        disabled=not (research_mode == "多週期當沖/隔日驗證" or (research_mode == "跨股票批次" and pool_mode == "動態短線TOP池")),
         help="先由候選母池用近期成交金額、成交量與振幅排序，再對入選股票執行分K策略健診。",
     )
     market = st.radio("市場", ["上市", "上櫃"], horizontal=True)
@@ -1277,13 +1278,15 @@ if research_mode == "多週期當沖/隔日驗證" and mtf_state:
 
     if not mdiag.empty:
         st.dataframe(mdiag, use_container_width=True, hide_index=True)
+    if mcross.empty:
+        st.warning("目前沒有產生多週期跨股結果。請先確認5m/15m/60m三個週期的成功下載數，再把畫面截圖給我。")
     if not mcross.empty:
         st.markdown("### 跨股票穩定度")
         st.dataframe(mcross.round(3), use_container_width=True, hide_index=True)
         st.download_button(
             "⬇️ 下載【多週期跨股票穩定度】",
             mcross.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"{EXPORT_PREFIX}_多週期跨股票穩定度.csv",
+            file_name=f"{APP_VERSION}_多週期跨股票穩定度.csv",
             mime="text/csv",
             use_container_width=True,
         )
@@ -1291,7 +1294,7 @@ if research_mode == "多週期當沖/隔日驗證" and mtf_state:
         st.download_button(
             "⬇️ 下載【多週期批次策略明細】",
             mdetail.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"{EXPORT_PREFIX}_多週期批次策略明細.csv",
+            file_name=f"{APP_VERSION}_多週期批次策略明細.csv",
             mime="text/csv",
             use_container_width=True,
         )
@@ -1299,7 +1302,7 @@ if research_mode == "多週期當沖/隔日驗證" and mtf_state:
         st.download_button(
             "⬇️ 下載【多週期逐筆交易明細】",
             mtrades.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"{EXPORT_PREFIX}_多週期逐筆交易明細.csv",
+            file_name=f"{APP_VERSION}_多週期逐筆交易明細.csv",
             mime="text/csv",
             use_container_width=True,
         )
@@ -1308,11 +1311,11 @@ if research_mode == "多週期當沖/隔日驗證" and mtf_state:
         st.download_button(
             "⬇️ 下載【多週期驗證股票池】",
             rp.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"{EXPORT_PREFIX}_多週期驗證股票池.csv",
+            file_name=f"{APP_VERSION}_多週期驗證股票池.csv",
             mime="text/csv",
             use_container_width=True,
         )
-    st.info("下一輪請提供：①【多週期跨股票穩定度】②【多週期批次策略明細】③【多週期逐筆交易明細】。股票池只有名單改變很多時才需要提供。")
+    st.info("下一輪請提供這3個中文下載檔：①【多週期跨股票穩定度】②【多週期批次策略明細】③【多週期逐筆交易明細】。三個按鈕名稱與實際CSV檔名已統一。")
 
 state = st.session_state.get("st_v120")
 batch_state = st.session_state.get("st_v120_batch")
@@ -1587,6 +1590,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.3.0 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.3.1 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
