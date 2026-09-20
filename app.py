@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.12.2
+黑嚕嚕－短線交易雷達 ST V1.12.3
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,13 +36,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.12.2"
+APP_VERSION = "ST V1.12.3"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.12.2"
-EXPORT_PREFIX = "ST_V1.12.2"
+APP_VERSION = "ST_V1.12.3"
+EXPORT_PREFIX = "ST_V1.12.3"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -2170,6 +2170,7 @@ _ph=st.session_state.get("st_v1122_pool20_hist")
 if simple_mode=="進階研究" and research_mode=="股票池2.0歷史驗證" and _ph:
     _hs=_ph.get("summary",pd.DataFrame()); _ht=_ph.get("trades",pd.DataFrame())
     st.subheader("🧪 股票池2.0歷史驗證結果")
+    st.success("歷史驗證已完成。下方應出現兩個歷史驗證下載檔，不是『逐檔診斷／摘要』。")
     st.warning("這一輪只檢驗『前一完成日』爆量/熱門是否對核心策略有資訊價值；尚未把條件寫進正式雷達。")
     if not _hs.empty:
         st.dataframe(_hs.round(3),use_container_width=True,hide_index=True)
@@ -2787,6 +2788,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.12.2 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.12.3 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
