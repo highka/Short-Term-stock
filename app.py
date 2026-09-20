@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.6.0
+黑嚕嚕－短線交易雷達 ST V1.6.2
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
-1. 統一指標：MA5 / MA15 / MA30 / MA60 / MA200 + KD(9,3,3)
+1. 統一指標：MA5 / MA15 / MA30 / MA60 / MA150 + KD(9,3,3)
 2. 比較 5m / 15m / 60m
 3. 比較當沖、隔日、2日、3日、5日持有
 4. 先做研究與回測，不下真單
@@ -36,13 +36,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.6.0"
+APP_VERSION = "ST V1.6.2"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.6.0"
-EXPORT_PREFIX = "ST_V1.6.0"
+APP_VERSION = "ST_V1.6.2"
+EXPORT_PREFIX = "ST_V1.6.2"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -155,9 +155,9 @@ def add_indicators(d: pd.DataFrame) -> pd.DataFrame:
         (x["MA5"] > x["MA15"]) &
         (x["MA15"] > x["MA30"]) &
         (x["MA30"] > x["MA60"]) &
-        (x["MA60"] > x["MA200"])
+        (x["MA60"] > x["MA150"])
     )
-    x["PRICE_GT_MA200"] = x["Close"] > x["MA200"]
+    x["PRICE_GT_MA150"] = x["Close"] > x["MA150"]
 
     x["MA5_XUP_MA15"] = (x["MA5"] > x["MA15"]) & (x["MA5"].shift(1) <= x["MA15"].shift(1))
     x["MA15_XUP_MA30"] = (x["MA15"] > x["MA30"]) & (x["MA15"].shift(1) <= x["MA30"].shift(1))
@@ -175,8 +175,8 @@ def add_indicators(d: pd.DataFrame) -> pd.DataFrame:
         x[f"MA{n}_SLOPE3"] = x[f"MA{n}"] - x[f"MA{n}"].shift(3)
 
     # V1.1：量能比 = 當根成交量 / 前20期平均量（shift 1 避免把當根放入基準）。
-    x["VOL_MA20_PREV"] = x["Volume"].shift(1).rolling(20, min_periods=20).mean()
-    x["VOL_RATIO20"] = x["Volume"] / x["VOL_MA20_PREV"].replace(0, np.nan)
+    x["VOL_MA15_PREV"] = x["Volume"].shift(1).rolling(20, min_periods=20).mean()
+    x["VOL_RATIO20"] = x["Volume"] / x["VOL_MA15_PREV"].replace(0, np.nan)
 
     # V1.1：日內 VWAP，每個交易日重新累積。
     tp = (x["High"] + x["Low"] + x["Close"]) / 3.0
@@ -210,7 +210,7 @@ def signal_mask(d: pd.DataFrame, rule: str) -> pd.Series:
         ),
         "完整多頭排列": d.get("FULL_BULL", false) & (~d.get("FULL_BULL", false).shift(1).fillna(False)),
         "完整多頭排列 + KD黃金交叉": d.get("FULL_BULL", false) & d.get("KD_GOLD", false),
-        "站上MA200 + KD黃金交叉": d.get("PRICE_GT_MA200", false) & d.get("KD_GOLD", false),
+        "站上MA150 + KD黃金交叉": d.get("PRICE_GT_MA150", false) & d.get("KD_GOLD", false),
         "KD黃金交叉 + K<30": d.get("KD_GOLD", false) & (d.get("K", pd.Series(np.nan, index=d.index)) < 30),
         "KD黃金交叉 + K30-50": d.get("KD_GOLD", false) & (d.get("K", pd.Series(np.nan, index=d.index)) >= 30) & (d.get("K", pd.Series(np.nan, index=d.index)) < 50),
         "KD黃金交叉 + K50-80": d.get("KD_GOLD", false) & (d.get("K", pd.Series(np.nan, index=d.index)) >= 50) & (d.get("K", pd.Series(np.nan, index=d.index)) < 80),
@@ -445,12 +445,12 @@ def market_regime_diagnostics(trades: pd.DataFrame, period: str) -> pd.DataFrame
     idx.index=pd.to_datetime(idx.index,utc=True,errors="coerce")
     idx=idx[~idx.index.isna()].sort_index()
     idx["MKT_MA5"]=idx["Close"].rolling(5).mean()
-    idx["MKT_MA20"]=idx["Close"].rolling(20).mean()
+    idx["MKT_MA15"]=idx["Close"].rolling(15).mean()
     idx["MKT_RET5"]=idx["Close"].pct_change(5)*100
-    idx["MKT_RET20"]=idx["Close"].pct_change(20)*100
-    idx["MKT_MA20_SLOPE"]=idx["MKT_MA20"].diff(3)
+    idx["MKT_RET15"]=idx["Close"].pct_change(15)*100
+    idx["MKT_MA15_SLOPE"]=idx["MKT_MA15"].diff(3)
     # shift(1)：訊號當天只使用前一個完成日
-    m=idx[["Close","MKT_MA5","MKT_MA20","MKT_RET5","MKT_RET20","MKT_MA20_SLOPE"]].shift(1).dropna().reset_index()
+    m=idx[["Close","MKT_MA5","MKT_MA15","MKT_RET5","MKT_RET15","MKT_MA15_SLOPE"]].shift(1).dropna().reset_index()
     m=m.rename(columns={m.columns[0]:"_mkt_dt","Close":"大盤收盤"})
     m["_mkt_dt"]=pd.to_datetime(m["_mkt_dt"],utc=True,errors="coerce")
 
@@ -458,12 +458,12 @@ def market_regime_diagnostics(trades: pd.DataFrame, period: str) -> pd.DataFrame
     t["_dt"]=pd.to_datetime(t["訊號時間"],utc=True,errors="coerce")
     t=t.dropna(subset=["_dt"]).sort_values("_dt")
     x=pd.merge_asof(t,m.sort_values("_mkt_dt"),left_on="_dt",right_on="_mkt_dt",direction="backward")
-    x["大盤站上MA20"]=x["大盤收盤"]>=x["MKT_MA20"]
-    x["大盤MA20上彎"]=x["MKT_MA20_SLOPE"]>0
+    x["大盤站上MA15"]=x["大盤收盤"]>=x["MKT_MA15"]
+    x["大盤MA15上彎"]=x["MKT_MA15_SLOPE"]>0
     x["大盤5日報酬正"]=x["MKT_RET5"]>0
 
     rows=[]
-    for factor,col in [("大盤位置","大盤站上MA20"),("大盤趨勢","大盤MA20上彎"),("大盤短動能","大盤5日報酬正")]:
+    for factor,col in [("大盤位置","大盤站上MA15"),("大盤趨勢","大盤MA15上彎"),("大盤短動能","大盤5日報酬正")]:
         for val,label in [(True,"是"),(False,"否")]:
             g=x[x[col].eq(val)]
             if g.empty: continue
@@ -473,6 +473,66 @@ def market_regime_diagnostics(trades: pd.DataFrame, period: str) -> pd.DataFrame
             rows.append({"市場因子":factor,"狀態":label,"交易數":len(r),
                          "股票數":int(g["股票"].nunique()),"勝率%":float((r>0).mean()*100),
                          "平均淨報酬%":float(r.mean()),"中位淨報酬%":float(r.median()),"整體PF":pf})
+    return pd.DataFrame(rows)
+
+
+def market_regime_by_timeblock(trades: pd.DataFrame, blocks: int = 4) -> pd.DataFrame:
+    """
+    把 ^TWII 前一完成交易日的市場狀態，與四段時間直接交叉。
+    目的：確認第1段失效是否真的由某一大盤regime主導，而非只看全期間分組。
+    """
+    if trades is None or trades.empty:
+        return pd.DataFrame()
+    try:
+        idx=yf.download("^TWII", period="6mo", interval="1d", auto_adjust=False,
+                        progress=False, threads=False)
+    except Exception:
+        return pd.DataFrame()
+    if idx is None or idx.empty:
+        return pd.DataFrame()
+    if isinstance(idx.columns,pd.MultiIndex):
+        try:
+            idx=idx.xs("^TWII",axis=1,level=-1)
+        except Exception:
+            idx.columns=[c[0] if isinstance(c,tuple) else c for c in idx.columns]
+    idx=idx.rename(columns={c:str(c).title() for c in idx.columns})
+    if "Close" not in idx.columns:
+        return pd.DataFrame()
+    idx.index=pd.to_datetime(idx.index,utc=True,errors="coerce")
+    idx=idx[~idx.index.isna()].sort_index()
+    idx["MKT_MA15"]=idx["Close"].rolling(15).mean()
+    idx["MKT_RET5"]=idx["Close"].pct_change(5)*100
+    idx["MKT_MA15_SLOPE"]=idx["MKT_MA15"].diff(3)
+    m=idx[["Close","MKT_MA15","MKT_RET5","MKT_MA15_SLOPE"]].shift(1).dropna().reset_index()
+    m=m.rename(columns={m.columns[0]:"_mkt_dt","Close":"大盤收盤"})
+    m["_mkt_dt"]=pd.to_datetime(m["_mkt_dt"],utc=True,errors="coerce")
+
+    t=trades.copy()
+    t["_dt"]=pd.to_datetime(t["訊號時間"],utc=True,errors="coerce")
+    t=t.dropna(subset=["_dt"]).sort_values("_dt").reset_index(drop=True)
+    x=pd.merge_asof(t,m.sort_values("_mkt_dt"),left_on="_dt",right_on="_mkt_dt",direction="backward")
+    x["大盤MA15上彎"]=x["MKT_MA15_SLOPE"]>0
+    x["大盤5日報酬正"]=x["MKT_RET5"]>0
+
+    bounds=x["_dt"].quantile(np.linspace(0,1,blocks+1)).tolist()
+    rows=[]
+    for i in range(blocks):
+        lo,hi=bounds[i],bounds[i+1]
+        tm=(x["_dt"]>=lo) & ((x["_dt"]<=hi) if i==blocks-1 else (x["_dt"]<hi))
+        for factor,col in [("大盤MA15上彎","大盤MA15上彎"),("大盤5日報酬正","大盤5日報酬正")]:
+            for val,label in [(True,"是"),(False,"否")]:
+                g=x[tm & x[col].eq(val)]
+                r=pd.to_numeric(g["淨報酬%"],errors="coerce").dropna()
+                if r.empty: continue
+                gp=r[r>0].sum(); gl=-r[r<0].sum()
+                pf=np.inf if gl==0 and gp>0 else (gp/gl if gl>0 else np.nan)
+                rows.append({
+                    "區段":f"時間區段{i+1}/{blocks}","開始":lo,"結束":hi,
+                    "市場因子":factor,"狀態":label,"交易數":len(r),
+                    "占該段交易%":float(len(r)/max(1,int(tm.sum()))*100),
+                    "勝率%":float((r>0).mean()*100),"平均淨報酬%":float(r.mean()),
+                    "中位淨報酬%":float(r.median()),"整體PF":pf
+                })
     return pd.DataFrame(rows)
 
 
@@ -878,7 +938,7 @@ def classify_stock_state(data_map: Dict[str, pd.DataFrame]) -> Dict[str, object]
         trend_score += 1
     if pd.notna(last.get("MA60_SLOPE3")) and last["MA60_SLOPE3"] > 0:
         trend_score += 1
-    if bool(last.get("PRICE_GT_MA200", False)):
+    if bool(last.get("PRICE_GT_MA150", False)):
         trend_score += 1
     if bool(last.get("MA_BULL_5_15", False)) and bool(last.get("MA_BULL_15_30", False)):
         trend_score += 1
@@ -1352,7 +1412,7 @@ def plot_chart(d: pd.DataFrame, interval: str):
         return
     show = d.tail(300)
     if not PLOTLY_OK:
-        st.line_chart(show[["Close", "MA5", "MA15", "MA30", "MA60", "MA200"]])
+        st.line_chart(show[["Close", "MA5", "MA15", "MA30", "MA60", "MA150"]])
         st.line_chart(show[["K", "D"]])
         return
 
@@ -1432,7 +1492,7 @@ with st.sidebar:
         "MA5>15>30>60 + KD黃金交叉",
         "完整多頭排列",
         "完整多頭排列 + KD黃金交叉",
-        "站上MA200 + KD黃金交叉",
+        "站上MA150 + KD黃金交叉",
         "KD黃金交叉 + K<30",
         "KD黃金交叉 + K30-50",
         "KD黃金交叉 + K50-80",
@@ -1525,10 +1585,12 @@ if run:
         state_diag = state_at_entry_diagnostics(oos_trades)
         filter_robust = state_filter_robustness(oos_trades, blocks=4)
         market_diag = market_regime_diagnostics(oos_trades, period)
-        st.session_state["st_v160_oos"] = {
+        market_blocks = market_regime_by_timeblock(oos_trades, blocks=4)
+        st.session_state["st_v162_oos"] = {
             "detail": oos_detail, "summary": oos_summary, "trades": oos_trades,
             "blocks": block_summary, "state_diag": state_diag,
             "filter_robust": filter_robust, "market_diag": market_diag,
+            "market_blocks": market_blocks,
             "pool": ranked_pool, "symbols": symbols
         }
         summary, data_map, trade_map = pd.DataFrame(), {}, {}
@@ -1610,7 +1672,7 @@ if run:
         "trade_map": trade_map,
     }
 
-oos_state = st.session_state.get("st_v160_oos")
+oos_state = st.session_state.get("st_v162_oos")
 if research_mode == "60m五日OOS驗證" and oos_state:
     st.markdown("## 🧪 60m＋K<30＋5日｜時間穩定度驗證")
     st.caption("規則完全固定；所有股票共用同一個全市場時間切點，前60%時間區段為樣本內、後40%為樣本外。股票池仍由近期流動性建立，因此仍屬固定股票池時間OOS。")
@@ -1621,6 +1683,7 @@ if research_mode == "60m五日OOS驗證" and oos_state:
     ostate=oos_state.get("state_diag",pd.DataFrame())
     ofilter=oos_state.get("filter_robust",pd.DataFrame())
     omarket=oos_state.get("market_diag",pd.DataFrame())
+    omarket_blocks=oos_state.get("market_blocks",pd.DataFrame())
     if not osum.empty:
         st.dataframe(osum.round(3),use_container_width=True,hide_index=True)
         st.download_button("⬇️ 下載【OOS驗證總表】",osum.to_csv(index=False).encode("utf-8-sig"),
@@ -1648,13 +1711,19 @@ if research_mode == "60m五日OOS驗證" and oos_state:
         st.dataframe(omarket.round(3),use_container_width=True,hide_index=True)
         st.download_button("⬇️ 下載【大盤環境診斷】",omarket.to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"{APP_VERSION}_大盤環境診斷.csv",mime="text/csv",use_container_width=True)
+    if not omarket_blocks.empty:
+        st.markdown("### 大盤環境 × 四段時間")
+        st.caption("直接檢查每一時間區段內的大盤regime與策略績效，避免把全期間相關性誤認成失效原因。")
+        st.dataframe(omarket_blocks.round(3),use_container_width=True,hide_index=True)
+        st.download_button("⬇️ 下載【大盤環境四段交叉驗證】",omarket_blocks.to_csv(index=False).encode("utf-8-sig"),
+                           file_name=f"{APP_VERSION}_大盤環境四段交叉驗證.csv",mime="text/csv",use_container_width=True)
     if not odet.empty:
         st.download_button("⬇️ 下載【OOS個股策略明細】",odet.to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"{APP_VERSION}_OOS個股策略明細.csv",mime="text/csv",use_container_width=True)
     if not otr.empty:
         st.download_button("⬇️ 下載【OOS逐筆交易明細】",otr.to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"{APP_VERSION}_OOS逐筆交易明細.csv",mime="text/csv",use_container_width=True)
-    st.info("下一輪請提供：①【大盤環境診斷】②【四段時間穩定度】③【OOS逐筆交易明細】。候選市場狀態驗證這輪不用再給；重點改成確認第1段失效是否來自大盤regime。")
+    st.info("下一輪請提供：①【大盤環境四段交叉驗證】②【四段時間穩定度】③【OOS逐筆交易明細】。這輪要直接確認第1段失效是否真的由大盤regime造成。")
 
 mtf_state = st.session_state.get("st_v130_mtf")
 if research_mode == "多週期當沖/隔日驗證" and mtf_state:
@@ -1978,6 +2047,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.6.0 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.6.2 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
