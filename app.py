@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.7.0
+黑嚕嚕－短線交易雷達 ST V1.7.1
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,13 +36,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.7.0"
+APP_VERSION = "ST V1.7.1"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.7.0"
-EXPORT_PREFIX = "ST_V1.7.0"
+APP_VERSION = "ST_V1.7.1"
+EXPORT_PREFIX = "ST_V1.7.1"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -545,30 +545,42 @@ def walkforward_tradability_validation(trades: pd.DataFrame, daily_lookback: int
     注意：這仍是在目前候選universe內做歷史可交易性重建，不等於完整歷史上市櫃成分重建。
     """
     if trades is None or trades.empty or "股票" not in trades.columns:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), "沒有可用的OOS逐筆交易或缺少股票欄位。"
 
     t=trades.copy()
     t["_dt"]=pd.to_datetime(t["訊號時間"],utc=True,errors="coerce")
     t=t.dropna(subset=["_dt"]).copy()
     symbols=sorted(t["股票"].dropna().astype(str).unique().tolist())
     if not symbols:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), "逐筆交易中沒有股票代號。"
+
+    def wf_yf_symbol(s: str) -> str:
+        s=str(s).strip()
+        if s.endswith(".TW") or s.endswith(".TWO"):
+            return s
+        # 現有universe多數已在SHORT_TERM_UNIVERSE；優先沿用其yfinance代碼。
+        for item in SHORT_TERM_UNIVERSE:
+            code=str(item).split(".")[0]
+            if code==s:
+                return str(item)
+        # fallback：台股四位數先以上市 .TW 嘗試
+        return f"{s}.TW"
 
     # 下載足夠長的日線，供每個訊號點向前看20個完成交易日。
     try:
         raw=yf.download(
-            tickers=" ".join([to_yf_symbol(s) for s in symbols]),
+            tickers=" ".join([wf_yf_symbol(s) for s in symbols]),
             period="6mo", interval="1d", auto_adjust=False,
             progress=False, threads=True, group_by="ticker"
         )
-    except Exception:
-        return pd.DataFrame(), pd.DataFrame()
+    except Exception as e:
+        return pd.DataFrame(), pd.DataFrame(), f"Yahoo日線下載失敗：{type(e).__name__}: {e}"
     if raw is None or raw.empty:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), "Yahoo日線下載結果為空。"
 
     rows=[]
     for symbol in symbols:
-        yf_sym=to_yf_symbol(symbol)
+        yf_sym=wf_yf_symbol(symbol)
         try:
             if isinstance(raw.columns,pd.MultiIndex):
                 if yf_sym in raw.columns.get_level_values(0):
@@ -601,12 +613,12 @@ def walkforward_tradability_validation(trades: pd.DataFrame, daily_lookback: int
             continue
 
     if not rows:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), "沒有任何股票成功完成歷史日線與訊號時間配對。"
 
     x=pd.concat(rows,ignore_index=True)
     x=x.dropna(subset=["WF成交金額","WF成交量","WF振幅"]).copy()
     if x.empty:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), "完成配對後，20日歷史可交易性欄位全部為空；可能是日線暖機資料不足。"
 
     # 每個交易日橫向排名：只用當時可取得的歷史20日資訊。
     x["_signal_day"]=x["_dt"].dt.floor("D")
@@ -639,7 +651,7 @@ def walkforward_tradability_validation(trades: pd.DataFrame, daily_lookback: int
         "WF成交金額","WF成交量","WF振幅","成交金額百分位","成交量百分位",
         "振幅百分位","WF可交易分數","WF分層"
     ] if c in x.columns]
-    return pd.DataFrame(summary),x[detail_cols].sort_values("訊號時間").reset_index(drop=True)
+    return pd.DataFrame(summary),x[detail_cols].sort_values("訊號時間").reset_index(drop=True), f"成功：{x['股票'].nunique()}檔、{len(x)}筆交易完成Walk-Forward歷史可交易性配對。"
 
 
 def time_block_stability(trades: pd.DataFrame, blocks: int = 4) -> pd.DataFrame:
@@ -1692,13 +1704,13 @@ if run:
         filter_robust = state_filter_robustness(oos_trades, blocks=4)
         market_diag = market_regime_diagnostics(oos_trades, period)
         market_blocks = market_regime_by_timeblock(oos_trades, blocks=4)
-        wf_summary, wf_detail = walkforward_tradability_validation(oos_trades, daily_lookback=20)
-        st.session_state["st_v170_oos"] = {
+        wf_summary, wf_detail, wf_status = walkforward_tradability_validation(oos_trades, daily_lookback=20)
+        st.session_state["st_v171_oos"] = {
             "detail": oos_detail, "summary": oos_summary, "trades": oos_trades,
             "blocks": block_summary, "state_diag": state_diag,
             "filter_robust": filter_robust, "market_diag": market_diag,
             "market_blocks": market_blocks,
-            "wf_summary": wf_summary, "wf_detail": wf_detail,
+            "wf_summary": wf_summary, "wf_detail": wf_detail, "wf_status": wf_status,
             "pool": ranked_pool, "symbols": symbols
         }
         summary, data_map, trade_map = pd.DataFrame(), {}, {}
@@ -1780,7 +1792,7 @@ if run:
         "trade_map": trade_map,
     }
 
-oos_state = st.session_state.get("st_v170_oos")
+oos_state = st.session_state.get("st_v171_oos")
 if research_mode == "60m五日OOS驗證" and oos_state:
     st.markdown("## 🧪 60m＋K<30＋5日｜時間穩定度驗證")
     st.caption("規則完全固定；所有股票共用同一個全市場時間切點，前60%時間區段為樣本內、後40%為樣本外。股票池仍由近期流動性建立，因此仍屬固定股票池時間OOS。")
@@ -1794,6 +1806,7 @@ if research_mode == "60m五日OOS驗證" and oos_state:
     omarket_blocks=oos_state.get("market_blocks",pd.DataFrame())
     owf=oos_state.get("wf_summary",pd.DataFrame())
     owfd=oos_state.get("wf_detail",pd.DataFrame())
+    owf_status=oos_state.get("wf_status","尚未執行Walk-Forward診斷。")
     if not osum.empty:
         st.dataframe(osum.round(3),use_container_width=True,hide_index=True)
         st.download_button("⬇️ 下載【OOS驗證總表】",osum.to_csv(index=False).encode("utf-8-sig"),
@@ -1827,8 +1840,12 @@ if research_mode == "60m五日OOS驗證" and oos_state:
         st.dataframe(omarket_blocks.round(3),use_container_width=True,hide_index=True)
         st.download_button("⬇️ 下載【大盤環境四段交叉驗證】",omarket_blocks.to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"{APP_VERSION}_大盤環境四段交叉驗證.csv",mime="text/csv",use_container_width=True)
+    st.markdown("### Walk-Forward 歷史可交易性驗證")
+    if owf.empty:
+        st.error(f"Walk-Forward未產生結果：{owf_status}")
+    else:
+        st.success(owf_status)
     if not owf.empty:
-        st.markdown("### Walk-Forward 歷史可交易性驗證")
         st.caption("每筆訊號只使用訊號日前一交易日以前的20日日線資訊，重建當時的成交金額/成交量/振幅相對排名。這是在目前候選universe內的歷史重建，不宣稱等同完整歷史上市櫃成分。")
         st.dataframe(owf.round(3),use_container_width=True,hide_index=True)
         st.download_button("⬇️ 下載【WalkForward股票池驗證】",owf.to_csv(index=False).encode("utf-8-sig"),
@@ -2166,6 +2183,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.7.0 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.7.1 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
