@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.13.2
+黑嚕嚕－短線交易雷達 ST V1.13.3
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -38,13 +38,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.13.2"
+APP_VERSION = "ST V1.13.3"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.13.2"
-EXPORT_PREFIX = "ST_V1.13.2"
+APP_VERSION = "ST_V1.13.3"
+EXPORT_PREFIX = "ST_V1.13.3"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -2430,9 +2430,11 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
-            if research_mode in ["全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
-                st.caption("本模式只分析股票池，不執行策略回測。")
+                ["全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=1)
+            if research_mode == "全市場候選策略驗證":
+                st.caption("本模式會執行固定策略回測：60m KD黃金交叉＋K<30＋持有5日，並比較核心TOP100與熱門增補。")
+            elif research_mode in ["全市場股票池研究","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
+                st.caption("本模式只分析股票池／研究資料。")
             else:
                 code = st.text_input("股票代號", value="2330")
                 market = st.radio("市場", ["上市","上櫃"], horizontal=True)
@@ -2469,27 +2471,40 @@ with st.sidebar:
         slip_bp = st.number_input("單邊滑價（bp）", min_value=0.0, max_value=30.0, value=5.0, step=1.0)
     cost = CostConfig(fee_discount=fee_discount, slippage_pct=slip_bp / 10000)
 
-    _btn_label = "🔄 更新今日雷達" if simple_mode=="今日雷達" else ("🧭 開始股票池研究" if research_mode in ["全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"] else "🚀 開始策略健診")
+    if simple_mode=="今日雷達":
+        _btn_label="🔄 更新今日雷達"
+    else:
+        _btn_label={
+            "全市場股票池研究":"🌐 建立全市場研究股票池",
+            "全市場候選策略驗證":"🧪 驗證核心TOP100 vs 熱門增補",
+            "股票池2.0研究":"🧭 開始股票池2.0即時診斷",
+            "股票池2.0歷史驗證":"🧪 開始股票池2.0歷史驗證",
+            "股票池健診":"🧭 開始股票池健診",
+        }.get(research_mode,"🚀 開始策略健診")
     run = st.button(_btn_label, type="primary", use_container_width=True)
 
 
 if simple_mode == "今日雷達":
     st.markdown("""<style>div[data-baseweb="tab-list"]{display:none!important;}</style>""", unsafe_allow_html=True)
 
+if simple_mode=="進階研究" and research_mode=="全市場候選策略驗證" and not run:
+    st.info("目前已選擇【全市場候選策略驗證】。請按「🧪 驗證核心TOP100 vs 熱門增補」。完成後應出現三個以【全市場候選策略】開頭的下載檔。")
+
 if run and simple_mode=="進階研究" and research_mode=="全市場候選策略驗證":
     st.subheader("🧪 全市場候選策略驗證")
     st.caption("固定60m KD黃金交叉＋K<30＋持有5日；比較核心TOP100與熱門增補。此版為目前股票池定義的初步A/B，尚非最終Walk-Forward。")
     with st.spinner("建立全市場候選池並下載60m資料進行固定策略驗證…"):
         _ab,_blocks,_pool,_pool_sum,_errs=validate_fullmarket_candidate_groups(cost,period="3mo")
-    st.session_state["st_v1132_fullmarket_ab"]={
+    st.session_state["st_v1133_fullmarket_ab"]={
         "ab":_ab,"blocks":_blocks,"pool":_pool,"pool_summary":_pool_sum,"errors":_errs
     }
 
-_fab=st.session_state.get("st_v1132_fullmarket_ab")
+_fab=st.session_state.get("st_v1133_fullmarket_ab")
 if simple_mode=="進階研究" and research_mode=="全市場候選策略驗證" and _fab:
     _ab=_fab.get("ab",pd.DataFrame()); _bl=_fab.get("blocks",pd.DataFrame())
     _pp=_fab.get("pool",pd.DataFrame()); _ps=_fab.get("pool_summary",pd.DataFrame()); _er=_fab.get("errors",[])
     st.subheader("🧪 全市場候選策略驗證結果")
+    st.success("如果你看到這個區塊，代表A/B策略驗證已完成。請下載下方三個『全市場候選策略』檔案。")
     if _er:
         st.warning("部分官方來源讀取異常："+"；".join(_er))
     st.warning("重要：本版股票組別由『目前』全市場資料定義，因此仍有 current-selection bias。結果只用來判斷熱門增補是否值得進入下一階段Walk-Forward，不作最終策略結論。")
@@ -3195,6 +3210,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.13.2 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.13.3 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
