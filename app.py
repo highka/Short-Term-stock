@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.12.1
+黑嚕嚕－短線交易雷達 ST V1.12.2
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,13 +36,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.12.1"
+APP_VERSION = "ST V1.12.2"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.12.1"
-EXPORT_PREFIX = "ST_V1.12.1"
+APP_VERSION = "ST_V1.12.2"
+EXPORT_PREFIX = "ST_V1.12.2"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -245,6 +245,107 @@ def aggregate_trade_metrics(trades: pd.DataFrame) -> dict:
     gl=-r[r<0].sum()
     pf=np.inf if gl==0 and gp>0 else (gp/gl if gl>0 else np.nan)
     return {"整體交易勝率":float((r>0).mean()*100),"整體平均淨報酬":float(r.mean()),"整體PF":float(pf) if np.isfinite(pf) else pf}
+
+
+
+def validate_pool20_historical(symbols: List[str], cost: CostConfig, period: str = "3mo"):
+    """
+    V1.12.2：固定核心策略 60m KD黃金交叉+K<30+5日，
+    以「訊號當下已知的前一個完成日K」建立爆量/熱門標籤，避免偷看當日收盤量。
+    """
+    _, _, trades = run_oos_60m_5d(symbols, cost, period, allow_overlap=False, train_ratio=0.60)
+    if trades is None or trades.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    tickers=list(dict.fromkeys(symbols))
+    daily=yf.download(tickers=tickers, period="6mo", interval="1d",
+                      group_by="ticker", auto_adjust=False, progress=False, threads=True)
+    contexts={}
+    for s in tickers:
+        try:
+            if isinstance(daily.columns,pd.MultiIndex):
+                if s not in daily.columns.get_level_values(0):
+                    continue
+                d=daily[s].copy()
+            else:
+                d=daily.copy()
+            d=d.dropna(subset=["Close","Volume"])
+            if d.empty:
+                continue
+            d.index=pd.to_datetime(d.index,errors="coerce")
+            d=d[d.index.notna()].copy()
+            d=d[d.index.weekday < 5]
+            close=pd.to_numeric(d["Close"],errors="coerce")
+            vol=pd.to_numeric(d["Volume"],errors="coerce")
+            turn=close*vol
+            rows=[]
+            for i in range(20,len(d)):
+                prev20=vol.iloc[i-20:i]
+                prev20_turn=turn.iloc[i-20:i]
+                base_vol=float(prev20.mean()) if len(prev20) else np.nan
+                base_turn=float(prev20_turn.median()) if len(prev20_turn) else np.nan
+                day_vol=float(vol.iloc[i])
+                day_turn=float(turn.iloc[i])
+                vol_ratio=day_vol/base_vol if base_vol>0 else np.nan
+                turn_ratio=day_turn/base_turn if base_turn>0 else np.nan
+                # 近3個「已完成」交易日（含該日）
+                vol3=float(vol.iloc[max(0,i-2):i+1].mean())
+                vol3_ratio=vol3/base_vol if base_vol>0 else np.nan
+                rows.append({
+                    "context_date":d.index[i].date(),
+                    "前一完成日量比20日":vol_ratio,
+                    "前一完成日成交金額比20日":turn_ratio,
+                    "近3完成日均量比20日":vol3_ratio,
+                })
+            contexts[s]=pd.DataFrame(rows)
+        except Exception:
+            continue
+
+    x=trades.copy()
+    sig=pd.to_datetime(x["訊號時間"],utc=True,errors="coerce").dt.tz_convert("Asia/Taipei")
+    x["訊號日期"]=sig.dt.date
+    vals=[]
+    for _,r in x.iterrows():
+        s=r["股票"]; sd=r["訊號日期"]
+        c=contexts.get(s,pd.DataFrame())
+        if c.empty or pd.isna(sd):
+            vals.append((np.nan,np.nan,np.nan,None))
+            continue
+        # 嚴格使用訊號日期以前的完成日K，杜絕使用訊號當日收盤量。
+        q=c[c["context_date"] < sd]
+        if q.empty:
+            vals.append((np.nan,np.nan,np.nan,None))
+        else:
+            z=q.iloc[-1]
+            vals.append((z["前一完成日量比20日"],z["前一完成日成交金額比20日"],
+                         z["近3完成日均量比20日"],z["context_date"]))
+    vv=pd.DataFrame(vals,columns=["前一完成日量比20日","前一完成日成交金額比20日","近3完成日均量比20日","量能基準日"],index=x.index)
+    x=pd.concat([x,vv],axis=1)
+
+    x["爆量分層"]=pd.cut(x["前一完成日量比20日"],
+        bins=[-np.inf,1.0,1.5,2.0,3.0,np.inf],
+        labels=["<1倍","1-1.5倍","1.5-2倍","2-3倍",">3倍"]).astype(str)
+    x["前日爆量>=1.5"]=np.where(x["前一完成日量比20日"]>=1.5,"是","否")
+    x["前日熱門動能"]=np.where(
+        (x["前一完成日成交金額比20日"]>=1.5)&(x["近3完成日均量比20日"]>=1.2),"是","否")
+
+    groups=[]
+    specs=[
+        ("全部基準",pd.Series(True,index=x.index)),
+        ("<1倍",x["爆量分層"]=="<1倍"),
+        ("1-1.5倍",x["爆量分層"]=="1-1.5倍"),
+        ("1.5-2倍",x["爆量分層"]=="1.5-2倍"),
+        ("2-3倍",x["爆量分層"]=="2-3倍"),
+        (">3倍",x["爆量分層"]==">3倍"),
+        ("爆量>=1.5倍",x["前日爆量>=1.5"]=="是"),
+        ("熱門動能",x["前日熱門動能"]=="是"),
+    ]
+    for name,mask in specs:
+        g=x[mask].copy()
+        m=aggregate_trade_metrics(g)
+        groups.append({"分組":name,"交易數":len(g),
+                       "涵蓋股票數":int(g["股票"].nunique()) if len(g) else 0,**m})
+    return pd.DataFrame(groups),x
 
 
 def run_oos_60m_5d(symbols: List[str], cost: CostConfig, period: str, allow_overlap: bool = False,
@@ -2012,8 +2113,8 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["股票池2.0研究","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
-            if research_mode in ["股票池2.0研究","股票池健診"]:
+                ["股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
+            if research_mode in ["股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
                 st.caption("本模式只分析股票池，不執行策略回測。")
             else:
                 code = st.text_input("股票代號", value="2330")
@@ -2028,7 +2129,7 @@ with st.sidebar:
                 "KD黃金交叉 + MA30向上","KD黃金交叉 + MA60向上","KD黃金交叉 + 量比>1.2",
                 "KD黃金交叉 + 量比>1.5","KD黃金交叉 + 站上VWAP","MA5>15 + KD + 站上VWAP"
             ]
-            if research_mode not in ["股票池2.0研究","股票池健診"]:
+            if research_mode not in ["股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
                 selected_rules = st.multiselect("進場規則", all_rules, default=["KD黃金交叉 + K<30"])
                 selected_modes = st.multiselect("持有方式",
                     ["當沖","隔日","2日","3日","4日","5日","6日","7日"], default=["5日"])
@@ -2051,12 +2152,34 @@ with st.sidebar:
         slip_bp = st.number_input("單邊滑價（bp）", min_value=0.0, max_value=30.0, value=5.0, step=1.0)
     cost = CostConfig(fee_discount=fee_discount, slippage_pct=slip_bp / 10000)
 
-    _btn_label = "🔄 更新今日雷達" if simple_mode=="今日雷達" else ("🧭 開始股票池研究" if research_mode in ["股票池2.0研究","股票池健診"] else "🚀 開始策略健診")
+    _btn_label = "🔄 更新今日雷達" if simple_mode=="今日雷達" else ("🧭 開始股票池研究" if research_mode in ["股票池2.0研究","股票池2.0歷史驗證","股票池健診"] else "🚀 開始策略健診")
     run = st.button(_btn_label, type="primary", use_container_width=True)
 
 
 if simple_mode == "今日雷達":
     st.markdown("""<style>div[data-baseweb="tab-list"]{display:none!important;}</style>""", unsafe_allow_html=True)
+
+if run and simple_mode=="進階研究" and research_mode=="股票池2.0歷史驗證":
+    st.subheader("🧪 股票池2.0歷史驗證")
+    st.caption("固定60m KD黃金交叉＋K<30＋持有5日；量能條件只使用訊號前一個已完成日K，避免偷看。")
+    with st.spinner("建立核心策略交易並對齊歷史量能…"):
+        _p20_hist,_p20_trades=validate_pool20_historical(SHORT_TERM_UNIVERSE,cost,period="3mo")
+    st.session_state["st_v1122_pool20_hist"]={"summary":_p20_hist,"trades":_p20_trades}
+
+_ph=st.session_state.get("st_v1122_pool20_hist")
+if simple_mode=="進階研究" and research_mode=="股票池2.0歷史驗證" and _ph:
+    _hs=_ph.get("summary",pd.DataFrame()); _ht=_ph.get("trades",pd.DataFrame())
+    st.subheader("🧪 股票池2.0歷史驗證結果")
+    st.warning("這一輪只檢驗『前一完成日』爆量/熱門是否對核心策略有資訊價值；尚未把條件寫進正式雷達。")
+    if not _hs.empty:
+        st.dataframe(_hs.round(3),use_container_width=True,hide_index=True)
+    with st.expander("查看逐筆交易與量能標籤"):
+        st.dataframe(_ht.round(3),use_container_width=True,hide_index=True)
+    st.download_button("⬇️ 下載【股票池2.0歷史驗證摘要】",_hs.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_股票池2.0歷史驗證摘要.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【股票池2.0歷史逐筆交易】",_ht.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_股票池2.0歷史逐筆交易.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.success("結果已保存；可連續下載兩份檔案，不需重跑。")
 
 if run and simple_mode=="進階研究" and research_mode=="股票池2.0研究":
     st.subheader("🧭 股票池2.0研究")
@@ -2122,11 +2245,11 @@ if simple_mode=="進階研究" and research_mode=="股票池健診" and _pool_st
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 單股總表", "🌐 跨股穩定度", "🔥 動態短線池", "🏭 族群比較", "🧬 狀態分類", "📈 K線/KD", "🔬 KD分區", "📦 量價/斜率", "🧾 交易明細"])
 
 if run:
-    if research_mode not in ["股票池2.0研究","股票池健診","多週期當沖/隔日驗證","60m五日OOS驗證"] and (not selected_intervals or not selected_rules or not selected_modes):
+    if research_mode not in ["股票池2.0研究","股票池2.0歷史驗證","股票池健診","多週期當沖/隔日驗證","60m五日OOS驗證"] and (not selected_intervals or not selected_rules or not selected_modes):
         st.error("請至少選擇一個K棒週期、進場規則與持有方式。")
         st.stop()
 
-    if research_mode in ["股票池2.0研究","股票池健診"]:
+    if research_mode in ["股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
         # 股票池研究已在上方獨立完成。：股票池健診已在上方獨立完成。
         # 初始化舊版共用變數，避免後續 session 儲存引用未定義的 summary。
         summary, data_map, trade_map = pd.DataFrame(), {}, {}
@@ -2664,6 +2787,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.12.1 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.12.2 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
