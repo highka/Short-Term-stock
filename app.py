@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.14.0
+黑嚕嚕－短線交易雷達 ST V1.14.1
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -38,13 +38,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.14.0"
+APP_VERSION = "ST V1.14.1"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.14.0"
-EXPORT_PREFIX = "ST_V1.14.0"
+APP_VERSION = "ST_V1.14.1"
+EXPORT_PREFIX = "ST_V1.14.1"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1268,6 +1268,97 @@ def build_fullmarket_walkforward_eligibility(lookback_months: int = 6, top_n: in
     elig=pd.concat(elig_rows,ignore_index=True) if elig_rows else pd.DataFrame()
     union=sorted(elig.loc[elig["WalkForward候選"],"股票"].unique().tolist()) if not elig.empty else []
     return elig, union, errors
+
+
+
+def validate_core_pool_sizes(cost: CostConfig, period: str="3mo"):
+    """
+    V1.14.1：真正Walk-Forward核心池規模健診。
+    不再研究熱門增補；固定比較每日歷史流動性 TOP50 / TOP100 / TOP150 / TOP200。
+    所有資格只使用訊號日前已完成日K，不以報酬反推門檻。
+    """
+    elig, _, errors = build_fullmarket_walkforward_eligibility(lookback_months=6, top_n=100)
+    if elig is None or elig.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    max_n=200
+    union=sorted(
+        elig.loc[elig["流動性排名"]<=max_n,"股票"].dropna().astype(str).unique().tolist()
+    )
+    if not union:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    _,_,trades=run_oos_60m_5d(union,cost,period,allow_overlap=False,train_ratio=0.60)
+    if trades is None or trades.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    t=trades.copy()
+    sig=pd.to_datetime(t["訊號時間"],utc=True,errors="coerce").dt.tz_convert("Asia/Taipei")
+    t["訊號日期"]=sig.dt.date
+
+    ranks=[]; base_dates=[]
+    for _,r in t.iterrows():
+        s=r["股票"]; sd=r["訊號日期"]
+        q=elig[(elig["股票"]==s)&(elig["基準完成日"]<sd)]
+        if q.empty:
+            ranks.append(np.nan); base_dates.append(None)
+        else:
+            z=q.sort_values("基準完成日").iloc[-1]
+            ranks.append(float(z["流動性排名"]))
+            base_dates.append(z["基準完成日"])
+    t["WF流動性排名"]=ranks
+    t["WF股票池基準日"]=base_dates
+    t=t[t["WF流動性排名"].notna()].copy()
+
+    sizes=[50,100,150,200]
+    rows=[]
+    for sample in ["全部","樣本內60%","樣本外40%"]:
+        xs=t if sample=="全部" else t[t["樣本"]==sample]
+        for n in sizes:
+            g=xs[xs["WF流動性排名"]<=n].copy()
+            m=aggregate_trade_metrics(g)
+            rows.append({
+                "樣本":sample,"核心池規模":f"TOP{n}",
+                "股票數":int(g["股票"].nunique()) if len(g) else 0,
+                "交易數":len(g),**m
+            })
+    summary=pd.DataFrame(rows)
+
+    # 四段時間穩定度
+    blocks=[]
+    ts=pd.to_datetime(t["訊號時間"],errors="coerce")
+    ok=ts.notna()
+    z=t.loc[ok].copy(); ts=ts.loc[ok]
+    if len(z):
+        edges=pd.date_range(ts.min(),ts.max(),periods=5)
+        labels=["第1段","第2段","第3段","第4段"]
+        z["時間段"]=pd.cut(ts,bins=edges,labels=labels,include_lowest=True,right=True)
+        for block in labels:
+            q=z[z["時間段"]==block]
+            for n in sizes:
+                g=q[q["WF流動性排名"]<=n].copy()
+                m=aggregate_trade_metrics(g)
+                blocks.append({
+                    "時間段":block,
+                    "起始":str(edges[labels.index(block)]),
+                    "結束":str(edges[labels.index(block)+1]),
+                    "核心池規模":f"TOP{n}",
+                    "股票數":int(g["股票"].nunique()) if len(g) else 0,
+                    "交易數":len(g),**m
+                })
+
+    # 每日各規模有效股票數；正常情況應固定50/100/150/200，資料不足時可察覺。
+    daily_rows=[]
+    for d,q in elig.groupby("基準完成日"):
+        daily_rows.append({
+            "基準完成日":d,
+            "TOP50":int((q["流動性排名"]<=50).sum()),
+            "TOP100":int((q["流動性排名"]<=100).sum()),
+            "TOP150":int((q["流動性排名"]<=150).sum()),
+            "TOP200":int((q["流動性排名"]<=200).sum()),
+        })
+    daily=pd.DataFrame(daily_rows).sort_values("基準完成日")
+    return summary,pd.DataFrame(blocks),t,daily,errors
 
 
 def validate_fullmarket_walkforward(cost: CostConfig, period: str="3mo"):
@@ -2621,8 +2712,10 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
-            if research_mode == "全市場WalkForward驗證":
+                ["核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
+            if research_mode == "核心池規模WalkForward":
+                st.caption("真正歷史Walk-Forward比較每日流動性TOP50 / TOP100 / TOP150 / TOP200；不使用熱門增補。")
+            elif research_mode == "全市場WalkForward驗證":
                 st.caption("真正歷史Walk-Forward：每個交易日只用當時已完成資料建立TOP100與熱門增補，再跑固定60m策略。")
             elif research_mode == "全市場候選策略驗證":
                 st.caption("本模式會執行固定策略回測：60m KD黃金交叉＋K<30＋持有5日，並比較核心TOP100與熱門增補。")
@@ -2641,7 +2734,7 @@ with st.sidebar:
                 "KD黃金交叉 + MA30向上","KD黃金交叉 + MA60向上","KD黃金交叉 + 量比>1.2",
                 "KD黃金交叉 + 量比>1.5","KD黃金交叉 + 站上VWAP","MA5>15 + KD + 站上VWAP"
             ]
-            if research_mode not in ["全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
+            if research_mode not in ["核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
                 selected_rules = st.multiselect("進場規則", all_rules, default=["KD黃金交叉 + K<30"])
                 selected_modes = st.multiselect("持有方式",
                     ["當沖","隔日","2日","3日","4日","5日","6日","7日"], default=["5日"])
@@ -2668,6 +2761,7 @@ with st.sidebar:
         _btn_label="🔄 更新今日雷達"
     else:
         _btn_label={
+            "核心池規模WalkForward":"📏 驗證核心池TOP50/100/150/200",
             "全市場WalkForward驗證":"🧭 執行全市場Walk-Forward",
             "全市場股票池研究":"🌐 建立全市場研究股票池",
             "全市場候選策略驗證":"🧪 驗證核心TOP100 vs 熱門增補",
@@ -2680,6 +2774,45 @@ with st.sidebar:
 
 if simple_mode == "今日雷達":
     st.markdown("""<style>div[data-baseweb="tab-list"]{display:none!important;}</style>""", unsafe_allow_html=True)
+
+if simple_mode=="進階研究" and research_mode=="核心池規模WalkForward" and not run:
+    st.info("V1.14.0 已確認熱門增補在真正Walk-Forward下拖累結果。這一版不調策略，只檢查核心流動池選50、100、150、200檔時是否穩定。")
+
+if run and simple_mode=="進階研究" and research_mode=="核心池規模WalkForward":
+    st.subheader("📏 核心池規模Walk-Forward")
+    with st.spinner("逐日建立全市場歷史流動性排名，下載TOP200曾入選股票的60m資料並比較四種核心池規模…"):
+        _cs_sum,_cs_blocks,_cs_trades,_cs_daily,_cs_errs=validate_core_pool_sizes(cost,period="3mo")
+    st.session_state["st_v1141_core_sizes"]={
+        "summary":_cs_sum,"blocks":_cs_blocks,"trades":_cs_trades,
+        "daily":_cs_daily,"errors":_cs_errs
+    }
+
+_cs=st.session_state.get("st_v1141_core_sizes")
+if simple_mode=="進階研究" and research_mode=="核心池規模WalkForward" and _cs:
+    _ss=_cs.get("summary",pd.DataFrame()); _sb=_cs.get("blocks",pd.DataFrame())
+    _st=_cs.get("trades",pd.DataFrame()); _sd=_cs.get("daily",pd.DataFrame()); _se=_cs.get("errors",[])
+    st.subheader("📏 核心池規模驗證結果")
+    if _se:
+        st.warning("部分官方來源讀取異常："+"；".join(_se))
+    st.info("TOP50/100/150/200 是事先固定的結構測試，不會因本次報酬結果去微調成TOP83、TOP117等事後最佳化數字。")
+    if not _ss.empty:
+        st.markdown("#### 全部 / 樣本內 / 樣本外")
+        st.dataframe(_ss.round(3),use_container_width=True,hide_index=True)
+    if not _sb.empty:
+        st.markdown("#### 四段時間穩定度")
+        st.dataframe(_sb.round(3),use_container_width=True,hide_index=True)
+    if not _sd.empty:
+        st.markdown("#### 每日核心池完整度")
+        st.dataframe(_sd.tail(30),use_container_width=True,hide_index=True)
+    st.download_button("⬇️ 下載【核心池規模WalkForward摘要】",_ss.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_核心池規模WalkForward摘要.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【核心池規模四段穩定度】",_sb.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_核心池規模四段穩定度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【核心池規模逐筆交易】",_st.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_核心池規模逐筆交易.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【核心池規模每日完整度】",_sd.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_核心池規模每日完整度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.success("四份檔案可連續下載，不需重跑。")
 
 if simple_mode=="進階研究" and research_mode=="全市場WalkForward驗證" and not run:
     st.info("這是目前最重要的驗證：股票池資格會隨歷史日期變動，不再用今天的TOP100回測過去。第一次執行時間會較長。")
@@ -2907,7 +3040,7 @@ if run:
         st.error("請至少選擇一個K棒週期、進場規則與持有方式。")
         st.stop()
 
-    if research_mode in ["全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
+    if research_mode in ["核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
         # 股票池研究已在上方獨立完成。：股票池健診已在上方獨立完成。
         # 初始化舊版共用變數，避免後續 session 儲存引用未定義的 summary。
         summary, data_map, trade_map = pd.DataFrame(), {}, {}
@@ -3445,6 +3578,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.14.0 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.14.1 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
