@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.14.1
+黑嚕嚕－短線交易雷達 ST V1.15.0
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -38,13 +38,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.14.1"
+APP_VERSION = "ST V1.15.0"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.14.1"
-EXPORT_PREFIX = "ST_V1.14.1"
+APP_VERSION = "ST_V1.15.0"
+EXPORT_PREFIX = "ST_V1.15.0"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1269,6 +1269,159 @@ def build_fullmarket_walkforward_eligibility(lookback_months: int = 6, top_n: in
     union=sorted(elig.loc[elig["WalkForward候選"],"股票"].unique().tolist()) if not elig.empty else []
     return elig, union, errors
 
+
+
+
+def build_market_regime_context(period: str="6mo"):
+    """
+    V1.15.0 市場環境資料：
+    只使用台灣加權指數 ^TWII 的已完成日K，指標沿用既有MA15概念，
+    再加上5日報酬作為「近期市場速度」診斷，不直接當交易濾網。
+    """
+    try:
+        d=yf.download("^TWII",period=period,interval="1d",
+                      auto_adjust=False,progress=False,threads=False)
+        if isinstance(d.columns,pd.MultiIndex):
+            # yfinance 單商品有時仍回傳 MultiIndex
+            d.columns=[c[0] if isinstance(c,tuple) else c for c in d.columns]
+        d=d.dropna(subset=["Close"]).copy()
+        d.index=pd.to_datetime(d.index,errors="coerce")
+        d=d[d.index.notna()]
+        d=d[d.index.weekday<5]
+        close=pd.to_numeric(d["Close"],errors="coerce")
+        d["市場MA15"]=close.rolling(15).mean()
+        d["市場MA15斜率3"]=d["市場MA15"]-d["市場MA15"].shift(3)
+        d["市場5日報酬%"]=(close/close.shift(5)-1)*100
+        d["市場在MA15之上"]=close>d["市場MA15"]
+        d["市場MA15向上"]=d["市場MA15斜率3"]>0
+
+        def ret_bucket(x):
+            if pd.isna(x): return "資料不足"
+            if x < -2: return "<-2%"
+            if x < 0: return "-2~0%"
+            if x < 2: return "0~2%"
+            return ">=2%"
+        d["市場5日報酬區間"]=d["市場5日報酬%"].map(ret_bucket)
+
+        def regime(row):
+            if pd.isna(row["市場MA15"]) or pd.isna(row["市場5日報酬%"]):
+                return "資料不足"
+            if (not row["市場在MA15之上"]) and row["市場5日報酬%"]<0:
+                return "弱勢"
+            if row["市場在MA15之上"] and row["市場MA15向上"] and row["市場5日報酬%"]>=0:
+                return "偏多"
+            return "混合"
+        d["市場狀態"]=d.apply(regime,axis=1)
+        out=d.reset_index().rename(columns={d.index.name or "index":"基準完成日"})
+        out["基準完成日"]=pd.to_datetime(out["基準完成日"]).dt.date
+        return out[["基準完成日","市場MA15","市場MA15斜率3","市場5日報酬%",
+                    "市場在MA15之上","市場MA15向上","市場5日報酬區間","市場狀態"]]
+    except Exception:
+        return pd.DataFrame()
+
+
+def validate_market_regime_top50(cost: CostConfig, period: str="3mo"):
+    """
+    V1.15.0：
+    固定真正Walk-Forward TOP50 + 固定60m KD黃金交叉/K<30/5日，
+    只診斷「訊號前一完成日」市場環境，不改交易規則。
+    """
+    elig, _, errors = build_fullmarket_walkforward_eligibility(lookback_months=6, top_n=100)
+    if elig is None or elig.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    union=sorted(elig.loc[elig["流動性排名"]<=50,"股票"].dropna().astype(str).unique().tolist())
+    if not union:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    _,_,trades=run_oos_60m_5d(union,cost,period,allow_overlap=False,train_ratio=0.60)
+    if trades is None or trades.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    t=trades.copy()
+    sig=pd.to_datetime(t["訊號時間"],utc=True,errors="coerce").dt.tz_convert("Asia/Taipei")
+    t["訊號日期"]=sig.dt.date
+
+    # 先確認該筆交易在訊號日前的歷史資格確實為TOP50。
+    keep=[]; ranks=[]; pool_dates=[]
+    for _,r in t.iterrows():
+        q=elig[(elig["股票"]==r["股票"])&(elig["基準完成日"]<r["訊號日期"])]
+        if q.empty:
+            keep.append(False); ranks.append(np.nan); pool_dates.append(None)
+        else:
+            z=q.sort_values("基準完成日").iloc[-1]
+            rank=float(z["流動性排名"])
+            keep.append(rank<=50); ranks.append(rank); pool_dates.append(z["基準完成日"])
+    t["WF流動性排名"]=ranks
+    t["WF股票池基準日"]=pool_dates
+    t=t[pd.Series(keep,index=t.index)].copy()
+
+    market=build_market_regime_context(period="6mo")
+    if market.empty:
+        return pd.DataFrame(),pd.DataFrame(),t,errors+["^TWII市場環境資料下載失敗"]
+
+    # 嚴格使用訊號日前最近一個已完成日K。
+    mrows=[]
+    for _,r in t.iterrows():
+        q=market[market["基準完成日"]<r["訊號日期"]]
+        if q.empty:
+            mrows.append({})
+        else:
+            mrows.append(q.sort_values("基準完成日").iloc[-1].to_dict())
+    mdf=pd.DataFrame(mrows,index=t.index)
+    for c in mdf.columns:
+        if c!="基準完成日":
+            t[c]=mdf[c]
+    t["市場基準日"]=mdf.get("基準完成日")
+
+    rows=[]
+    specs=[]
+    for state in ["偏多","混合","弱勢"]:
+        specs.append(("市場狀態",state,t["市場狀態"]==state))
+    for bucket in ["<-2%","-2~0%","0~2%",">=2%"]:
+        specs.append(("5日報酬",bucket,t["市場5日報酬區間"]==bucket))
+    specs += [
+        ("MA15位置","站上MA15",t["市場在MA15之上"]==True),
+        ("MA15位置","跌破MA15",t["市場在MA15之上"]==False),
+        ("MA15方向","MA15向上",t["市場MA15向上"]==True),
+        ("MA15方向","MA15未向上",t["市場MA15向上"]==False),
+    ]
+
+    for sample in ["全部","樣本內60%","樣本外40%"]:
+        xs=t if sample=="全部" else t[t["樣本"]==sample]
+        for typ,name,mask in specs:
+            g=xs[mask.reindex(xs.index,fill_value=False)]
+            m=aggregate_trade_metrics(g)
+            rows.append({
+                "樣本":sample,"環境分類":typ,"環境":name,
+                "股票數":int(g["股票"].nunique()) if len(g) else 0,
+                "交易數":len(g),**m
+            })
+    summary=pd.DataFrame(rows)
+
+    # 四段時間 × 市場狀態，檢查是否能解釋先前第1段失效。
+    blocks=[]
+    ts=pd.to_datetime(t["訊號時間"],errors="coerce")
+    ok=ts.notna()
+    z=t.loc[ok].copy(); ts=ts.loc[ok]
+    if len(z):
+        edges=pd.date_range(ts.min(),ts.max(),periods=5)
+        labels=["第1段","第2段","第3段","第4段"]
+        z["時間段"]=pd.cut(ts,bins=edges,labels=labels,include_lowest=True,right=True)
+        for block in labels:
+            q=z[z["時間段"]==block]
+            for state in ["偏多","混合","弱勢"]:
+                g=q[q["市場狀態"]==state]
+                m=aggregate_trade_metrics(g)
+                blocks.append({
+                    "時間段":block,
+                    "起始":str(edges[labels.index(block)]),
+                    "結束":str(edges[labels.index(block)+1]),
+                    "市場狀態":state,
+                    "股票數":int(g["股票"].nunique()) if len(g) else 0,
+                    "交易數":len(g),**m
+                })
+    return summary,pd.DataFrame(blocks),t,errors
 
 
 def validate_core_pool_sizes(cost: CostConfig, period: str="3mo"):
@@ -2712,8 +2865,10 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
-            if research_mode == "核心池規模WalkForward":
+                ["市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
+            if research_mode == "市場環境健診_TOP50":
+                st.caption("固定真正Walk-Forward TOP50與核心策略，只診斷訊號前一完成日的TAIEX MA15與5日市場狀態。")
+            elif research_mode == "核心池規模WalkForward":
                 st.caption("真正歷史Walk-Forward比較每日流動性TOP50 / TOP100 / TOP150 / TOP200；不使用熱門增補。")
             elif research_mode == "全市場WalkForward驗證":
                 st.caption("真正歷史Walk-Forward：每個交易日只用當時已完成資料建立TOP100與熱門增補，再跑固定60m策略。")
@@ -2734,7 +2889,7 @@ with st.sidebar:
                 "KD黃金交叉 + MA30向上","KD黃金交叉 + MA60向上","KD黃金交叉 + 量比>1.2",
                 "KD黃金交叉 + 量比>1.5","KD黃金交叉 + 站上VWAP","MA5>15 + KD + 站上VWAP"
             ]
-            if research_mode not in ["核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
+            if research_mode not in ["市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
                 selected_rules = st.multiselect("進場規則", all_rules, default=["KD黃金交叉 + K<30"])
                 selected_modes = st.multiselect("持有方式",
                     ["當沖","隔日","2日","3日","4日","5日","6日","7日"], default=["5日"])
@@ -2761,6 +2916,7 @@ with st.sidebar:
         _btn_label="🔄 更新今日雷達"
     else:
         _btn_label={
+            "市場環境健診_TOP50":"🌤️ 執行TOP50市場環境健診",
             "核心池規模WalkForward":"📏 驗證核心池TOP50/100/150/200",
             "全市場WalkForward驗證":"🧭 執行全市場Walk-Forward",
             "全市場股票池研究":"🌐 建立全市場研究股票池",
@@ -2774,6 +2930,41 @@ with st.sidebar:
 
 if simple_mode == "今日雷達":
     st.markdown("""<style>div[data-baseweb="tab-list"]{display:none!important;}</style>""", unsafe_allow_html=True)
+
+if simple_mode=="進階研究" and research_mode=="市場環境健診_TOP50" and not run:
+    st.info("V1.14.1 顯示TOP50在全部、樣本外與第2~4段皆優於更大的核心池，但第1段所有規模都失效。這一版固定TOP50，不再調股票池，只檢查市場環境。")
+
+if run and simple_mode=="進階研究" and research_mode=="市場環境健診_TOP50":
+    st.subheader("🌤️ TOP50市場環境健診")
+    with st.spinner("重建TOP50 Walk-Forward交易，並對齊每筆訊號前一完成日的TAIEX市場狀態…"):
+        _mr_sum,_mr_blocks,_mr_trades,_mr_errs=validate_market_regime_top50(cost,period="3mo")
+    st.session_state["st_v1150_market_regime"]={
+        "summary":_mr_sum,"blocks":_mr_blocks,"trades":_mr_trades,"errors":_mr_errs
+    }
+
+_mr=st.session_state.get("st_v1150_market_regime")
+if simple_mode=="進階研究" and research_mode=="市場環境健診_TOP50" and _mr:
+    _ms=_mr.get("summary",pd.DataFrame()); _mb=_mr.get("blocks",pd.DataFrame())
+    _mt=_mr.get("trades",pd.DataFrame()); _me=_mr.get("errors",[])
+    st.subheader("🌤️ TOP50市場環境健診結果")
+    if _me:
+        st.warning("資料來源異常："+"；".join(_me))
+    st.info("這一版只做診斷，不會因結果直接把MA15或5日報酬寫成濾網。必須先看樣本外與四段是否一致。")
+    if not _ms.empty:
+        st.markdown("#### 市場環境分組｜全部 / 樣本內 / 樣本外")
+        st.dataframe(_ms.round(3),use_container_width=True,hide_index=True)
+    if not _mb.empty:
+        st.markdown("#### 四段時間 × 市場狀態")
+        st.dataframe(_mb.round(3),use_container_width=True,hide_index=True)
+    with st.expander("查看逐筆交易市場標籤"):
+        st.dataframe(_mt.round(3),use_container_width=True,hide_index=True)
+    st.download_button("⬇️ 下載【TOP50市場環境健診摘要】",_ms.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_TOP50市場環境健診摘要.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【TOP50市場環境四段穩定度】",_mb.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_TOP50市場環境四段穩定度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【TOP50市場環境逐筆交易】",_mt.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_TOP50市場環境逐筆交易.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.success("三份檔案可連續下載，不需重跑。")
 
 if simple_mode=="進階研究" and research_mode=="核心池規模WalkForward" and not run:
     st.info("V1.14.0 已確認熱門增補在真正Walk-Forward下拖累結果。這一版不調策略，只檢查核心流動池選50、100、150、200檔時是否穩定。")
@@ -3040,7 +3231,7 @@ if run:
         st.error("請至少選擇一個K棒週期、進場規則與持有方式。")
         st.stop()
 
-    if research_mode in ["核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
+    if research_mode in ["市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
         # 股票池研究已在上方獨立完成。：股票池健診已在上方獨立完成。
         # 初始化舊版共用變數，避免後續 session 儲存引用未定義的 summary。
         summary, data_map, trade_map = pd.DataFrame(), {}, {}
@@ -3578,6 +3769,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.14.1 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.15.0 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
