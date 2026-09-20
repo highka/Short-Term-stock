@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.11.4
+黑嚕嚕－短線交易雷達 ST V1.12.0
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,13 +36,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.11.4"
+APP_VERSION = "ST V1.12.0"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.11.4"
-EXPORT_PREFIX = "ST_V1.11.4"
+APP_VERSION = "ST_V1.12.0"
+EXPORT_PREFIX = "ST_V1.12.0"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -934,6 +934,101 @@ def scan_latest_60m_radar(symbols: List[str], ranked_pool: pd.DataFrame, period:
     radar["_o"]=radar["目前狀態"].map(order).fillna(9)
     radar=radar.sort_values(["_o","訊號時間"],ascending=[True,False]).drop(columns="_o").reset_index(drop=True)
     return radar, diagnostics
+
+
+def build_pool_20_diagnostics(universe: List[str], top_n: int = 100) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    V1.12.0 股票池2.0研究：
+    核心流動性、短期爆量、熱門動能分開標記，不把熱門度直接混入既有可交易分。
+    只做研究標籤，不改正式60m雷達股票池。
+    """
+    tickers=list(dict.fromkeys(universe))
+    raw=yf.download(tickers=tickers, period="2mo", interval="1d",
+                    group_by="ticker", auto_adjust=False, progress=False,
+                    threads=True)
+    rows=[]
+    for s in tickers:
+        try:
+            if isinstance(raw.columns,pd.MultiIndex):
+                if s not in raw.columns.get_level_values(0):
+                    continue
+                df=raw[s].copy()
+            else:
+                df=raw.copy()
+            df=df.dropna(subset=["Close","Volume"])
+            if len(df)<21:
+                continue
+            close=pd.to_numeric(df["Close"],errors="coerce")
+            vol=pd.to_numeric(df["Volume"],errors="coerce")
+            high=pd.to_numeric(df["High"],errors="coerce")
+            low=pd.to_numeric(df["Low"],errors="coerce")
+            turnover=close*vol
+            amp=(high-low)/close.replace(0,np.nan)*100
+
+            prev20_vol=vol.iloc[-21:-1]
+            prev20_turn=turnover.iloc[-21:-1]
+            prev20_amp=amp.iloc[-21:-1]
+            today_vol=float(vol.iloc[-1])
+            today_turn=float(turnover.iloc[-1])
+            vol20=float(prev20_vol.mean()) if len(prev20_vol) else np.nan
+            turn20=float(prev20_turn.median()) if len(prev20_turn) else np.nan
+            amp20=float(prev20_amp.median()) if len(prev20_amp) else np.nan
+            vol_ratio=today_vol/vol20 if vol20 and vol20>0 else np.nan
+            turn_ratio=today_turn/turn20 if turn20 and turn20>0 else np.nan
+            vol3=float(vol.iloc[-3:].mean())
+            vol3_ratio=vol3/vol20 if vol20 and vol20>0 else np.nan
+            amp3=float(amp.iloc[-3:].mean())
+            amp_ratio=amp3/amp20 if amp20 and amp20>0 else np.nan
+
+            rows.append({
+                "股票":s,"研究主題":research_theme(s),
+                "最後交易日":str(pd.Timestamp(df.index[-1]).date()),
+                "20日成交金額中位數":turn20,
+                "20日成交量均值":vol20,
+                "20日振幅中位數%":amp20,
+                "今日成交量":today_vol,
+                "今日量比20日":vol_ratio,
+                "3日均量比20日":vol3_ratio,
+                "今日成交金額比20日":turn_ratio,
+                "3日振幅比20日":amp_ratio,
+            })
+        except Exception:
+            continue
+
+    out=pd.DataFrame(rows)
+    if out.empty:
+        return out,pd.DataFrame()
+
+    # 核心流動池：只按既有流動性概念排序，不把爆量/熱門當預測分數。
+    out["流動性百分位"]=out["20日成交金額中位數"].rank(pct=True)*100
+    out["核心流動池"]=np.where(out["流動性百分位"]>=40,"是","否")
+
+    # 爆量只分層，門檻先作研究桶，不宣稱哪個最好。
+    out["爆量層級"]=pd.cut(
+        out["今日量比20日"],
+        bins=[-np.inf,1.0,1.5,2.0,3.0,np.inf],
+        labels=["<1倍","1-1.5倍","1.5-2倍","2-3倍",">3倍"]
+    ).astype(str)
+
+    # 熱門動能：成交金額與量能同時高於自己的20日基準；僅觀察標籤。
+    hot=(out["今日成交金額比20日"]>=1.5) & (out["3日均量比20日"]>=1.2)
+    out["熱門動能觀察"]=np.where(hot,"是","否")
+    out["爆量異動觀察"]=np.where(out["今日量比20日"]>=1.5,"是","否")
+
+    # 保留既有TOP比較組，避免直接替換正式池。
+    out["既有TOP比較組"]=np.where(
+        out["20日成交金額中位數"].rank(ascending=False,method="min")<=top_n,"是","否"
+    )
+
+    summary=pd.DataFrame([
+        {"指標":"有效股票數","數值":len(out)},
+        {"指標":"核心流動池","數值":int((out["核心流動池"]=="是").sum())},
+        {"指標":"爆量異動觀察","數值":int((out["爆量異動觀察"]=="是").sum())},
+        {"指標":"熱門動能觀察","數值":int((out["熱門動能觀察"]=="是").sum())},
+        {"指標":f"既有TOP{top_n}比較組","數值":int((out["既有TOP比較組"]=="是").sum())},
+    ])
+    return out.sort_values(["爆量異動觀察","今日量比20日","今日成交金額比20日"],
+                           ascending=[True,False,False]).reset_index(drop=True),summary
 
 
 def diagnose_stock_pool(universe: List[str], ranked_pool: pd.DataFrame, top_n: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -1903,8 +1998,8 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
-            if research_mode == "股票池健診":
+                ["股票池2.0研究","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
+            if research_mode in ["股票池2.0研究","股票池健診"]:
                 st.caption("本模式只分析股票池，不執行策略回測。")
             else:
                 code = st.text_input("股票代號", value="2330")
@@ -1919,7 +2014,7 @@ with st.sidebar:
                 "KD黃金交叉 + MA30向上","KD黃金交叉 + MA60向上","KD黃金交叉 + 量比>1.2",
                 "KD黃金交叉 + 量比>1.5","KD黃金交叉 + 站上VWAP","MA5>15 + KD + 站上VWAP"
             ]
-            if research_mode != "股票池健診":
+            if research_mode not in ["股票池2.0研究","股票池健診"]:
                 selected_rules = st.multiselect("進場規則", all_rules, default=["KD黃金交叉 + K<30"])
                 selected_modes = st.multiselect("持有方式",
                     ["當沖","隔日","2日","3日","4日","5日","6日","7日"], default=["5日"])
@@ -1942,12 +2037,35 @@ with st.sidebar:
         slip_bp = st.number_input("單邊滑價（bp）", min_value=0.0, max_value=30.0, value=5.0, step=1.0)
     cost = CostConfig(fee_discount=fee_discount, slippage_pct=slip_bp / 10000)
 
-    _btn_label = "🔄 更新今日雷達" if simple_mode=="今日雷達" else ("🧭 開始股票池健診" if research_mode=="股票池健診" else "🚀 開始策略健診")
+    _btn_label = "🔄 更新今日雷達" if simple_mode=="今日雷達" else ("🧭 開始股票池研究" if research_mode in ["股票池2.0研究","股票池健診"] else "🚀 開始策略健診")
     run = st.button(_btn_label, type="primary", use_container_width=True)
 
 
 if simple_mode == "今日雷達":
     st.markdown("""<style>div[data-baseweb="tab-list"]{display:none!important;}</style>""", unsafe_allow_html=True)
+
+if run and simple_mode=="進階研究" and research_mode=="股票池2.0研究":
+    st.subheader("🧭 股票池2.0研究")
+    st.caption("核心流動、爆量異動、熱門動能分開觀察；本版不改正式今日雷達。")
+    with st.spinner("計算近期流動性、爆量與熱門動能…"):
+        _p20_detail,_p20_summary=build_pool_20_diagnostics(SHORT_TERM_UNIVERSE,top_n=top_n)
+    st.session_state["st_v1120_pool20"]={"detail":_p20_detail,"summary":_p20_summary}
+
+_p20=st.session_state.get("st_v1120_pool20")
+if simple_mode=="進階研究" and research_mode=="股票池2.0研究" and _p20:
+    _d=_p20.get("detail",pd.DataFrame()); _s=_p20.get("summary",pd.DataFrame())
+    if not _s.empty:
+        cols=st.columns(len(_s))
+        for c,(_,r) in zip(cols,_s.iterrows()):
+            c.metric(str(r["指標"]),int(r["數值"]))
+    st.info("1.5倍、2倍、3倍目前只是研究分桶，不直接當買進條件；下一輪會拿來和60m核心策略做歷史驗證。")
+    showcols=[c for c in ["股票","研究主題","核心流動池","爆量層級","熱門動能觀察","今日量比20日","3日均量比20日","今日成交金額比20日","3日振幅比20日","既有TOP比較組"] if c in _d.columns]
+    st.dataframe(_d[showcols].round(3),use_container_width=True,hide_index=True)
+    st.download_button("⬇️ 下載【股票池2.0逐檔診斷】",_d.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_股票池2.0逐檔診斷.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【股票池2.0摘要】",_s.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_股票池2.0摘要.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.success("結果已保存在工作階段；下載不會要求重新計算。")
 
 if run and simple_mode=="進階研究" and research_mode=="股票池健診":
     st.subheader("🧭 股票池健診")
@@ -1956,9 +2074,9 @@ if run and simple_mode=="進階研究" and research_mode=="股票池健診":
         # V1.11.4 必須先排名完整母池，不能先 head(100)，否則第101名以後會被誤判成「無資料」。
         _ranked_all = rank_short_term_pool(SHORT_TERM_UNIVERSE, top_n=len(SHORT_TERM_UNIVERSE))
         _detail, _summary = diagnose_stock_pool(SHORT_TERM_UNIVERSE, _ranked_all, top_n)
-    st.session_state["st_v1114_pool_diag"]={"detail":_detail,"summary":_summary}
+    st.session_state["st_v1120_pool_diag"]={"detail":_detail,"summary":_summary}
 
-_pool_state=st.session_state.get("st_v1114_pool_diag")
+_pool_state=st.session_state.get("st_v1120_pool_diag")
 if simple_mode=="進階研究" and research_mode=="股票池健診" and _pool_state:
     _detail=_pool_state.get("detail",pd.DataFrame())
     _summary=_pool_state.get("summary",pd.DataFrame())
@@ -1986,12 +2104,12 @@ if simple_mode=="進階研究" and research_mode=="股票池健診" and _pool_st
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 單股總表", "🌐 跨股穩定度", "🔥 動態短線池", "🏭 族群比較", "🧬 狀態分類", "📈 K線/KD", "🔬 KD分區", "📦 量價/斜率", "🧾 交易明細"])
 
 if run:
-    if research_mode not in ["股票池健診","多週期當沖/隔日驗證","60m五日OOS驗證"] and (not selected_intervals or not selected_rules or not selected_modes):
+    if research_mode not in ["股票池2.0研究","股票池健診","多週期當沖/隔日驗證","60m五日OOS驗證"] and (not selected_intervals or not selected_rules or not selected_modes):
         st.error("請至少選擇一個K棒週期、進場規則與持有方式。")
         st.stop()
 
-    if research_mode == "股票池健診":
-        # V1.11.3：股票池健診已在上方獨立完成。
+    if research_mode in ["股票池2.0研究","股票池健診"]:
+        # 股票池研究已在上方獨立完成。：股票池健診已在上方獨立完成。
         # 初始化舊版共用變數，避免後續 session 儲存引用未定義的 summary。
         summary, data_map, trade_map = pd.DataFrame(), {}, {}
     elif research_mode == "60m五日OOS驗證":
@@ -2033,7 +2151,7 @@ if run:
         pool_detail, pool_summary = diagnose_stock_pool(SHORT_TERM_UNIVERSE, ranked_pool, top_n)
         with st.spinner("掃描最新60m行情，建立今日雷達…"):
             live_radar, live_diag = scan_latest_60m_radar(symbols, ranked_pool, period=period, observe_days=5)
-        st.session_state["st_v1114_oos"] = {
+        st.session_state["st_v1120_oos"] = {
             "detail": oos_detail, "summary": oos_summary, "trades": oos_trades,
             "blocks": block_summary, "state_diag": state_diag,
             "filter_robust": filter_robust, "market_diag": market_diag,
@@ -2121,7 +2239,7 @@ if run:
         "trade_map": trade_map,
     }
 
-oos_state = st.session_state.get("st_v1114_oos")
+oos_state = st.session_state.get("st_v1120_oos")
 if research_mode == "60m五日OOS驗證" and oos_state:
     st.markdown("## 🧪 60m＋K<30＋5日｜時間穩定度驗證")
     st.caption("規則完全固定；所有股票共用同一個全市場時間切點，前60%時間區段為樣本內、後40%為樣本外。股票池仍由近期流動性建立，因此仍屬固定股票池時間OOS。")
@@ -2528,6 +2646,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.11.4 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.12.0 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
