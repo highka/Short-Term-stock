@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.12.0
+黑嚕嚕－短線交易雷達 ST V1.12.1
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,13 +36,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.12.0"
+APP_VERSION = "ST V1.12.1"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.12.0"
-EXPORT_PREFIX = "ST_V1.12.0"
+APP_VERSION = "ST_V1.12.1"
+EXPORT_PREFIX = "ST_V1.12.1"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -956,6 +956,17 @@ def build_pool_20_diagnostics(universe: List[str], top_n: int = 100) -> Tuple[pd
             else:
                 df=raw.copy()
             df=df.dropna(subset=["Close","Volume"])
+            # V1.12.1：只使用「已完成的台股日K」。
+            # Yahoo 偶爾會在週末/非交易時段附上一根日期為今天、但成交量不完整的日K，
+            # 會讓爆量比失真；週末列一律排除，交易日13:30前也排除當日日K。
+            _idx=pd.to_datetime(df.index,errors="coerce")
+            _weekday=pd.Series(_idx.weekday,index=df.index)
+            df=df.loc[_weekday.values < 5].copy()
+            _now_tw=pd.Timestamp.now(tz="Asia/Taipei")
+            if not df.empty:
+                _last_date=pd.Timestamp(df.index[-1]).date()
+                if _last_date == _now_tw.date() and _now_tw.time() < pd.Timestamp("13:30").time():
+                    df=df.iloc[:-1]
             if len(df)<21:
                 continue
             close=pd.to_numeric(df["Close"],errors="coerce")
@@ -1020,6 +1031,9 @@ def build_pool_20_diagnostics(universe: List[str], top_n: int = 100) -> Tuple[pd
         out["20日成交金額中位數"].rank(ascending=False,method="min")<=top_n,"是","否"
     )
 
+    _dates=pd.to_datetime(out["最後交易日"],errors="coerce").dt.date
+    _common_date=str(pd.Series(_dates).mode().iloc[0]) if len(_dates.dropna()) else ""
+    out["是否共同最新交易日"]=np.where(out["最後交易日"]==_common_date,"是","否")
     summary=pd.DataFrame([
         {"指標":"有效股票數","數值":len(out)},
         {"指標":"核心流動池","數值":int((out["核心流動池"]=="是").sum())},
@@ -2058,8 +2072,12 @@ if simple_mode=="進階研究" and research_mode=="股票池2.0研究" and _p20:
         cols=st.columns(len(_s))
         for c,(_,r) in zip(cols,_s.iterrows()):
             c.metric(str(r["指標"]),int(r["數值"]))
+    if not _d.empty:
+        _common=pd.to_datetime(_d["最後交易日"],errors="coerce").dt.date.mode()
+        if len(_common):
+            st.caption(f"資料基準交易日：{_common.iloc[0]}｜V1.12.1 已排除週末與未收盤日K。")
     st.info("1.5倍、2倍、3倍目前只是研究分桶，不直接當買進條件；下一輪會拿來和60m核心策略做歷史驗證。")
-    showcols=[c for c in ["股票","研究主題","核心流動池","爆量層級","熱門動能觀察","今日量比20日","3日均量比20日","今日成交金額比20日","3日振幅比20日","既有TOP比較組"] if c in _d.columns]
+    showcols=[c for c in ["股票","研究主題","核心流動池","爆量層級","熱門動能觀察","今日量比20日","3日均量比20日","今日成交金額比20日","3日振幅比20日","既有TOP比較組","是否共同最新交易日"] if c in _d.columns]
     st.dataframe(_d[showcols].round(3),use_container_width=True,hide_index=True)
     st.download_button("⬇️ 下載【股票池2.0逐檔診斷】",_d.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"{APP_VERSION}_股票池2.0逐檔診斷.csv",mime="text/csv",use_container_width=True,on_click="ignore")
@@ -2646,6 +2664,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.12.0 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.12.1 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
