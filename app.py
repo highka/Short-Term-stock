@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.4.1
+黑嚕嚕－短線交易雷達 ST V1.4.2
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,13 +36,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.4.1"
+APP_VERSION = "ST V1.4.2"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.4.1"
-EXPORT_PREFIX = "ST_V1.4.1"
+APP_VERSION = "ST_V1.4.2"
+EXPORT_PREFIX = "ST_V1.4.2"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -228,78 +228,82 @@ def signal_mask(d: pd.DataFrame, rule: str) -> pd.Series:
 
 
 
-def temporal_oos_split_trades(trades: pd.DataFrame, train_ratio: float = 0.60):
-    """依訊號時間切割前60% / 後40%。規則固定，不在測試段重新最佳化。"""
-    if trades is None or trades.empty or "訊號時間" not in trades.columns:
-        return pd.DataFrame(), pd.DataFrame(), pd.NaT
-    t = trades.copy()
-    t["_signal_dt"] = pd.to_datetime(t["訊號時間"], utc=True, errors="coerce")
-    t = t.dropna(subset=["_signal_dt"]).sort_values("_signal_dt").reset_index(drop=True)
-    if len(t) < 2:
-        return t.drop(columns=["_signal_dt"]), pd.DataFrame(), pd.NaT
-    cut = max(1, min(len(t)-1, int(len(t) * train_ratio)))
-    cutoff = t.loc[cut, "_signal_dt"]
-    train = t.iloc[:cut].drop(columns=["_signal_dt"]).copy()
-    test = t.iloc[cut:].drop(columns=["_signal_dt"]).copy()
-    return train, test, cutoff
+def _profit_factor_series(df: pd.DataFrame) -> pd.Series:
+    for c in ["PF", "ProfitFactor", "Profit Factor"]:
+        if c in df.columns:
+            return pd.to_numeric(df[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    return pd.Series(dtype=float)
 
 
 def run_oos_60m_5d(symbols: List[str], cost: CostConfig, period: str, allow_overlap: bool = False,
                      train_ratio: float = 0.60):
     """
-    V1.4.0 固定模型驗證：
+    V1.4.2 固定模型驗證：
     60m KD黃金交叉 + K<30，持有5日。
-    每檔依訊號時間前60%為樣本內、後40%為時間樣本外。
-    注意：股票池仍由近期流動性建立，因此這是「固定股票池時間OOS」，
-    尚不是完整 walk-forward 股票池OOS。
+    先收集所有股票交易，再以「全體訊號時間」建立同一個時間切點：
+    前60%時間區段 = 樣本內；後40%時間區段 = 樣本外。
+    這比每檔依交易筆數各自切割更接近真正的時間OOS。
+    股票池仍由近期流動性建立，因此仍不是完整 walk-forward 股票池OOS。
     """
     raw = download_intraday_batch(symbols, "60m", period)
-    rows, trade_parts = [], []
-    p = st.progress(0, text="60m固定模型 OOS 驗證…")
+    raw_trades = []
+    p = st.progress(0, text="60m固定模型：建立全體交易…")
     for n, symbol in enumerate(symbols, 1):
-        if symbol not in raw or raw[symbol].empty:
-            continue
-        d = add_indicators(raw[symbol])
-        t = backtest(d, "60m", "KD黃金交叉 + K<30", "5日", cost)
-        if not allow_overlap:
-            t = enforce_non_overlapping(t)
-        tr, te, cutoff = temporal_oos_split_trades(t, train_ratio)
-        for sample_name, part in [("樣本內60%", tr), ("樣本外40%", te)]:
-            m = metrics(part)
-            rows.append({
-                "股票": symbol, "研究主題": research_theme(symbol),
-                "樣本": sample_name, "切割時間": cutoff,
-                "週期": "60m", "規則": "KD黃金交叉 + K<30", "持有": "5日", **m
-            })
-            if not part.empty:
-                x=part.copy()
+        if symbol in raw and not raw[symbol].empty:
+            d = add_indicators(raw[symbol])
+            t = backtest(d, "60m", "KD黃金交叉 + K<30", "5日", cost)
+            if not allow_overlap:
+                t = enforce_non_overlapping(t)
+            if not t.empty:
+                x=t.copy()
                 x.insert(0,"股票",symbol)
                 x["研究主題"]=research_theme(symbol)
-                x["樣本"]=sample_name
-                x["切割時間"]=cutoff
-                x["回測版本"]=APP_VERSION
-                trade_parts.append(x)
-        p.progress(n/max(1,len(symbols)), text=f"OOS {symbol}｜{n}/{len(symbols)}")
+                x["_signal_dt"]=pd.to_datetime(x["訊號時間"], utc=True, errors="coerce")
+                raw_trades.append(x)
+        p.progress(n/max(1,len(symbols)), text=f"建立交易 {symbol}｜{n}/{len(symbols)}")
     p.empty()
-    detail=pd.DataFrame(rows)
-    trades=pd.concat(trade_parts,ignore_index=True) if trade_parts else pd.DataFrame()
-    summaries=[]
-    if not detail.empty:
-        for sample_name,g in detail.groupby("樣本"):
-            valid=g[g["交易數"]>0].copy()
-            pf_col="PF" if "PF" in valid.columns else ("Profit Factor" if "Profit Factor" in valid.columns else None)
-            pf=valid[pf_col].replace([np.inf,-np.inf],np.nan) if pf_col else pd.Series(dtype=float)
-            summaries.append({
-                "回測版本":APP_VERSION, "樣本":sample_name, "股票數":int(valid["股票"].nunique()),
-                "總交易數":int(valid["交易數"].sum()),
-                "正期望股票比例":float((valid["期望值%"]>0).mean()*100) if len(valid) else np.nan,
-                "平均期望值":float(valid["期望值%"].mean()) if len(valid) else np.nan,
-                "期望值中位數":float(valid["期望值%"].median()) if len(valid) else np.nan,
-                "PF中位數":float(pf.median()) if not pf.empty else np.nan,
-                "平均勝率":float(valid["勝率%"].mean()) if len(valid) else np.nan,
-                "平均最大回撤":float(valid["最大回撤%"].mean()) if len(valid) else np.nan,
+
+    if not raw_trades:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    all_t=pd.concat(raw_trades,ignore_index=True).dropna(subset=["_signal_dt"]).sort_values("_signal_dt")
+    unique_times=pd.Series(all_t["_signal_dt"].drop_duplicates().sort_values().to_list())
+    if len(unique_times)<2:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    cut_idx=max(1,min(len(unique_times)-1,int(len(unique_times)*train_ratio)))
+    cutoff=unique_times.iloc[cut_idx]
+    all_t["樣本"]=np.where(all_t["_signal_dt"] < cutoff, "樣本內60%", "樣本外40%")
+    all_t["切割時間"]=cutoff
+    all_t["回測版本"]=APP_VERSION
+
+    rows=[]
+    for symbol in symbols:
+        stx=all_t[all_t["股票"]==symbol]
+        for sample_name in ["樣本內60%","樣本外40%"]:
+            part=stx[stx["樣本"]==sample_name].drop(columns=["_signal_dt"],errors="ignore")
+            m=metrics(part)
+            rows.append({
+                "股票":symbol,"研究主題":research_theme(symbol),"樣本":sample_name,
+                "切割時間":cutoff,"週期":"60m","規則":"KD黃金交叉 + K<30","持有":"5日",**m
             })
-    return detail, pd.DataFrame(summaries), trades
+
+    detail=pd.DataFrame(rows)
+    trades=all_t.drop(columns=["_signal_dt"],errors="ignore").reset_index(drop=True)
+    summaries=[]
+    for sample_name,g in detail.groupby("樣本"):
+        valid=g[g["交易數"]>0].copy()
+        pf=_profit_factor_series(valid)
+        summaries.append({
+            "回測版本":APP_VERSION,"樣本":sample_name,"共同切割時間":cutoff,
+            "股票數":int(valid["股票"].nunique()),"總交易數":int(valid["交易數"].sum()),
+            "正期望股票比例":float((valid["期望值%"]>0).mean()*100) if len(valid) else np.nan,
+            "平均期望值":float(valid["期望值%"].mean()) if len(valid) else np.nan,
+            "期望值中位數":float(valid["期望值%"].median()) if len(valid) else np.nan,
+            "PF中位數":float(pf.median()) if not pf.empty else np.nan,
+            "平均勝率":float(valid["勝率%"].mean()) if len(valid) else np.nan,
+            "平均最大回撤":float(valid["最大回撤%"].mean()) if len(valid) else np.nan,
+        })
+    return detail,pd.DataFrame(summaries),trades
 
 
 def build_multitimeframe_5m_signal(
@@ -1319,7 +1323,7 @@ if run:
         except Exception as e:
             st.error(f"OOS驗證中斷：{type(e).__name__}: {e}")
             st.stop()
-        st.session_state["st_v141_oos"] = {
+        st.session_state["st_v142_oos"] = {
             "detail": oos_detail, "summary": oos_summary, "trades": oos_trades,
             "pool": ranked_pool, "symbols": symbols
         }
@@ -1402,10 +1406,10 @@ if run:
         "trade_map": trade_map,
     }
 
-oos_state = st.session_state.get("st_v141_oos")
+oos_state = st.session_state.get("st_v142_oos")
 if research_mode == "60m五日OOS驗證" and oos_state:
     st.markdown("## 🧪 60m＋K<30＋5日｜時間OOS驗證")
-    st.caption("規則完全固定；每檔交易依時間前60%/後40%切割。股票池仍由近期流動性建立，所以本版屬固定股票池時間OOS，不把它誤稱為完整walk-forward。")
+    st.caption("規則完全固定；所有股票共用同一個全市場時間切點，前60%時間區段為樣本內、後40%為樣本外。股票池仍由近期流動性建立，因此仍屬固定股票池時間OOS。")
     osum=oos_state.get("summary",pd.DataFrame())
     odet=oos_state.get("detail",pd.DataFrame())
     otr=oos_state.get("trades",pd.DataFrame())
@@ -1743,6 +1747,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.4.1 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.4.2 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
