@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.5.0
+黑嚕嚕－短線交易雷達 ST V1.5.1
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,13 +36,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.5.0"
+APP_VERSION = "ST V1.5.1"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.5.0"
-EXPORT_PREFIX = "ST_V1.5.0"
+APP_VERSION = "ST_V1.5.1"
+EXPORT_PREFIX = "ST_V1.5.1"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -318,6 +318,50 @@ def run_oos_60m_5d(symbols: List[str], cost: CostConfig, period: str, allow_over
             "平均最大回撤":float(valid["最大回撤%"].mean()) if len(valid) else np.nan,
         })
     return detail,pd.DataFrame(summaries),trades
+
+
+def state_at_entry_diagnostics(trades: pd.DataFrame) -> pd.DataFrame:
+    """描述訊號發生當下的狀態；只做診斷，不自動把最佳分組變成新規則。"""
+    if trades is None or trades.empty:
+        return pd.DataFrame()
+    t=trades.copy()
+    groups=[]
+
+    def add_group(factor, label, mask):
+        g=t.loc[mask].copy()
+        if g.empty:
+            return
+        r=pd.to_numeric(g["淨報酬%"],errors="coerce").dropna()
+        if r.empty:
+            return
+        gp=r[r>0].sum(); gl=-r[r<0].sum()
+        pf=np.inf if gl==0 and gp>0 else (gp/gl if gl>0 else np.nan)
+        groups.append({
+            "狀態因子":factor,"分組":label,"交易數":len(r),
+            "股票數":int(g["股票"].nunique()),
+            "勝率%":float((r>0).mean()*100),"平均淨報酬%":float(r.mean()),
+            "中位淨報酬%":float(r.median()),"整體PF":pf
+        })
+
+    if "K區間" in t:
+        add_group("K深度","K<20",t["K區間"].eq("K<20"))
+        add_group("K深度","K20-30",t["K區間"].eq("K20-30"))
+    if {"訊號收盤","訊號VWAP"}.issubset(t.columns):
+        add_group("VWAP位置","收盤>VWAP",t["訊號收盤"]>t["訊號VWAP"])
+        add_group("VWAP位置","收盤<=VWAP",t["訊號收盤"]<=t["訊號VWAP"])
+    for c,label in [("MA30斜率3","MA30"),("MA60斜率3","MA60")]:
+        if c in t:
+            x=pd.to_numeric(t[c],errors="coerce")
+            add_group(f"{label}方向",f"{label}上彎",x>0)
+            add_group(f"{label}方向",f"{label}下彎/平",x<=0)
+    if "量比20" in t:
+        x=pd.to_numeric(t["量比20"],errors="coerce")
+        add_group("量比","量比<1",x<1)
+        add_group("量比","量比>=1",x>=1)
+    if "研究主題" in t:
+        for theme,gidx in t.groupby("研究主題").groups.items():
+            add_group("研究主題",str(theme),t.index.isin(gidx))
+    return pd.DataFrame(groups)
 
 
 def time_block_stability(trades: pd.DataFrame, blocks: int = 4) -> pd.DataFrame:
@@ -1366,9 +1410,11 @@ if run:
             st.error(f"OOS驗證中斷：{type(e).__name__}: {e}")
             st.stop()
         block_summary = time_block_stability(oos_trades, blocks=4)
-        st.session_state["st_v150_oos"] = {
+        state_diag = state_at_entry_diagnostics(oos_trades)
+        st.session_state["st_v151_oos"] = {
             "detail": oos_detail, "summary": oos_summary, "trades": oos_trades,
-            "blocks": block_summary, "pool": ranked_pool, "symbols": symbols
+            "blocks": block_summary, "state_diag": state_diag,
+            "pool": ranked_pool, "symbols": symbols
         }
         summary, data_map, trade_map = pd.DataFrame(), {}, {}
         symbol = symbols[0]
@@ -1449,7 +1495,7 @@ if run:
         "trade_map": trade_map,
     }
 
-oos_state = st.session_state.get("st_v150_oos")
+oos_state = st.session_state.get("st_v151_oos")
 if research_mode == "60m五日OOS驗證" and oos_state:
     st.markdown("## 🧪 60m＋K<30＋5日｜時間穩定度驗證")
     st.caption("規則完全固定；所有股票共用同一個全市場時間切點，前60%時間區段為樣本內、後40%為樣本外。股票池仍由近期流動性建立，因此仍屬固定股票池時間OOS。")
@@ -1457,6 +1503,7 @@ if research_mode == "60m五日OOS驗證" and oos_state:
     odet=oos_state.get("detail",pd.DataFrame())
     otr=oos_state.get("trades",pd.DataFrame())
     oblocks=oos_state.get("blocks",pd.DataFrame())
+    ostate=oos_state.get("state_diag",pd.DataFrame())
     if not osum.empty:
         st.dataframe(osum.round(3),use_container_width=True,hide_index=True)
         st.download_button("⬇️ 下載【OOS驗證總表】",osum.to_csv(index=False).encode("utf-8-sig"),
@@ -1466,13 +1513,19 @@ if research_mode == "60m五日OOS驗證" and oos_state:
         st.dataframe(oblocks.round(3),use_container_width=True,hide_index=True)
         st.download_button("⬇️ 下載【四段時間穩定度】",oblocks.to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"{APP_VERSION}_四段時間穩定度.csv",mime="text/csv",use_container_width=True)
+    if not ostate.empty:
+        st.markdown("### 訊號當下狀態診斷")
+        st.caption("這張表只找失效環境，不會自動把表現最好的分組變成新策略，避免事後挑條件。")
+        st.dataframe(ostate.round(3),use_container_width=True,hide_index=True)
+        st.download_button("⬇️ 下載【訊號狀態診斷】",ostate.to_csv(index=False).encode("utf-8-sig"),
+                           file_name=f"{APP_VERSION}_訊號狀態診斷.csv",mime="text/csv",use_container_width=True)
     if not odet.empty:
         st.download_button("⬇️ 下載【OOS個股策略明細】",odet.to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"{APP_VERSION}_OOS個股策略明細.csv",mime="text/csv",use_container_width=True)
     if not otr.empty:
         st.download_button("⬇️ 下載【OOS逐筆交易明細】",otr.to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"{APP_VERSION}_OOS逐筆交易明細.csv",mime="text/csv",use_container_width=True)
-    st.info("下一輪請提供：①【OOS驗證總表】②【四段時間穩定度】③【OOS逐筆交易明細】。個股策略明細這輪不用給我。")
+    st.info("下一輪請提供：①【四段時間穩定度】②【訊號狀態診斷】③【OOS逐筆交易明細】。本輪重點是找出第1段失效、第4段轉弱時的市場/訊號狀態。")
 
 mtf_state = st.session_state.get("st_v130_mtf")
 if research_mode == "多週期當沖/隔日驗證" and mtf_state:
@@ -1796,6 +1849,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.5.0 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.5.1 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
