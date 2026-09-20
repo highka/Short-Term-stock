@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.11.3
+黑嚕嚕－短線交易雷達 ST V1.11.4
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,13 +36,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.11.3"
+APP_VERSION = "ST V1.11.4"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.11.3"
-EXPORT_PREFIX = "ST_V1.11.3"
+APP_VERSION = "ST_V1.11.4"
+EXPORT_PREFIX = "ST_V1.11.4"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -958,9 +958,9 @@ def diagnose_stock_pool(universe: List[str], ranked_pool: pd.DataFrame, top_n: i
             "是否有近期排名資料":"是" if s in rmap else "否",
             "目前排名":m.get("目前排名",np.nan),
             "短線可交易分":m.get("短線可交易分",np.nan),
-            "近期成交金額":m.get("近期成交金額",np.nan),
-            "近期成交量":m.get("近期成交量",np.nan),
-            "近期振幅":m.get("近期振幅",np.nan),
+            "近期成交金額":m.get("20日成交金額中位數",np.nan),
+            "近期成交量":m.get("20日成交量中位數",np.nan),
+            "近期振幅":m.get("20日振幅中位數%",np.nan),
             "目前TOP池":"是" if (pd.notna(m.get("目前排名",np.nan)) and m.get("目前排名")<=top_n) else "否",
         })
     detail=pd.DataFrame(rows)
@@ -1951,26 +1951,37 @@ if simple_mode == "今日雷達":
 
 if run and simple_mode=="進階研究" and research_mode=="股票池健診":
     st.subheader("🧭 股票池健診")
-    st.caption("分析人工母池 → 近期資料 → 可交易性排名 → TOP100截斷；本次不跑策略回測。")
+    st.caption("分析人工母池 → 全母池近期資料 → 可交易性排名 → TOP100截斷；本次不跑策略回測。")
     with st.spinner("分析股票池…"):
-        _ranked = rank_short_term_pool(SHORT_TERM_UNIVERSE, top_n=min(100, len(SHORT_TERM_UNIVERSE)))
-        _detail, _summary = diagnose_stock_pool(SHORT_TERM_UNIVERSE, _ranked, top_n)
+        # V1.11.4 必須先排名完整母池，不能先 head(100)，否則第101名以後會被誤判成「無資料」。
+        _ranked_all = rank_short_term_pool(SHORT_TERM_UNIVERSE, top_n=len(SHORT_TERM_UNIVERSE))
+        _detail, _summary = diagnose_stock_pool(SHORT_TERM_UNIVERSE, _ranked_all, top_n)
+    st.session_state["st_v1114_pool_diag"]={"detail":_detail,"summary":_summary}
+
+_pool_state=st.session_state.get("st_v1114_pool_diag")
+if simple_mode=="進階研究" and research_mode=="股票池健診" and _pool_state:
+    _detail=_pool_state.get("detail",pd.DataFrame())
+    _summary=_pool_state.get("summary",pd.DataFrame())
+    st.subheader("🧭 股票池健診結果")
     c1,c2,c3,c4=st.columns(4)
     c1.metric("人工母池",len(_detail))
     c2.metric("有近期資料",int((_detail["是否有近期排名資料"]=="是").sum()) if not _detail.empty else 0)
     c3.metric(f"TOP{top_n}",int((_detail["目前TOP池"]=="是").sum()) if not _detail.empty else 0)
-    c4.metric("TOP外",int((_detail["目前TOP池"]=="否").sum()) if not _detail.empty else 0)
-    st.warning("短線可交易分只代表流動性/活躍度，不代表未來報酬。TOP100在這裡只是比較組。")
+    c4.metric("TOP外",int(((_detail["是否有近期排名資料"]=="是") & (_detail["目前TOP池"]=="否")).sum()) if not _detail.empty else 0)
+    st.warning("短線可交易分只代表流動性/活躍度，不代表未來報酬。TOP100只是比較組。")
     if not _summary.empty:
         st.markdown("#### 族群分布")
         st.dataframe(_summary.round(3),use_container_width=True,hide_index=True)
     with st.expander("查看股票池逐檔明細"):
         st.dataframe(_detail.round(3),use_container_width=True,hide_index=True)
     st.download_button("⬇️ 下載【股票池健診明細】",_detail.to_csv(index=False).encode("utf-8-sig"),
-                       file_name=f"{APP_VERSION}_股票池健診明細.csv",mime="text/csv",use_container_width=True)
+                       file_name=f"{APP_VERSION}_股票池健診明細.csv",mime="text/csv",
+                       use_container_width=True,on_click="ignore")
     st.download_button("⬇️ 下載【股票池族群分布】",_summary.to_csv(index=False).encode("utf-8-sig"),
-                       file_name=f"{APP_VERSION}_股票池族群分布.csv",mime="text/csv",use_container_width=True)
-    st.info("這一輪只需要下載【股票池健診明細】與【股票池族群分布】。")
+                       file_name=f"{APP_VERSION}_股票池族群分布.csv",mime="text/csv",
+                       use_container_width=True,on_click="ignore")
+    st.success("結果已保存在本次工作階段。下載檔案不會清掉健診結果，不需要重新計算。")
+
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 單股總表", "🌐 跨股穩定度", "🔥 動態短線池", "🏭 族群比較", "🧬 狀態分類", "📈 K線/KD", "🔬 KD分區", "📦 量價/斜率", "🧾 交易明細"])
 
@@ -2022,7 +2033,7 @@ if run:
         pool_detail, pool_summary = diagnose_stock_pool(SHORT_TERM_UNIVERSE, ranked_pool, top_n)
         with st.spinner("掃描最新60m行情，建立今日雷達…"):
             live_radar, live_diag = scan_latest_60m_radar(symbols, ranked_pool, period=period, observe_days=5)
-        st.session_state["st_v1113_oos"] = {
+        st.session_state["st_v1114_oos"] = {
             "detail": oos_detail, "summary": oos_summary, "trades": oos_trades,
             "blocks": block_summary, "state_diag": state_diag,
             "filter_robust": filter_robust, "market_diag": market_diag,
@@ -2110,7 +2121,7 @@ if run:
         "trade_map": trade_map,
     }
 
-oos_state = st.session_state.get("st_v1113_oos")
+oos_state = st.session_state.get("st_v1114_oos")
 if research_mode == "60m五日OOS驗證" and oos_state:
     st.markdown("## 🧪 60m＋K<30＋5日｜時間穩定度驗證")
     st.caption("規則完全固定；所有股票共用同一個全市場時間切點，前60%時間區段為樣本內、後40%為樣本外。股票池仍由近期流動性建立，因此仍屬固定股票池時間OOS。")
@@ -2517,6 +2528,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.11.3 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.11.4 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
