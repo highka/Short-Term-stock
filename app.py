@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.12.4
+黑嚕嚕－短線交易雷達 ST V1.13.0
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -26,6 +26,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+import urllib.request
+import json
 
 warnings.filterwarnings("ignore")
 
@@ -36,13 +38,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.12.4"
+APP_VERSION = "ST V1.13.0"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.12.4"
-EXPORT_PREFIX = "ST_V1.12.4"
+APP_VERSION = "ST_V1.13.0"
+EXPORT_PREFIX = "ST_V1.13.0"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1097,6 +1099,157 @@ def scan_latest_60m_radar(symbols: List[str], ranked_pool: pd.DataFrame, period:
     radar["_o"]=radar["目前狀態"].map(order).fillna(9)
     radar=radar.sort_values(["_o","訊號時間"],ascending=[True,False]).drop(columns="_o").reset_index(drop=True)
     return radar, diagnostics
+
+
+
+def fetch_official_tw_stock_universe():
+    """
+    V1.13.0：官方上市/上櫃公司基本資料。
+    只保留4位數字公司代號；上市加.TW、上櫃加.TWO。
+    官方來源失敗時回傳空表，由UI明確提示，不靜默冒充全市場。
+    """
+    endpoints=[
+        ("上市","https://openapi.twse.com.tw/v1/opendata/t187ap03_L",".TW"),
+        ("上櫃","https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O",".TWO"),
+    ]
+    rows=[]
+    errors=[]
+    for market,url,suffix in endpoints:
+        try:
+            req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0"})
+            with urllib.request.urlopen(req,timeout=20) as resp:
+                data=json.loads(resp.read().decode("utf-8"))
+            for item in data:
+                code=str(item.get("公司代號",item.get("SecuritiesCompanyCode",""))).strip()
+                name=str(item.get("公司簡稱",item.get("CompanyName",""))).strip()
+                industry=str(item.get("產業別",item.get("SecuritiesIndustryCode",""))).strip()
+                if len(code)==4 and code.isdigit():
+                    rows.append({"股票":code+suffix,"代號":code,"公司":name,
+                                 "市場":market,"官方產業別":industry,"官方來源":url})
+        except Exception as e:
+            errors.append(f"{market}: {e}")
+    df=pd.DataFrame(rows).drop_duplicates("股票") if rows else pd.DataFrame()
+    return df,errors
+
+
+def download_daily_batches(symbols: List[str], period: str="2mo", batch_size: int=80):
+    """分批下載日K，避免全市場一次向Yahoo請求過大。"""
+    out={}
+    syms=list(dict.fromkeys(symbols))
+    for i in range(0,len(syms),batch_size):
+        batch=syms[i:i+batch_size]
+        try:
+            raw=yf.download(tickers=batch,period=period,interval="1d",
+                            group_by="ticker",auto_adjust=False,progress=False,threads=True)
+            for s in batch:
+                try:
+                    if isinstance(raw.columns,pd.MultiIndex):
+                        if s not in raw.columns.get_level_values(0):
+                            continue
+                        d=raw[s].copy()
+                    else:
+                        if len(batch)!=1:
+                            continue
+                        d=raw.copy()
+                    d=d.dropna(subset=["Close","Volume"])
+                    if len(d):
+                        out[s]=d
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return out
+
+
+def build_full_market_pool_diagnostics(top_n: int=100):
+    """
+    V1.13.0 全市場股票池研究：
+    官方上市+上櫃普通公司 → Yahoo近期日K → 流動性/爆量/熱門標籤。
+    爆量只作資訊欄位，不作報酬預測分數。
+    """
+    official,errors=fetch_official_tw_stock_universe()
+    if official.empty:
+        return pd.DataFrame(),pd.DataFrame(),errors
+
+    dmap=download_daily_batches(official["股票"].tolist(),period="2mo",batch_size=80)
+    rows=[]
+    now_tw=pd.Timestamp.now(tz="Asia/Taipei")
+    for _,meta in official.iterrows():
+        s=meta["股票"]
+        d=dmap.get(s)
+        if d is None or len(d)<21:
+            continue
+        try:
+            d=d.copy()
+            d.index=pd.to_datetime(d.index,errors="coerce")
+            d=d[d.index.notna()]
+            d=d[d.index.weekday<5]
+            if not len(d):
+                continue
+            if pd.Timestamp(d.index[-1]).date()==now_tw.date() and now_tw.time()<pd.Timestamp("13:30").time():
+                d=d.iloc[:-1]
+            if len(d)<21:
+                continue
+            close=pd.to_numeric(d["Close"],errors="coerce")
+            vol=pd.to_numeric(d["Volume"],errors="coerce")
+            high=pd.to_numeric(d["High"],errors="coerce")
+            low=pd.to_numeric(d["Low"],errors="coerce")
+            turn=close*vol
+            amp=(high-low)/close.replace(0,np.nan)*100
+            pv=vol.iloc[-21:-1]; pt=turn.iloc[-21:-1]; pa=amp.iloc[-21:-1]
+            vol20=float(pv.mean()); turn20=float(pt.median()); amp20=float(pa.median())
+            today_vol=float(vol.iloc[-1]); today_turn=float(turn.iloc[-1])
+            vratio=today_vol/vol20 if vol20>0 else np.nan
+            tratio=today_turn/turn20 if turn20>0 else np.nan
+            vol3=float(vol.iloc[-3:].mean())
+            v3ratio=vol3/vol20 if vol20>0 else np.nan
+            amp3=float(amp.iloc[-3:].mean())
+            aratio=amp3/amp20 if amp20>0 else np.nan
+            rows.append({
+                "股票":s,"代號":meta["代號"],"公司":meta["公司"],"市場":meta["市場"],
+                "官方產業別":meta["官方產業別"],"最後交易日":str(pd.Timestamp(d.index[-1]).date()),
+                "20日成交金額中位數":turn20,"20日成交量均值":vol20,
+                "今日量比20日":vratio,"3日均量比20日":v3ratio,
+                "今日成交金額比20日":tratio,"3日振幅比20日":aratio,
+            })
+        except Exception:
+            continue
+
+    out=pd.DataFrame(rows)
+    if out.empty:
+        return out,pd.DataFrame(),errors
+
+    out["成交金額百分位"]=out["20日成交金額中位數"].rank(pct=True)*100
+    out["流動性排名"]=out["20日成交金額中位數"].rank(ascending=False,method="min")
+    out["核心TOP100"]=np.where(out["流動性排名"]<=top_n,"是","否")
+    out["爆量異動"]=np.where(out["今日量比20日"]>=1.5,"是","否")
+    out["熱門動能"]=np.where(
+        (out["今日成交金額比20日"]>=1.5)&(out["3日均量比20日"]>=1.2),"是","否")
+
+    # 研究用擴充候選：不把爆量直接當買進條件。
+    # 只允許本身至少位於全市場成交金額前60%，避免極低流動股票因偶發小量被放大。
+    hot_add=(out["核心TOP100"]=="否")&(out["成交金額百分位"]>=40)&(
+        (out["爆量異動"]=="是")|(out["熱門動能"]=="是"))
+    out["熱門增補候選"]=np.where(hot_add,"是","否")
+    out["研究候選池"]=np.where((out["核心TOP100"]=="是")|hot_add,"是","否")
+    out["爆量分層"]=pd.cut(out["今日量比20日"],
+        bins=[-np.inf,1.0,1.5,2.0,3.0,np.inf],
+        labels=["<1倍","1-1.5倍","1.5-2倍","2-3倍",">3倍"]).astype(str)
+
+    common=pd.to_datetime(out["最後交易日"],errors="coerce").dt.date.mode()
+    common_date=str(common.iloc[0]) if len(common) else ""
+    summary=pd.DataFrame([
+        {"指標":"官方上市+上櫃公司數","數值":len(official)},
+        {"指標":"Yahoo有效日K數","數值":len(out)},
+        {"指標":"核心TOP100","數值":int((out["核心TOP100"]=="是").sum())},
+        {"指標":"TOP100外爆量","數值":int(((out["核心TOP100"]=="否")&(out["爆量異動"]=="是")).sum())},
+        {"指標":"TOP100外熱門動能","數值":int(((out["核心TOP100"]=="否")&(out["熱門動能"]=="是")).sum())},
+        {"指標":"熱門增補候選","數值":int((out["熱門增補候選"]=="是").sum())},
+        {"指標":"研究候選池總數","數值":int((out["研究候選池"]=="是").sum())},
+    ])
+    out["共同資料基準日"]=common_date
+    return out.sort_values(["研究候選池","核心TOP100","今日量比20日","20日成交金額中位數"],
+                           ascending=[False,False,False,False]).reset_index(drop=True),summary,errors
 
 
 def build_pool_20_diagnostics(universe: List[str], top_n: int = 100) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -2175,8 +2328,8 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
-            if research_mode in ["股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
+                ["全市場股票池研究","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
+            if research_mode in ["全市場股票池研究","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
                 st.caption("本模式只分析股票池，不執行策略回測。")
             else:
                 code = st.text_input("股票代號", value="2330")
@@ -2191,7 +2344,7 @@ with st.sidebar:
                 "KD黃金交叉 + MA30向上","KD黃金交叉 + MA60向上","KD黃金交叉 + 量比>1.2",
                 "KD黃金交叉 + 量比>1.5","KD黃金交叉 + 站上VWAP","MA5>15 + KD + 站上VWAP"
             ]
-            if research_mode not in ["股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
+            if research_mode not in ["全市場股票池研究","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
                 selected_rules = st.multiselect("進場規則", all_rules, default=["KD黃金交叉 + K<30"])
                 selected_modes = st.multiselect("持有方式",
                     ["當沖","隔日","2日","3日","4日","5日","6日","7日"], default=["5日"])
@@ -2214,12 +2367,48 @@ with st.sidebar:
         slip_bp = st.number_input("單邊滑價（bp）", min_value=0.0, max_value=30.0, value=5.0, step=1.0)
     cost = CostConfig(fee_discount=fee_discount, slippage_pct=slip_bp / 10000)
 
-    _btn_label = "🔄 更新今日雷達" if simple_mode=="今日雷達" else ("🧭 開始股票池研究" if research_mode in ["股票池2.0研究","股票池2.0歷史驗證","股票池健診"] else "🚀 開始策略健診")
+    _btn_label = "🔄 更新今日雷達" if simple_mode=="今日雷達" else ("🧭 開始股票池研究" if research_mode in ["全市場股票池研究","股票池2.0研究","股票池2.0歷史驗證","股票池健診"] else "🚀 開始策略健診")
     run = st.button(_btn_label, type="primary", use_container_width=True)
 
 
 if simple_mode == "今日雷達":
     st.markdown("""<style>div[data-baseweb="tab-list"]{display:none!important;}</style>""", unsafe_allow_html=True)
+
+if run and simple_mode=="進階研究" and research_mode=="全市場股票池研究":
+    st.subheader("🌐 全市場股票池研究")
+    st.caption("官方上市+上櫃公司名單 → Yahoo近期日K → 核心TOP100 + 熱門增補候選。爆量只作資訊，不作買進分數。")
+    with st.spinner("下載官方上市/上櫃名單並分批建立全市場股票池，第一次可能需要較久…"):
+        _fm_detail,_fm_summary,_fm_errors=build_full_market_pool_diagnostics(top_n=100)
+    st.session_state["st_v1130_fullmarket"]={
+        "detail":_fm_detail,"summary":_fm_summary,"errors":_fm_errors
+    }
+
+_fm=st.session_state.get("st_v1130_fullmarket")
+if simple_mode=="進階研究" and research_mode=="全市場股票池研究" and _fm:
+    _fd=_fm.get("detail",pd.DataFrame()); _fs=_fm.get("summary",pd.DataFrame()); _fe=_fm.get("errors",[])
+    st.subheader("🌐 全市場股票池研究結果")
+    if _fe:
+        st.warning("部分官方來源讀取異常："+"；".join(_fe))
+    if not _fs.empty:
+        cols=st.columns(min(4,len(_fs)))
+        for i,(_,r) in enumerate(_fs.iterrows()):
+            cols[i%len(cols)].metric(str(r["指標"]),int(r["數值"]))
+    if not _fd.empty:
+        _common=_fd["共同資料基準日"].mode()
+        if len(_common):
+            st.caption(f"共同資料基準日：{_common.iloc[0]}")
+        st.info("V1.12.4顯示量能效果高度依市場時段變化，因此本版只把爆量/熱門列為『增補候選』，不直接改核心策略。")
+        show=[c for c in ["股票","公司","市場","核心TOP100","熱門增補候選","研究候選池",
+                          "流動性排名","成交金額百分位","爆量分層","今日量比20日",
+                          "今日成交金額比20日","3日均量比20日","熱門動能"] if c in _fd.columns]
+        st.dataframe(_fd[show].round(3),use_container_width=True,hide_index=True)
+    st.download_button("⬇️ 下載【全市場股票池明細】",_fd.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_全市場股票池明細.csv",mime="text/csv",
+                       use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【全市場股票池摘要】",_fs.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_全市場股票池摘要.csv",mime="text/csv",
+                       use_container_width=True,on_click="ignore")
+    st.success("結果已保存；下載不需重新計算。")
 
 if run and simple_mode=="進階研究" and research_mode=="股票池2.0歷史驗證":
     st.subheader("🧪 股票池2.0歷史驗證")
@@ -2326,7 +2515,7 @@ if run:
         st.error("請至少選擇一個K棒週期、進場規則與持有方式。")
         st.stop()
 
-    if research_mode in ["股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
+    if research_mode in ["全市場股票池研究","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
         # 股票池研究已在上方獨立完成。：股票池健診已在上方獨立完成。
         # 初始化舊版共用變數，避免後續 session 儲存引用未定義的 summary。
         summary, data_map, trade_map = pd.DataFrame(), {}, {}
@@ -2864,6 +3053,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.12.4 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.13.0 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
