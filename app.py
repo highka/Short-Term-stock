@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.15.1
+黑嚕嚕－短線交易雷達 ST V1.16.0
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -38,13 +38,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.15.1"
+APP_VERSION = "ST V1.16.0"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.15.1"
-EXPORT_PREFIX = "ST_V1.15.1"
+APP_VERSION = "ST_V1.16.0"
+EXPORT_PREFIX = "ST_V1.16.0"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -412,8 +412,20 @@ def validate_pool20_historical(symbols: List[str], cost: CostConfig, period: str
     return pd.DataFrame(groups),x,_sample_stability,_block_stability
 
 
+
+def _as_taipei_series(s):
+    """將交易時間統一視為台北時間；naive時間不再誤當UTC。"""
+    x=pd.to_datetime(s,errors="coerce")
+    try:
+        if x.dt.tz is None:
+            return x.dt.tz_localize("Asia/Taipei")
+        return x.dt.tz_convert("Asia/Taipei")
+    except Exception:
+        return x
+
+
 def run_oos_60m_5d(symbols: List[str], cost: CostConfig, period: str, allow_overlap: bool = False,
-                     train_ratio: float = 0.60):
+                     train_ratio: float = 0.60, evaluation_months: Optional[int] = None):
     """
     V1.4.2 固定模型驗證：
     60m KD黃金交叉 + K<30，持有5日。
@@ -435,7 +447,7 @@ def run_oos_60m_5d(symbols: List[str], cost: CostConfig, period: str, allow_over
                 x=t.copy()
                 x.insert(0,"股票",symbol)
                 x["研究主題"]=research_theme(symbol)
-                x["_signal_dt"]=pd.to_datetime(x["訊號時間"], utc=True, errors="coerce")
+                x["_signal_dt"]=_as_taipei_series(x["訊號時間"])
                 raw_trades.append(x)
         p.progress(n/max(1,len(symbols)), text=f"建立交易 {symbol}｜{n}/{len(symbols)}")
     p.empty()
@@ -444,6 +456,11 @@ def run_oos_60m_5d(symbols: List[str], cost: CostConfig, period: str, allow_over
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     all_t=pd.concat(raw_trades,ignore_index=True).dropna(subset=["_signal_dt"]).sort_values("_signal_dt")
+    # V1.16.0：可用更長資料做指標暖機，但只評估最後N個月。
+    if evaluation_months is not None and not all_t.empty:
+        _eval_end=all_t["_signal_dt"].max()
+        _eval_start=_eval_end-pd.DateOffset(months=int(evaluation_months))
+        all_t=all_t[all_t["_signal_dt"]>=_eval_start].copy()
     unique_times=pd.Series(all_t["_signal_dt"].drop_duplicates().sort_values().to_list())
     if len(unique_times)<2:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
@@ -1319,6 +1336,103 @@ def build_market_regime_context(period: str="6mo"):
     except Exception:
         return pd.DataFrame()
 
+
+
+
+def _filter_historical_top50(trades: pd.DataFrame, elig: pd.DataFrame) -> pd.DataFrame:
+    if trades is None or trades.empty or elig is None or elig.empty:
+        return pd.DataFrame()
+    t=trades.copy()
+    sig=_as_taipei_series(t["訊號時間"])
+    t["訊號日期"]=sig.dt.date
+    t["訊號小時"]=sig.dt.hour
+    keep=[]; ranks=[]; base_dates=[]
+    for _,r in t.iterrows():
+        q=elig[(elig["股票"]==r["股票"])&(elig["基準完成日"]<r["訊號日期"])]
+        if q.empty:
+            keep.append(False); ranks.append(np.nan); base_dates.append(None)
+        else:
+            z=q.sort_values("基準完成日").iloc[-1]
+            rank=float(z["流動性排名"])
+            keep.append(rank<=50); ranks.append(rank); base_dates.append(z["基準完成日"])
+    t["WF流動性排名"]=ranks
+    t["WF股票池基準日"]=base_dates
+    return t[pd.Series(keep,index=t.index)].copy()
+
+
+def _warmup_summary(trades: pd.DataFrame, label: str):
+    rows=[]
+    if trades is None or trades.empty:
+        return pd.DataFrame(),pd.DataFrame()
+    for sample in ["全部","樣本內60%","樣本外40%"]:
+        g=trades if sample=="全部" else trades[trades["樣本"]==sample]
+        m=aggregate_trade_metrics(g)
+        rows.append({
+            "版本":label,"樣本":sample,
+            "股票數":int(g["股票"].nunique()) if len(g) else 0,
+            "交易數":len(g),**m
+        })
+    summary=pd.DataFrame(rows)
+
+    ts=_as_taipei_series(trades["訊號時間"])
+    z=trades.copy()
+    edges=pd.date_range(ts.min(),ts.max(),periods=5) if len(z) else []
+    blocks=[]
+    if len(edges)==5:
+        labels=["第1段","第2段","第3段","第4段"]
+        z["時間段"]=pd.cut(ts,bins=edges,labels=labels,include_lowest=True,right=True)
+        for block in labels:
+            g=z[z["時間段"]==block]
+            m=aggregate_trade_metrics(g)
+            blocks.append({
+                "版本":label,"時間段":block,
+                "起始":str(edges[labels.index(block)]),
+                "結束":str(edges[labels.index(block)+1]),
+                "股票數":int(g["股票"].nunique()) if len(g) else 0,
+                "交易數":len(g),**m
+            })
+    return summary,pd.DataFrame(blocks)
+
+
+def validate_top50_warmup_correction(cost: CostConfig):
+    """
+    V1.16.0 檢查過去第1段失效是否受指標暖機不足影響。
+    A：舊方式，抓3mo直接算KD/MA。
+    B：抓6mo做指標暖機，只評估最後3mo。
+    股票池、策略、成本與持有期完全相同。
+    """
+    elig, _, errors=build_fullmarket_walkforward_eligibility(lookback_months=6,top_n=100)
+    if elig is None or elig.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+    union=sorted(elig.loc[elig["流動性排名"]<=50,"股票"].dropna().astype(str).unique().tolist())
+    if not union:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    _,_,old_trades=run_oos_60m_5d(
+        union,cost,"3mo",allow_overlap=False,train_ratio=0.60,evaluation_months=None
+    )
+    _,_,warm_trades=run_oos_60m_5d(
+        union,cost,"6mo",allow_overlap=False,train_ratio=0.60,evaluation_months=3
+    )
+    old_top=_filter_historical_top50(old_trades,elig)
+    warm_top=_filter_historical_top50(warm_trades,elig)
+
+    s1,b1=_warmup_summary(old_top,"舊3mo直接計算")
+    s2,b2=_warmup_summary(warm_top,"6mo暖機_評估末3mo")
+    summary=pd.concat([s1,s2],ignore_index=True)
+    blocks=pd.concat([b1,b2],ignore_index=True)
+
+    compare=pd.DataFrame([
+        {"檢查":"舊版逐筆數","數值":len(old_top)},
+        {"檢查":"暖機版逐筆數","數值":len(warm_top)},
+        {"檢查":"舊版量比20缺值率%","數值":float(old_top["量比20"].isna().mean()*100) if len(old_top) else np.nan},
+        {"檢查":"暖機版量比20缺值率%","數值":float(warm_top["量比20"].isna().mean()*100) if len(warm_top) else np.nan},
+        {"檢查":"舊版MA60斜率缺值率%","數值":float(old_top["MA60斜率3"].isna().mean()*100) if len(old_top) else np.nan},
+        {"檢查":"暖機版MA60斜率缺值率%","數值":float(warm_top["MA60斜率3"].isna().mean()*100) if len(warm_top) else np.nan},
+    ])
+    warm_top["訊號時間_台北"]=_as_taipei_series(warm_top["訊號時間"]).astype(str)
+    warm_top["訊號小時_台北"]=_as_taipei_series(warm_top["訊號時間"]).dt.hour
+    return summary,blocks,warm_top,errors,compare
 
 
 def validate_top50_signal_quality(cost: CostConfig, period: str="3mo"):
@@ -2968,8 +3082,10 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
-            if research_mode == "TOP50訊號品質健診":
+                ["TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
+            if research_mode == "TOP50暖機修正驗證":
+                st.caption("比較舊3mo直接計算 vs 6mo指標暖機後只評估最後3mo；同時修正訊號時間誤當UTC的問題。")
+            elif research_mode == "TOP50訊號品質健診":
                 st.caption("固定真正Walk-Forward TOP50與核心策略，只診斷K深度、量比20、MA30/60方向與60m訊號時段。")
             elif research_mode == "市場環境健診_TOP50":
                 st.caption("固定真正Walk-Forward TOP50與核心策略，只診斷訊號前一完成日的TAIEX MA15與5日市場狀態。")
@@ -2994,7 +3110,7 @@ with st.sidebar:
                 "KD黃金交叉 + MA30向上","KD黃金交叉 + MA60向上","KD黃金交叉 + 量比>1.2",
                 "KD黃金交叉 + 量比>1.5","KD黃金交叉 + 站上VWAP","MA5>15 + KD + 站上VWAP"
             ]
-            if research_mode not in ["TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
+            if research_mode not in ["TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
                 selected_rules = st.multiselect("進場規則", all_rules, default=["KD黃金交叉 + K<30"])
                 selected_modes = st.multiselect("持有方式",
                     ["當沖","隔日","2日","3日","4日","5日","6日","7日"], default=["5日"])
@@ -3021,6 +3137,7 @@ with st.sidebar:
         _btn_label="🔄 更新今日雷達"
     else:
         _btn_label={
+            "TOP50暖機修正驗證":"🧰 執行TOP50暖機修正驗證",
             "TOP50訊號品質健診":"🔬 執行TOP50訊號品質健診",
             "市場環境健診_TOP50":"🌤️ 執行TOP50市場環境健診",
             "核心池規模WalkForward":"📏 驗證核心池TOP50/100/150/200",
@@ -3036,6 +3153,47 @@ with st.sidebar:
 
 if simple_mode == "今日雷達":
     st.markdown("""<style>div[data-baseweb="tab-list"]{display:none!important;}</style>""", unsafe_allow_html=True)
+
+if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and not run:
+    st.warning("V1.15.1 發現兩個資料問題：① 60m訊號時間被誤當UTC，所以09~13時段全部顯示成17~21；② 3mo資料直接起算造成早期量比/MA60暖機不足。這版先修資料品質，不新增策略條件。")
+
+if run and simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證":
+    st.subheader("🧰 TOP50暖機修正驗證")
+    with st.spinner("同時跑舊3mo版本與6mo暖機版本，比較最後3個月結果…"):
+        _wu_sum,_wu_blocks,_wu_trades,_wu_errs,_wu_check=validate_top50_warmup_correction(cost)
+    st.session_state["st_v1160_warmup"]={
+        "summary":_wu_sum,"blocks":_wu_blocks,"trades":_wu_trades,
+        "check":_wu_check,"errors":_wu_errs
+    }
+
+_wu=st.session_state.get("st_v1160_warmup")
+if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and _wu:
+    _us=_wu.get("summary",pd.DataFrame()); _ub=_wu.get("blocks",pd.DataFrame())
+    _ut=_wu.get("trades",pd.DataFrame()); _uc=_wu.get("check",pd.DataFrame()); _ue=_wu.get("errors",[])
+    st.subheader("🧰 TOP50暖機修正結果")
+    if _ue:
+        st.warning("資料來源異常："+"；".join(_ue))
+    st.info("先確認暖機修正是否改變第1段與整體結論；若有明顯差異，後續所有研究統一改用『長資料暖機＋固定評估窗』。")
+    if not _uc.empty:
+        st.markdown("#### 資料完整度")
+        st.dataframe(_uc.round(3),use_container_width=True,hide_index=True)
+    if not _us.empty:
+        st.markdown("#### 舊版 vs 暖機版｜全部 / 樣本內 / 樣本外")
+        st.dataframe(_us.round(3),use_container_width=True,hide_index=True)
+    if not _ub.empty:
+        st.markdown("#### 舊版 vs 暖機版｜四段時間")
+        st.dataframe(_ub.round(3),use_container_width=True,hide_index=True)
+    with st.expander("查看暖機版逐筆交易"):
+        st.dataframe(_ut.round(3),use_container_width=True,hide_index=True)
+    st.download_button("⬇️ 下載【TOP50暖機修正摘要】",_us.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_TOP50暖機修正摘要.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【TOP50暖機修正四段穩定度】",_ub.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_TOP50暖機修正四段穩定度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【TOP50暖機修正逐筆交易】",_ut.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_TOP50暖機修正逐筆交易.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【TOP50暖機資料完整度】",_uc.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_TOP50暖機資料完整度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.success("四份檔案可連續下載，不需重跑。")
 
 if simple_mode=="進階研究" and research_mode=="TOP50訊號品質健診" and not run:
     st.info("V1.15.0 顯示MA15/市場狀態無法穩定解釋第1段失效，且部分關係在樣本內外反轉。這一版不加市場Gate，改固定TOP50檢查訊號本身品質。")
@@ -3372,7 +3530,7 @@ if run:
         st.error("請至少選擇一個K棒週期、進場規則與持有方式。")
         st.stop()
 
-    if research_mode in ["TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
+    if research_mode in ["TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
         # 股票池研究已在上方獨立完成。：股票池健診已在上方獨立完成。
         # 初始化舊版共用變數，避免後續 session 儲存引用未定義的 summary。
         summary, data_map, trade_map = pd.DataFrame(), {}, {}
@@ -3910,6 +4068,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.15.1 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.0 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
