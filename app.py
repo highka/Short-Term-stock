@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.7.2
+黑嚕嚕－短線交易雷達 ST V1.8.0
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,13 +36,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.7.2"
+APP_VERSION = "ST V1.8.0"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.7.2"
-EXPORT_PREFIX = "ST_V1.7.2"
+APP_VERSION = "ST_V1.8.0"
+EXPORT_PREFIX = "ST_V1.8.0"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -683,6 +683,56 @@ def walkforward_layer_time_validation(wf_detail: pd.DataFrame, blocks: int = 4) 
                 "整體PF":pf
             })
     return pd.DataFrame(rows)
+
+
+def build_research_radar_candidates(trades: pd.DataFrame, wf_detail: pd.DataFrame) -> pd.DataFrame:
+    """
+    V1.8.0 研究雷達候選：
+    - 核心訊號固定：60m KD黃金交叉 + K<30
+    - 不把WF可交易分數當預測報酬排名；只標示歷史可交易性層級
+    - 80以上不直接排除，因V1.7.2顯示其弱勢並非所有時間段都成立
+    - 排序優先使用訊號新鮮度與K深度；此表是研究候選，不是投資建議/自動下單
+    """
+    if trades is None or trades.empty:
+        return pd.DataFrame()
+    t=trades.copy()
+    t["_dt"]=pd.to_datetime(t["訊號時間"],utc=True,errors="coerce")
+    t=t.dropna(subset=["_dt"]).copy()
+
+    # 合併當時的WF可交易性資訊
+    if wf_detail is not None and not wf_detail.empty:
+        w=wf_detail.copy()
+        w["_dt"]=pd.to_datetime(w["訊號時間"],utc=True,errors="coerce")
+        keep=[c for c in ["股票","_dt","WF可交易分數","WF分層","WF成交金額","WF成交量","WF振幅"] if c in w.columns]
+        w=w[keep].drop_duplicates(["股票","_dt"])
+        t=t.merge(w,on=["股票","_dt"],how="left",suffixes=("","_wf"))
+
+    # K值欄位若存在，K越低只作研究排序輔助；不改核心訊號門檻K<30。
+    kval=None
+    for c in ["訊號K","K"]:
+        if c in t.columns:
+            kval=pd.to_numeric(t[c],errors="coerce")
+            break
+    if kval is None:
+        kval=pd.Series(np.nan,index=t.index)
+
+    latest=t["_dt"].max()
+    t["距最新訊號小時"]=(latest-t["_dt"]).dt.total_seconds()/3600
+    t["K深度分"]=np.where(kval.notna(),(30-kval).clip(lower=0,upper=30)/30*100,np.nan)
+    t["訊號新鮮度分"]=(100-(t["距最新訊號小時"]/24*8)).clip(lower=0,upper=100)
+
+    # 不用WF分數預測報酬；只給可交易性標籤。研究排序=新鮮度70% + K深度30%(有K時)
+    t["雷達研究分數"]=t["訊號新鮮度分"]
+    hask=t["K深度分"].notna()
+    t.loc[hask,"雷達研究分數"]=t.loc[hask,"訊號新鮮度分"]*0.70+t.loc[hask,"K深度分"]*0.30
+    t["核心規則"]="60m KD黃金交叉 + K<30｜研究持有5日"
+    t["用途"]="研究雷達候選（非投資建議）"
+
+    cols=[c for c in [
+        "股票","研究主題","訊號時間","核心規則","WF分層","WF可交易分數",
+        "訊號新鮮度分","K深度分","雷達研究分數","用途"
+    ] if c in t.columns]
+    return t[cols].sort_values(["訊號時間","雷達研究分數"],ascending=[False,False]).reset_index(drop=True)
 
 
 def time_block_stability(trades: pd.DataFrame, blocks: int = 4) -> pd.DataFrame:
@@ -1737,12 +1787,14 @@ if run:
         market_blocks = market_regime_by_timeblock(oos_trades, blocks=4)
         wf_summary, wf_detail, wf_status = walkforward_tradability_validation(oos_trades, daily_lookback=20)
         wf_time = walkforward_layer_time_validation(wf_detail, blocks=4)
-        st.session_state["st_v172_oos"] = {
+        radar_candidates = build_research_radar_candidates(oos_trades, wf_detail)
+        st.session_state["st_v180_oos"] = {
             "detail": oos_detail, "summary": oos_summary, "trades": oos_trades,
             "blocks": block_summary, "state_diag": state_diag,
             "filter_robust": filter_robust, "market_diag": market_diag,
             "market_blocks": market_blocks,
             "wf_summary": wf_summary, "wf_detail": wf_detail, "wf_status": wf_status, "wf_time": wf_time,
+            "radar_candidates": radar_candidates,
             "pool": ranked_pool, "symbols": symbols
         }
         summary, data_map, trade_map = pd.DataFrame(), {}, {}
@@ -1824,7 +1876,7 @@ if run:
         "trade_map": trade_map,
     }
 
-oos_state = st.session_state.get("st_v172_oos")
+oos_state = st.session_state.get("st_v180_oos")
 if research_mode == "60m五日OOS驗證" and oos_state:
     st.markdown("## 🧪 60m＋K<30＋5日｜時間穩定度驗證")
     st.caption("規則完全固定；所有股票共用同一個全市場時間切點，前60%時間區段為樣本內、後40%為樣本外。股票池仍由近期流動性建立，因此仍屬固定股票池時間OOS。")
@@ -1840,6 +1892,7 @@ if research_mode == "60m五日OOS驗證" and oos_state:
     owfd=oos_state.get("wf_detail",pd.DataFrame())
     owf_status=oos_state.get("wf_status","尚未執行Walk-Forward診斷。")
     owf_time=oos_state.get("wf_time",pd.DataFrame())
+    oradar=oos_state.get("radar_candidates",pd.DataFrame())
     if not osum.empty:
         st.dataframe(osum.round(3),use_container_width=True,hide_index=True)
         st.download_button("⬇️ 下載【OOS驗證總表】",osum.to_csv(index=False).encode("utf-8-sig"),
@@ -1892,13 +1945,19 @@ if research_mode == "60m五日OOS驗證" and oos_state:
         st.dataframe(owf_time.round(3),use_container_width=True,hide_index=True)
         st.download_button("⬇️ 下載【WalkForward分層四段驗證】",owf_time.to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"{APP_VERSION}_WalkForward分層四段驗證.csv",mime="text/csv",use_container_width=True)
+    if not oradar.empty:
+        st.markdown("### 研究雷達候選")
+        st.caption("核心規則仍固定60m KD黃金交叉＋K<30。WF可交易性只作流動性背景，不再假設分數越高未來報酬越高；雷達排序主要反映訊號新鮮度與K深度。")
+        st.dataframe(oradar.head(100).round(3),use_container_width=True,hide_index=True)
+        st.download_button("⬇️ 下載【研究雷達候選】",oradar.to_csv(index=False).encode("utf-8-sig"),
+                           file_name=f"{APP_VERSION}_研究雷達候選.csv",mime="text/csv",use_container_width=True)
     if not odet.empty:
         st.download_button("⬇️ 下載【OOS個股策略明細】",odet.to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"{APP_VERSION}_OOS個股策略明細.csv",mime="text/csv",use_container_width=True)
     if not otr.empty:
         st.download_button("⬇️ 下載【OOS逐筆交易明細】",otr.to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"{APP_VERSION}_OOS逐筆交易明細.csv",mime="text/csv",use_container_width=True)
-    st.info("下一輪請提供：①【WalkForward分層四段驗證】②【WalkForward股票池驗證】③【WalkForward逐筆明細】。這輪確認「高活躍層反而較弱」是否跨時間成立，再決定是否修改股票池排名公式。")
+    st.info("下一輪請提供：①【研究雷達候選】②【WalkForward分層四段驗證】③【WalkForward逐筆明細】。本版開始把已驗證核心規則轉成雷達輸出；WF分數只保留為可交易性背景，不當作報酬預測排名。")
 
 mtf_state = st.session_state.get("st_v130_mtf")
 if research_mode == "多週期當沖/隔日驗證" and mtf_state:
@@ -2222,6 +2281,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.7.2 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.8.0 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
