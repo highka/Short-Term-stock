@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.13.0
+黑嚕嚕－短線交易雷達 ST V1.13.1
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -38,13 +38,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.13.0"
+APP_VERSION = "ST V1.13.1"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.13.0"
-EXPORT_PREFIX = "ST_V1.13.0"
+APP_VERSION = "ST_V1.13.1"
+EXPORT_PREFIX = "ST_V1.13.1"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1161,6 +1161,41 @@ def download_daily_batches(symbols: List[str], period: str="2mo", batch_size: in
     return out
 
 
+
+def summarize_liquidity_thresholds(full_df: pd.DataFrame):
+    """
+    V1.13.1：用絕對成交金額與相對百分位兩種方式觀察候選池大小。
+    目的不是直接選出『最佳』門檻，而是避免把極低流動股票只因爆量納入。
+    """
+    if full_df is None or full_df.empty:
+        return pd.DataFrame()
+    x=full_df.copy()
+    rows=[]
+    specs=[
+        ("成交金額≥5,000萬", x["20日成交金額中位數"]>=50_000_000),
+        ("成交金額≥1億", x["20日成交金額中位數"]>=100_000_000),
+        ("成交金額≥2億", x["20日成交金額中位數"]>=200_000_000),
+        ("成交金額≥5億", x["20日成交金額中位數"]>=500_000_000),
+        ("全市場流動性前20%", x["成交金額百分位"]>=80),
+        ("全市場流動性前15%", x["成交金額百分位"]>=85),
+        ("全市場流動性前10%", x["成交金額百分位"]>=90),
+    ]
+    for name,eligible in specs:
+        add=(x["核心TOP100"]=="否") & eligible & (
+            (x["爆量異動"]=="是") | (x["熱門動能"]=="是")
+        )
+        rows.append({
+            "門檻":name,
+            "符合基本流動股票":int(eligible.sum()),
+            "TOP100外熱門增補":int(add.sum()),
+            "研究候選池總數":int(100+add.sum()),
+            "最低20日成交金額中位數":float(x.loc[eligible,"20日成交金額中位數"].min()) if eligible.any() else np.nan,
+            "上市增補":int((add & (x["市場"]=="上市")).sum()),
+            "上櫃增補":int((add & (x["市場"]=="上櫃")).sum()),
+        })
+    return pd.DataFrame(rows)
+
+
 def build_full_market_pool_diagnostics(top_n: int=100):
     """
     V1.13.0 全市場股票池研究：
@@ -1226,9 +1261,12 @@ def build_full_market_pool_diagnostics(top_n: int=100):
     out["熱門動能"]=np.where(
         (out["今日成交金額比20日"]>=1.5)&(out["3日均量比20日"]>=1.2),"是","否")
 
-    # 研究用擴充候選：不把爆量直接當買進條件。
-    # 只允許本身至少位於全市場成交金額前60%，避免極低流動股票因偶發小量被放大。
-    hot_add=(out["核心TOP100"]=="否")&(out["成交金額百分位"]>=40)&(
+    # V1.13.1：正式研究候選先收斂到「全市場流動性前20%」。
+    # 原V1.13.0使用>=40百分位，實際可低到日成交金額約數百萬，過於寬鬆。
+    out["寬鬆熱門增補_V1130"]=np.where(
+        (out["核心TOP100"]=="否")&(out["成交金額百分位"]>=40)&(
+            (out["爆量異動"]=="是")|(out["熱門動能"]=="是")),"是","否")
+    hot_add=(out["核心TOP100"]=="否")&(out["成交金額百分位"]>=80)&(
         (out["爆量異動"]=="是")|(out["熱門動能"]=="是"))
     out["熱門增補候選"]=np.where(hot_add,"是","否")
     out["研究候選池"]=np.where((out["核心TOP100"]=="是")|hot_add,"是","否")
@@ -2379,13 +2417,16 @@ if run and simple_mode=="進階研究" and research_mode=="全市場股票池研
     st.caption("官方上市+上櫃公司名單 → Yahoo近期日K → 核心TOP100 + 熱門增補候選。爆量只作資訊，不作買進分數。")
     with st.spinner("下載官方上市/上櫃名單並分批建立全市場股票池，第一次可能需要較久…"):
         _fm_detail,_fm_summary,_fm_errors=build_full_market_pool_diagnostics(top_n=100)
-    st.session_state["st_v1130_fullmarket"]={
-        "detail":_fm_detail,"summary":_fm_summary,"errors":_fm_errors
+        _fm_thresholds=summarize_liquidity_thresholds(_fm_detail)
+    st.session_state["st_v1131_fullmarket"]={
+        "detail":_fm_detail,"summary":_fm_summary,"errors":_fm_errors,
+        "thresholds":_fm_thresholds
     }
 
-_fm=st.session_state.get("st_v1130_fullmarket")
+_fm=st.session_state.get("st_v1131_fullmarket")
 if simple_mode=="進階研究" and research_mode=="全市場股票池研究" and _fm:
     _fd=_fm.get("detail",pd.DataFrame()); _fs=_fm.get("summary",pd.DataFrame()); _fe=_fm.get("errors",[])
+    _ft=_fm.get("thresholds",pd.DataFrame())
     st.subheader("🌐 全市場股票池研究結果")
     if _fe:
         st.warning("部分官方來源讀取異常："+"；".join(_fe))
@@ -2397,7 +2438,10 @@ if simple_mode=="進階研究" and research_mode=="全市場股票池研究" and
         _common=_fd["共同資料基準日"].mode()
         if len(_common):
             st.caption(f"共同資料基準日：{_common.iloc[0]}")
-        st.info("V1.12.4顯示量能效果高度依市場時段變化，因此本版只把爆量/熱門列為『增補候選』，不直接改核心策略。")
+        st.info("V1.13.1 將正式研究增補收斂到『全市場流動性前20%』；爆量/熱門仍只作候選，不直接改買進策略。")
+        if not _ft.empty:
+            st.markdown("#### 流動性門檻敏感度")
+            st.dataframe(_ft.round(0),use_container_width=True,hide_index=True)
         show=[c for c in ["股票","公司","市場","核心TOP100","熱門增補候選","研究候選池",
                           "流動性排名","成交金額百分位","爆量分層","今日量比20日",
                           "今日成交金額比20日","3日均量比20日","熱門動能"] if c in _fd.columns]
@@ -2408,7 +2452,10 @@ if simple_mode=="進階研究" and research_mode=="全市場股票池研究" and
     st.download_button("⬇️ 下載【全市場股票池摘要】",_fs.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"{APP_VERSION}_全市場股票池摘要.csv",mime="text/csv",
                        use_container_width=True,on_click="ignore")
-    st.success("結果已保存；下載不需重新計算。")
+    st.download_button("⬇️ 下載【全市場流動性門檻比較】",_ft.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_全市場流動性門檻比較.csv",mime="text/csv",
+                       use_container_width=True,on_click="ignore")
+    st.success("結果已保存；三份檔案可連續下載，不需重跑。")
 
 if run and simple_mode=="進階研究" and research_mode=="股票池2.0歷史驗證":
     st.subheader("🧪 股票池2.0歷史驗證")
@@ -3053,6 +3100,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.13.0 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.13.1 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
