@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.11.1
+黑嚕嚕－短線交易雷達 ST V1.11.2
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,13 +36,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.11.1"
+APP_VERSION = "ST V1.11.2"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.11.1"
-EXPORT_PREFIX = "ST_V1.11.1"
+APP_VERSION = "ST_V1.11.2"
+EXPORT_PREFIX = "ST_V1.11.2"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1903,11 +1903,14 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=3)
-            code = st.text_input("股票代號", value="2330")
-            market = st.radio("市場", ["上市","上櫃"], horizontal=True)
-            symbol = normalize_symbol(code, market)
-            selected_intervals = st.multiselect("K棒週期", INTERVALS, default=["60m"])
+                ["股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
+            if research_mode == "股票池健診":
+                st.caption("本模式只分析股票池，不執行策略回測。")
+            else:
+                code = st.text_input("股票代號", value="2330")
+                market = st.radio("市場", ["上市","上櫃"], horizontal=True)
+                symbol = normalize_symbol(code, market)
+                selected_intervals = st.multiselect("K棒週期", INTERVALS, default=["60m"])
             all_rules = [
                 "MA5上穿MA15","MA15上穿MA30","KD黃金交叉","MA5>15 + KD黃金交叉",
                 "MA5>15>30 + KD黃金交叉","MA5>15>30>60 + KD黃金交叉","完整多頭排列",
@@ -1916,12 +1919,13 @@ with st.sidebar:
                 "KD黃金交叉 + MA30向上","KD黃金交叉 + MA60向上","KD黃金交叉 + 量比>1.2",
                 "KD黃金交叉 + 量比>1.5","KD黃金交叉 + 站上VWAP","MA5>15 + KD + 站上VWAP"
             ]
-            selected_rules = st.multiselect("進場規則", all_rules, default=["KD黃金交叉 + K<30"])
-            selected_modes = st.multiselect("持有方式",
-                ["當沖","隔日","2日","3日","4日","5日","6日","7日"], default=["5日"])
-            overlap_mode = st.radio("持倉期間新訊號",
-                ["禁止重疊（較接近實際單一持倉）","允許重疊（訊號事件研究）"])
-            allow_overlap = overlap_mode.startswith("允許")
+            if research_mode != "股票池健診":
+                selected_rules = st.multiselect("進場規則", all_rules, default=["KD黃金交叉 + K<30"])
+                selected_modes = st.multiselect("持有方式",
+                    ["當沖","隔日","2日","3日","4日","5日","6日","7日"], default=["5日"])
+                overlap_mode = st.radio("持倉期間新訊號",
+                    ["禁止重疊（較接近實際單一持倉）","允許重疊（訊號事件研究）"])
+                allow_overlap = overlap_mode.startswith("允許")
             if research_mode == "跨股票批次":
                 pool_mode = st.radio("批次股票池", ["手動輸入","族群代表池","動態短線TOP池"], index=2)
                 batch_text = st.text_area("批次股票代號", value=batch_text)
@@ -1938,12 +1942,35 @@ with st.sidebar:
         slip_bp = st.number_input("單邊滑價（bp）", min_value=0.0, max_value=30.0, value=5.0, step=1.0)
     cost = CostConfig(fee_discount=fee_discount, slippage_pct=slip_bp / 10000)
 
-    run = st.button("🔄 更新今日雷達" if simple_mode=="今日雷達" else "🚀 開始策略健診",
-                    type="primary", use_container_width=True)
+    _btn_label = "🔄 更新今日雷達" if simple_mode=="今日雷達" else ("🧭 開始股票池健診" if research_mode=="股票池健診" else "🚀 開始策略健診")
+    run = st.button(_btn_label, type="primary", use_container_width=True)
 
 
 if simple_mode == "今日雷達":
     st.markdown("""<style>div[data-baseweb="tab-list"]{display:none!important;}</style>""", unsafe_allow_html=True)
+
+if run and simple_mode=="進階研究" and research_mode=="股票池健診":
+    st.subheader("🧭 股票池健診")
+    st.caption("分析人工母池 → 近期資料 → 可交易性排名 → TOP100截斷；本次不跑策略回測。")
+    with st.spinner("分析股票池…"):
+        _ranked = rank_short_term_pool(SHORT_TERM_UNIVERSE, top_n=min(100, len(SHORT_TERM_UNIVERSE)))
+        _detail, _summary = diagnose_stock_pool(SHORT_TERM_UNIVERSE, _ranked, top_n)
+    c1,c2,c3,c4=st.columns(4)
+    c1.metric("人工母池",len(_detail))
+    c2.metric("有近期資料",int((_detail["是否有近期排名資料"]=="是").sum()) if not _detail.empty else 0)
+    c3.metric(f"TOP{top_n}",int((_detail["目前TOP池"]=="是").sum()) if not _detail.empty else 0)
+    c4.metric("TOP外",int((_detail["目前TOP池"]=="否").sum()) if not _detail.empty else 0)
+    st.warning("短線可交易分只代表流動性/活躍度，不代表未來報酬。TOP100在這裡只是比較組。")
+    if not _summary.empty:
+        st.markdown("#### 族群分布")
+        st.dataframe(_summary.round(3),use_container_width=True,hide_index=True)
+    with st.expander("查看股票池逐檔明細"):
+        st.dataframe(_detail.round(3),use_container_width=True,hide_index=True)
+    st.download_button("⬇️ 下載【股票池健診明細】",_detail.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_股票池健診明細.csv",mime="text/csv",use_container_width=True)
+    st.download_button("⬇️ 下載【股票池族群分布】",_summary.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_股票池族群分布.csv",mime="text/csv",use_container_width=True)
+    st.info("這一輪只需要下載【股票池健診明細】與【股票池族群分布】。")
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 單股總表", "🌐 跨股穩定度", "🔥 動態短線池", "🏭 族群比較", "🧬 狀態分類", "📈 K線/KD", "🔬 KD分區", "📦 量價/斜率", "🧾 交易明細"])
 
@@ -1991,7 +2018,7 @@ if run:
         pool_detail, pool_summary = diagnose_stock_pool(SHORT_TERM_UNIVERSE, ranked_pool, top_n)
         with st.spinner("掃描最新60m行情，建立今日雷達…"):
             live_radar, live_diag = scan_latest_60m_radar(symbols, ranked_pool, period=period, observe_days=5)
-        st.session_state["st_v1111_oos"] = {
+        st.session_state["st_v1112_oos"] = {
             "detail": oos_detail, "summary": oos_summary, "trades": oos_trades,
             "blocks": block_summary, "state_diag": state_diag,
             "filter_robust": filter_robust, "market_diag": market_diag,
@@ -2079,7 +2106,7 @@ if run:
         "trade_map": trade_map,
     }
 
-oos_state = st.session_state.get("st_v1111_oos")
+oos_state = st.session_state.get("st_v1112_oos")
 if research_mode == "60m五日OOS驗證" and oos_state:
     st.markdown("## 🧪 60m＋K<30＋5日｜時間穩定度驗證")
     st.caption("規則完全固定；所有股票共用同一個全市場時間切點，前60%時間區段為樣本內、後40%為樣本外。股票池仍由近期流動性建立，因此仍屬固定股票池時間OOS。")
@@ -2486,6 +2513,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.11.1 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.11.2 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
