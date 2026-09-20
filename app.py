@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.2.7
+黑嚕嚕－短線交易雷達 ST V1.3.0
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,13 +36,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.2.7"
+APP_VERSION = "ST V1.3.0"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.2.7"
-EXPORT_PREFIX = "ST_V1.2.7"
+APP_VERSION = "ST_V1.3.0"
+EXPORT_PREFIX = "ST_V1.3.0"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -221,8 +221,153 @@ def signal_mask(d: pd.DataFrame, rule: str) -> pd.Series:
         "KD黃金交叉 + 量比>1.5": d.get("KD_GOLD", false) & (d.get("VOL_RATIO20", pd.Series(np.nan, index=d.index)) > 1.5),
         "KD黃金交叉 + 站上VWAP": d.get("KD_GOLD", false) & d.get("PRICE_GT_VWAP", false),
         "MA5>15 + KD + 站上VWAP": d.get("MA_BULL_5_15", false) & d.get("KD_GOLD", false) & d.get("PRICE_GT_VWAP", false),
+        "多週期條件": d.get("MTF_SIGNAL", false),
     }
     return rules.get(rule, false).fillna(False)
+
+
+
+def build_multitimeframe_5m_signal(
+    d5: pd.DataFrame,
+    d15: pd.DataFrame,
+    d60: pd.DataFrame,
+    entry_rule: str,
+) -> pd.DataFrame:
+    """
+    V1.3.0 多週期研究：
+    60m 環境 = K<30
+    15m 確認 = KD黃金交叉
+    5m 觸發 = KD黃金交叉 / MA5上穿MA15 / 站上VWAP後KD黃金交叉
+
+    高週期欄位以「K棒完成時間」向後平移後再對齊5m，
+    避免在高週期K棒尚未收完時偷看該根資料。
+    """
+    if d5 is None or d15 is None or d60 is None or d5.empty or d15.empty or d60.empty:
+        return pd.DataFrame()
+
+    x5 = d5.copy().sort_index()
+    x15 = d15.copy().sort_index()
+    x60 = d60.copy().sort_index()
+
+    # Yahoo 分K索引通常代表K棒起始時間；轉成可使用時間。
+    a15 = pd.DataFrame(index=x15.index + pd.Timedelta(minutes=15))
+    a15["CONFIRM_15M"] = x15["KD_GOLD"].fillna(False).to_numpy()
+    # 15m黃金交叉確認後，給後續45分鐘作為5m進場窗口。
+    a15["CONFIRM_15M_RECENT"] = a15["CONFIRM_15M"].rolling(3, min_periods=1).max().astype(bool)
+
+    a60 = pd.DataFrame(index=x60.index + pd.Timedelta(minutes=60))
+    a60["ENV_60M_K"] = x60["K"].to_numpy()
+    a60["ENV_60M_LOW"] = (a60["ENV_60M_K"] < 30).fillna(False)
+
+    base = x5.reset_index()
+    time_col = base.columns[0]
+    base = base.rename(columns={time_col: "_time"}).sort_values("_time")
+
+    z15 = a15.reset_index()
+    z15 = z15.rename(columns={z15.columns[0]: "_time"}).sort_values("_time")
+    z60 = a60.reset_index()
+    z60 = z60.rename(columns={z60.columns[0]: "_time"}).sort_values("_time")
+
+    base = pd.merge_asof(base, z15, on="_time", direction="backward")
+    base = pd.merge_asof(base, z60, on="_time", direction="backward")
+    base = base.set_index("_time")
+    base.index.name = x5.index.name
+
+    env = base["ENV_60M_LOW"].fillna(False)
+    confirm = base["CONFIRM_15M_RECENT"].fillna(False)
+
+    if entry_rule == "5m KD黃金交叉":
+        trigger = base["KD_GOLD"].fillna(False)
+    elif entry_rule == "5m MA5上穿MA15":
+        trigger = base["MA5_XUP_MA15"].fillna(False)
+    else:
+        trigger = base["KD_GOLD"].fillna(False) & base["PRICE_GT_VWAP"].fillna(False)
+
+    base["MTF_SIGNAL"] = env & confirm & trigger
+    base["MTF_60M_K"] = base["ENV_60M_K"]
+    base["MTF_15M_CONFIRM"] = confirm
+    base["MTF_5M_TRIGGER"] = trigger
+    return base
+
+
+def run_multitimeframe_batch(
+    symbols: List[str],
+    entry_rules: List[str],
+    modes: List[str],
+    cost: CostConfig,
+    period: str,
+    allow_overlap: bool = False,
+):
+    """60m環境 → 15m確認 → 5m觸發；用5m價格執行當沖/隔日/2日回測。"""
+    all_rows, all_trades = [], []
+    p = st.progress(0, text="下載 5m / 15m / 60m 多週期資料…")
+
+    raw5 = download_intraday_batch(symbols, "5m", period)
+    p.progress(0.10, text="5m下載完成")
+    raw15 = download_intraday_batch(symbols, "15m", period)
+    p.progress(0.20, text="15m下載完成")
+    raw60 = download_intraday_batch(symbols, "60m", period)
+    p.progress(0.30, text="60m下載完成")
+
+    diagnostics = []
+    for iv, raw in [("5m", raw5), ("15m", raw15), ("60m", raw60)]:
+        ok = sum(1 for s in symbols if s in raw and not raw[s].empty)
+        diagnostics.append({"週期": iv, "要求股票數": len(symbols), "成功下載": ok, "失敗/空資料": len(symbols)-ok})
+
+    for n, symbol in enumerate(symbols, 1):
+        if symbol not in raw5 or symbol not in raw15 or symbol not in raw60:
+            continue
+        if raw5[symbol].empty or raw15[symbol].empty or raw60[symbol].empty:
+            continue
+
+        d5 = add_indicators(raw5[symbol])
+        d15 = add_indicators(raw15[symbol])
+        d60 = add_indicators(raw60[symbol])
+
+        for er in entry_rules:
+            mtf = build_multitimeframe_5m_signal(d5, d15, d60, er)
+            if mtf.empty:
+                continue
+            for mode in modes:
+                t = backtest(mtf, "5m", "多週期條件", mode, cost)
+                raw_count = len(t)
+                if not allow_overlap:
+                    t = enforce_non_overlapping(t)
+                m = metrics(t)
+                m["原始訊號數"] = raw_count
+                m["重疊排除數"] = raw_count - len(t)
+                rule_name = f"60m K<30 → 15m KD黃金交叉 → {er}"
+                all_rows.append({
+                    "股票": symbol,
+                    "研究主題": research_theme(symbol),
+                    "週期": "60m→15m→5m",
+                    "規則": rule_name,
+                    "持有": mode,
+                    **m,
+                })
+                if not t.empty:
+                    tt = t.copy()
+                    tt.insert(0, "股票", symbol)
+                    tt["多週期規則"] = rule_name
+                    tt["回測版本"] = APP_VERSION
+                    tt["持倉模式"] = "允許重疊" if allow_overlap else "禁止重疊"
+                    all_trades.append(tt)
+
+        p.progress(0.30 + 0.70*n/max(1, len(symbols)), text=f"多週期計算 {symbol}｜{n}/{len(symbols)}")
+
+    p.empty()
+    detail = pd.DataFrame(all_rows)
+    if not detail.empty:
+        detail["回測版本"] = APP_VERSION
+        detail["持倉模式"] = "允許重疊" if allow_overlap else "禁止重疊"
+        if "PF" not in detail.columns and "Profit Factor" in detail.columns:
+            detail["PF"] = detail["Profit Factor"]
+    cross = cross_stock_summary(detail[detail["交易數"] > 0].copy()) if not detail.empty else pd.DataFrame()
+    if not cross.empty:
+        cross.insert(0, "回測版本", APP_VERSION)
+        cross.insert(1, "持倉模式", "允許重疊" if allow_overlap else "禁止重疊")
+    trades = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
+    return detail, cross, trades, pd.DataFrame(diagnostics)
 
 
 def bars_per_day(interval: str) -> int:
@@ -924,7 +1069,7 @@ st.info(
 
 with st.sidebar:
     st.header("研究設定")
-    research_mode = st.radio("研究模式", ["單一股票", "跨股票批次"], horizontal=True)
+    research_mode = st.radio("研究模式", ["單一股票", "跨股票批次", "多週期當沖/隔日驗證"], horizontal=True)
     code = st.text_input("股票代號", value="2330")
     pool_mode = st.radio(
         "批次股票池",
@@ -1008,6 +1153,23 @@ with st.sidebar:
     if research_mode == "跨股票批次":
         st.caption("V1.2.7 驗證門檻：優先觀察 60m｜KD黃金交叉+K<30｜4~7日；若TOP50仍維持正期望股票比例≥70%、期望中位數>0、PF中位數>1.2，再進入下一階段。")
 
+    if research_mode == "多週期當沖/隔日驗證":
+        st.markdown("#### V1.3.0 多週期進場")
+        st.caption("固定 60m K<30 作環境、15m KD黃金交叉作確認，再比較不同5m觸發。")
+        mtf_entry_rules = st.multiselect(
+            "5分鐘進場觸發",
+            ["5m KD黃金交叉", "5m MA5上穿MA15", "5m KD黃金交叉+站上VWAP"],
+            default=["5m KD黃金交叉", "5m KD黃金交叉+站上VWAP"],
+        )
+        mtf_modes = st.multiselect(
+            "短線出場方式",
+            ["當沖", "隔日", "2日"],
+            default=["當沖", "隔日"],
+        )
+    else:
+        mtf_entry_rules = []
+        mtf_modes = []
+
     st.divider()
     st.subheader("交易成本")
     fee_discount = st.number_input("手續費折數", min_value=0.1, max_value=1.0, value=0.28, step=0.01)
@@ -1018,17 +1180,43 @@ with st.sidebar:
     if research_mode == "跨股票批次" and pool_mode == "動態短線TOP池":
         st.info(f"本次預計：TOP {top_n} × {len(selected_intervals)}週期 × {len(selected_rules)}規則 × {len(selected_modes)}持有方式。V1.2.7 建議 TOP50，用來確認30檔結果的樣本穩健度。")
         if top_n > 50:
-            st.warning("目前仍使用 yfinance。一次超過30檔容易遇到下載限制或執行時間過長；建議先20～30檔分批驗證。")
+            st.warning("目前仍使用 yfinance。若超過50檔遇到下載限制或執行時間過長，先維持50檔即可。")
     run = st.button("🚀 開始策略健診", type="primary", use_container_width=True)
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 單股總表", "🌐 跨股穩定度", "🔥 動態短線池", "🏭 族群比較", "🧬 狀態分類", "📈 K線/KD", "🔬 KD分區", "📦 量價/斜率", "🧾 交易明細"])
 
 if run:
-    if not selected_intervals or not selected_rules or not selected_modes:
+    if research_mode != "多週期當沖/隔日驗證" and (not selected_intervals or not selected_rules or not selected_modes):
         st.error("請至少選擇一個K棒週期、進場規則與持有方式。")
         st.stop()
 
-    if research_mode == "跨股票批次":
+    if research_mode == "多週期當沖/隔日驗證":
+        # 多週期版沿用動態短線池；預設50檔即可，避免再擴大樣本造成不必要負載。
+        with st.spinner("建立多週期驗證股票池…"):
+            ranked_pool = rank_short_term_pool(SHORT_TERM_UNIVERSE, top_n=top_n)
+        symbols = ranked_pool["股票"].tolist() if not ranked_pool.empty else []
+        if not symbols:
+            st.error("股票池建立失敗：沒有可用股票。")
+            st.stop()
+        if not mtf_entry_rules or not mtf_modes:
+            st.error("請至少選擇一個5分鐘進場觸發與一個短線出場方式。")
+            st.stop()
+        try:
+            with st.spinner(f"多週期當沖/隔日驗證：{len(symbols)}檔…"):
+                mtf_detail, mtf_cross, mtf_trades, mtf_diag = run_multitimeframe_batch(
+                    symbols, mtf_entry_rules, mtf_modes, cost, period, allow_overlap
+                )
+        except Exception as e:
+            st.error(f"多週期健診中斷：{type(e).__name__}: {e}")
+            st.stop()
+        st.session_state["st_v130_mtf"] = {
+            "detail": mtf_detail, "cross": mtf_cross, "trades": mtf_trades,
+            "diagnostics": mtf_diag, "symbols": symbols, "ranked_pool": ranked_pool,
+        }
+        # 不進入舊批次流程
+        summary, data_map, trade_map = pd.DataFrame(), {}, {}
+        symbol = symbols[0]
+    elif research_mode == "跨股票批次":
         if pool_mode == "手動輸入":
             symbols = parse_batch_codes(batch_text, market)
             ranked_pool = pd.DataFrame()
@@ -1066,7 +1254,7 @@ if run:
         # 批次完成後不再重跑第一檔，避免再次下載造成中斷。
         symbol = symbols[0]
         summary, data_map, trade_map = pd.DataFrame(), {}, {}
-    else:
+    elif research_mode == "單一股票":
         with st.spinner(f"下載 {symbol} 分K並回測…"):
             summary, data_map, trade_map = run_matrix(
                 symbol, selected_intervals, selected_rules, selected_modes, cost, period
@@ -1078,6 +1266,53 @@ if run:
         "data_map": data_map,
         "trade_map": trade_map,
     }
+
+mtf_state = st.session_state.get("st_v130_mtf")
+if research_mode == "多週期當沖/隔日驗證" and mtf_state:
+    st.markdown("## ⚡ 多週期當沖／隔日驗證結果")
+    mcross = mtf_state.get("cross", pd.DataFrame())
+    mdetail = mtf_state.get("detail", pd.DataFrame())
+    mtrades = mtf_state.get("trades", pd.DataFrame())
+    mdiag = mtf_state.get("diagnostics", pd.DataFrame())
+
+    if not mdiag.empty:
+        st.dataframe(mdiag, use_container_width=True, hide_index=True)
+    if not mcross.empty:
+        st.markdown("### 跨股票穩定度")
+        st.dataframe(mcross.round(3), use_container_width=True, hide_index=True)
+        st.download_button(
+            "⬇️ 下載【多週期跨股票穩定度】",
+            mcross.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"{EXPORT_PREFIX}_多週期跨股票穩定度.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    if not mdetail.empty:
+        st.download_button(
+            "⬇️ 下載【多週期批次策略明細】",
+            mdetail.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"{EXPORT_PREFIX}_多週期批次策略明細.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    if not mtrades.empty:
+        st.download_button(
+            "⬇️ 下載【多週期逐筆交易明細】",
+            mtrades.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"{EXPORT_PREFIX}_多週期逐筆交易明細.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    rp = mtf_state.get("ranked_pool", pd.DataFrame())
+    if not rp.empty:
+        st.download_button(
+            "⬇️ 下載【多週期驗證股票池】",
+            rp.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"{EXPORT_PREFIX}_多週期驗證股票池.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    st.info("下一輪請提供：①【多週期跨股票穩定度】②【多週期批次策略明細】③【多週期逐筆交易明細】。股票池只有名單改變很多時才需要提供。")
 
 state = st.session_state.get("st_v120")
 batch_state = st.session_state.get("st_v120_batch")
@@ -1173,7 +1408,7 @@ if state:
             st.dataframe(cx.round(3), use_container_width=True, hide_index=True)
             st.caption("重點看『正期望股票比例＋期望值中位數＋股票數/交易數』，避免被單一股票或少量交易拉高。")
             st.download_button(
-                "⬇️ 下載跨股票穩定度 CSV",
+                "⬇️ 下載【跨股票穩定度】",
                 cx.to_csv(index=False).encode("utf-8-sig"),
                 file_name=f"{EXPORT_PREFIX}_cross_stock_stability_nonoverlap.csv",
                 mime="text/csv",
@@ -1181,7 +1416,7 @@ if state:
             detail_export = batch_state.get("detail", pd.DataFrame())
             if not detail_export.empty:
                 st.download_button(
-                    "⬇️ 下載批次策略明細（含重疊排除）",
+                    "⬇️ 下載【批次策略明細】",
                     data=detail_export.to_csv(index=False).encode("utf-8-sig"),
                     file_name=f"{EXPORT_PREFIX}_batch_strategy_detail_nonoverlap.csv",
                     mime="text/csv",
@@ -1207,7 +1442,7 @@ if state:
                 tc = rp.groupby("研究主題")["股票"].count().sort_values(ascending=False).rename("入選檔數").reset_index()
                 st.dataframe(tc, use_container_width=True, hide_index=True)
             st.download_button(
-                "⬇️ 下載本次動態短線股票池 CSV",
+                "⬇️ 下載【動態短線股票池】",
                 show[cols].to_csv(index=False).encode("utf-8-sig"),
                 file_name=f"{EXPORT_PREFIX}_dynamic_short_term_pool.csv",
                 mime="text/csv",
@@ -1235,7 +1470,7 @@ if state:
             st.dataframe(sx.round(3), use_container_width=True, hide_index=True)
             st.caption("族群結果用來找『策略在哪些產業環境較穩定』，不把單一族群的最高數字直接視為最終策略。")
             st.download_button(
-                "⬇️ 下載族群策略健診 CSV",
+                "⬇️ 下載【族群策略健診】",
                 sx.to_csv(index=False).encode("utf-8-sig"),
                 file_name=f"{EXPORT_PREFIX}_sector_strategy_nonoverlap.csv",
                 mime="text/csv",
@@ -1352,6 +1587,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.2.7 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.3.0 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
