@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.12.3
+黑嚕嚕－短線交易雷達 ST V1.12.4
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,13 +36,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.12.3"
+APP_VERSION = "ST V1.12.4"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.12.3"
-EXPORT_PREFIX = "ST_V1.12.3"
+APP_VERSION = "ST_V1.12.4"
+EXPORT_PREFIX = "ST_V1.12.4"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -248,6 +248,67 @@ def aggregate_trade_metrics(trades: pd.DataFrame) -> dict:
 
 
 
+
+def summarize_pool20_stability(trades: pd.DataFrame):
+    """V1.12.4：爆量分層的樣本內外與四段時間穩定度。"""
+    if trades is None or trades.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    x=trades.copy()
+    buckets=["全部基準","<1倍","1-1.5倍","1.5-2倍","2-3倍",">3倍","爆量>=1.5倍","熱門動能"]
+
+    def mask_for(name):
+        if name=="全部基準":
+            return pd.Series(True,index=x.index)
+        if name in ["<1倍","1-1.5倍","1.5-2倍","2-3倍",">3倍"]:
+            return x["爆量分層"]==name
+        if name=="爆量>=1.5倍":
+            return x["前日爆量>=1.5"]=="是"
+        return x["前日熱門動能"]=="是"
+
+    # IS / OOS
+    sample_rows=[]
+    for sample in [z for z in ["樣本內60%","樣本外40%"] if z in set(x["樣本"].dropna())]:
+        xs=x[x["樣本"]==sample]
+        for b in buckets:
+            g=xs[mask_for(b).reindex(xs.index,fill_value=False)]
+            m=aggregate_trade_metrics(g)
+            sample_rows.append({"樣本":sample,"分組":b,"交易數":len(g),
+                                "涵蓋股票數":int(g["股票"].nunique()) if len(g) else 0,**m})
+    sample_df=pd.DataFrame(sample_rows)
+
+    # 四段等時間區間，不以交易數等分，避免大量交易期被強迫平均。
+    ts=pd.to_datetime(x["訊號時間"],errors="coerce")
+    ok=ts.notna()
+    xb=x.loc[ok].copy()
+    ts=ts.loc[ok]
+    block_rows=[]
+    if len(xb):
+        t0,t1=ts.min(),ts.max()
+        edges=pd.date_range(t0,t1,periods=5)
+        # 最後一段包含右界。
+        labels=["第1段","第2段","第3段","第4段"]
+        xb["時間段"]=pd.cut(ts,bins=edges,labels=labels,include_lowest=True,right=True)
+        for block in labels:
+            z=xb[xb["時間段"]==block]
+            for b in buckets:
+                if b=="全部基準":
+                    g=z
+                elif b in ["<1倍","1-1.5倍","1.5-2倍","2-3倍",">3倍"]:
+                    g=z[z["爆量分層"]==b]
+                elif b=="爆量>=1.5倍":
+                    g=z[z["前日爆量>=1.5"]=="是"]
+                else:
+                    g=z[z["前日熱門動能"]=="是"]
+                m=aggregate_trade_metrics(g)
+                block_rows.append({"時間段":block,
+                                   "起始":str(edges[labels.index(block)]),
+                                   "結束":str(edges[labels.index(block)+1]),
+                                   "分組":b,"交易數":len(g),
+                                   "涵蓋股票數":int(g["股票"].nunique()) if len(g) else 0,**m})
+    return sample_df,pd.DataFrame(block_rows)
+
+
 def validate_pool20_historical(symbols: List[str], cost: CostConfig, period: str = "3mo"):
     """
     V1.12.2：固定核心策略 60m KD黃金交叉+K<30+5日，
@@ -345,7 +406,8 @@ def validate_pool20_historical(symbols: List[str], cost: CostConfig, period: str
         m=aggregate_trade_metrics(g)
         groups.append({"分組":name,"交易數":len(g),
                        "涵蓋股票數":int(g["股票"].nunique()) if len(g) else 0,**m})
-    return pd.DataFrame(groups),x
+    _sample_stability,_block_stability=summarize_pool20_stability(x)
+    return pd.DataFrame(groups),x,_sample_stability,_block_stability
 
 
 def run_oos_60m_5d(symbols: List[str], cost: CostConfig, period: str, allow_overlap: bool = False,
@@ -2163,24 +2225,38 @@ if run and simple_mode=="進階研究" and research_mode=="股票池2.0歷史驗
     st.subheader("🧪 股票池2.0歷史驗證")
     st.caption("固定60m KD黃金交叉＋K<30＋持有5日；量能條件只使用訊號前一個已完成日K，避免偷看。")
     with st.spinner("建立核心策略交易並對齊歷史量能…"):
-        _p20_hist,_p20_trades=validate_pool20_historical(SHORT_TERM_UNIVERSE,cost,period="3mo")
-    st.session_state["st_v1122_pool20_hist"]={"summary":_p20_hist,"trades":_p20_trades}
+        _p20_hist,_p20_trades,_p20_sample,_p20_blocks=validate_pool20_historical(SHORT_TERM_UNIVERSE,cost,period="3mo")
+    st.session_state["st_v1124_pool20_hist"]={
+        "summary":_p20_hist,"trades":_p20_trades,
+        "sample":_p20_sample,"blocks":_p20_blocks
+    }
 
-_ph=st.session_state.get("st_v1122_pool20_hist")
+_ph=st.session_state.get("st_v1124_pool20_hist")
 if simple_mode=="進階研究" and research_mode=="股票池2.0歷史驗證" and _ph:
     _hs=_ph.get("summary",pd.DataFrame()); _ht=_ph.get("trades",pd.DataFrame())
+    _hsa=_ph.get("sample",pd.DataFrame()); _hbl=_ph.get("blocks",pd.DataFrame())
     st.subheader("🧪 股票池2.0歷史驗證結果")
     st.success("歷史驗證已完成。下方應出現兩個歷史驗證下載檔，不是『逐檔診斷／摘要』。")
     st.warning("這一輪只檢驗『前一完成日』爆量/熱門是否對核心策略有資訊價值；尚未把條件寫進正式雷達。")
     if not _hs.empty:
         st.dataframe(_hs.round(3),use_container_width=True,hide_index=True)
+    if not _hsa.empty:
+        st.markdown("#### 樣本內 / 樣本外穩定度")
+        st.dataframe(_hsa.round(3),use_container_width=True,hide_index=True)
+    if not _hbl.empty:
+        st.markdown("#### 四段時間穩定度")
+        st.dataframe(_hbl.round(3),use_container_width=True,hide_index=True)
     with st.expander("查看逐筆交易與量能標籤"):
         st.dataframe(_ht.round(3),use_container_width=True,hide_index=True)
     st.download_button("⬇️ 下載【股票池2.0歷史驗證摘要】",_hs.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"{APP_VERSION}_股票池2.0歷史驗證摘要.csv",mime="text/csv",use_container_width=True,on_click="ignore")
     st.download_button("⬇️ 下載【股票池2.0歷史逐筆交易】",_ht.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"{APP_VERSION}_股票池2.0歷史逐筆交易.csv",mime="text/csv",use_container_width=True,on_click="ignore")
-    st.success("結果已保存；可連續下載兩份檔案，不需重跑。")
+    st.download_button("⬇️ 下載【股票池2.0樣本內外穩定度】",_hsa.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_股票池2.0樣本內外穩定度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【股票池2.0四段時間穩定度】",_hbl.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_股票池2.0四段時間穩定度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.success("結果已保存；四份檔案可連續下載，不需重跑。")
 
 if run and simple_mode=="進階研究" and research_mode=="股票池2.0研究":
     st.subheader("🧭 股票池2.0研究")
@@ -2788,6 +2864,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.12.3 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.12.4 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
