@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.11.2
+黑嚕嚕－短線交易雷達 ST V1.11.3
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,13 +36,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.11.2"
+APP_VERSION = "ST V1.11.3"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.11.2"
-EXPORT_PREFIX = "ST_V1.11.2"
+APP_VERSION = "ST_V1.11.3"
+EXPORT_PREFIX = "ST_V1.11.3"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1975,11 +1975,15 @@ if run and simple_mode=="進階研究" and research_mode=="股票池健診":
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 單股總表", "🌐 跨股穩定度", "🔥 動態短線池", "🏭 族群比較", "🧬 狀態分類", "📈 K線/KD", "🔬 KD分區", "📦 量價/斜率", "🧾 交易明細"])
 
 if run:
-    if research_mode not in ["多週期當沖/隔日驗證","60m五日OOS驗證"] and (not selected_intervals or not selected_rules or not selected_modes):
+    if research_mode not in ["股票池健診","多週期當沖/隔日驗證","60m五日OOS驗證"] and (not selected_intervals or not selected_rules or not selected_modes):
         st.error("請至少選擇一個K棒週期、進場規則與持有方式。")
         st.stop()
 
-    if research_mode == "60m五日OOS驗證":
+    if research_mode == "股票池健診":
+        # V1.11.3：股票池健診已在上方獨立完成。
+        # 初始化舊版共用變數，避免後續 session 儲存引用未定義的 summary。
+        summary, data_map, trade_map = pd.DataFrame(), {}, {}
+    elif research_mode == "60m五日OOS驗證":
         # V1.4.1：OOS 執行移到按下「開始策略健診」之後；
         # 此時交易成本 cost 已完成建立，避免 V1.4.0 的 NameError。
         with st.spinner("建立固定股票池並進行60m五日時間OOS…"):
@@ -2018,7 +2022,7 @@ if run:
         pool_detail, pool_summary = diagnose_stock_pool(SHORT_TERM_UNIVERSE, ranked_pool, top_n)
         with st.spinner("掃描最新60m行情，建立今日雷達…"):
             live_radar, live_diag = scan_latest_60m_radar(symbols, ranked_pool, period=period, observe_days=5)
-        st.session_state["st_v1112_oos"] = {
+        st.session_state["st_v1113_oos"] = {
             "detail": oos_detail, "summary": oos_summary, "trades": oos_trades,
             "blocks": block_summary, "state_diag": state_diag,
             "filter_robust": filter_robust, "market_diag": market_diag,
@@ -2106,7 +2110,7 @@ if run:
         "trade_map": trade_map,
     }
 
-oos_state = st.session_state.get("st_v1112_oos")
+oos_state = st.session_state.get("st_v1113_oos")
 if research_mode == "60m五日OOS驗證" and oos_state:
     st.markdown("## 🧪 60m＋K<30＋5日｜時間穩定度驗證")
     st.caption("規則完全固定；所有股票共用同一個全市場時間切點，前60%時間區段為樣本內、後40%為樣本外。股票池仍由近期流動性建立，因此仍屬固定股票池時間OOS。")
@@ -2513,6 +2517,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.11.2 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.11.3 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
