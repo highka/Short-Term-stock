@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.10.0
+黑嚕嚕－短線交易雷達 ST V1.10.1
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,13 +36,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.10.0"
+APP_VERSION = "ST V1.10.1"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.10.0"
-EXPORT_PREFIX = "ST_V1.10.0"
+APP_VERSION = "ST_V1.10.1"
+EXPORT_PREFIX = "ST_V1.10.1"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -893,9 +893,9 @@ def scan_latest_60m_radar(symbols: List[str], ranked_pool: pd.DataFrame, period:
         sdate=stime_tw.date()
         observe_to=pd.Timestamp(np.busday_offset(sdate, observe_days, roll="forward")).date()
         age_h=(now_tw-stime_tw).total_seconds()/3600
-        if age_h <= 24 and age_h >= 0:
-            status="🟢 新訊號"
-        elif pd.Timestamp(observe_to) >= pd.Timestamp(now_tw.date()):
+        # 最新交易日判斷稍後依全體行情最後K棒日期統一修正；
+        # 這裡先依5工作日窗判斷觀察中/逾期，避免週末用24小時誤殺週五新訊號。
+        if pd.Timestamp(observe_to) >= pd.Timestamp(now_tw.date()):
             status="🟡 觀察中"
         else:
             status="⚪ 已逾期"
@@ -921,6 +921,14 @@ def scan_latest_60m_radar(symbols: List[str], ranked_pool: pd.DataFrame, period:
     diagnostics=pd.DataFrame(diag)
     if radar.empty:
         return radar, diagnostics
+
+    # V1.10.1：以本批100檔共同的「行情最後交易日」定義新訊號。
+    # 例如週日執行時，週五訊號仍應是新訊號，而不是因超過24小時被降成觀察中。
+    last_market_dates=pd.to_datetime(diagnostics["行情最後K棒"],errors="coerce").dropna()
+    if not last_market_dates.empty:
+        latest_market_date=last_market_dates.max().date()
+        sig_dates=pd.to_datetime(radar["訊號時間"],errors="coerce").dt.date
+        radar.loc[sig_dates==latest_market_date,"目前狀態"]="🟢 新訊號"
 
     order={"🟢 新訊號":0,"🟡 觀察中":1,"⚪ 已逾期":2}
     radar["_o"]=radar["目前狀態"].map(order).fillna(9)
@@ -1994,7 +2002,7 @@ if run:
         latest_signal = pd.to_datetime(oos_trades["訊號時間"],utc=True,errors="coerce").max() if not oos_trades.empty else pd.NaT
         with st.spinner("掃描100檔最新60m行情，建立今日雷達…"):
             live_radar, live_diag = scan_latest_60m_radar(symbols, ranked_pool, period=period, observe_days=5)
-        st.session_state["st_v1100_oos"] = {
+        st.session_state["st_v1101_oos"] = {
             "detail": oos_detail, "summary": oos_summary, "trades": oos_trades,
             "blocks": block_summary, "state_diag": state_diag,
             "filter_robust": filter_robust, "market_diag": market_diag,
@@ -2082,7 +2090,7 @@ if run:
         "trade_map": trade_map,
     }
 
-oos_state = st.session_state.get("st_v1100_oos")
+oos_state = st.session_state.get("st_v1101_oos")
 if research_mode == "60m五日OOS驗證" and oos_state:
     st.markdown("## 🧪 60m＋K<30＋5日｜時間穩定度驗證")
     st.caption("規則完全固定；所有股票共用同一個全市場時間切點，前60%時間區段為樣本內、後40%為樣本外。股票池仍由近期流動性建立，因此仍屬固定股票池時間OOS。")
@@ -2106,7 +2114,7 @@ if research_mode == "60m五日OOS驗證" and oos_state:
     olive_diag=oos_state.get("live_diag",pd.DataFrame())
 
     st.markdown("## 📡 今日60m短線雷達")
-    st.caption("V1.10.0起，這裡直接掃描最新60m行情，不再從歷史回測交易表反推今天。規則固定：KD黃金交叉＋K<30；只把已完成60m K棒納入判斷。")
+    st.caption("直接掃描最新60m行情。V1.10.1以『行情最後交易日』判斷新訊號，週末執行時週五訊號仍會標成🟢；只使用已完成60m K棒。")
     if not olive_diag.empty:
         _ok=int((olive_diag["狀態"]=="掃描完成").sum())
         _last=pd.to_datetime(olive_diag["行情最後K棒"],errors="coerce").max()
@@ -2221,7 +2229,7 @@ if research_mode == "60m五日OOS驗證" and oos_state:
     if not otr.empty:
         st.download_button("⬇️ 下載【OOS逐筆交易明細】",otr.to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"{APP_VERSION}_OOS逐筆交易明細.csv",mime="text/csv",use_container_width=True)
-    st.info("下一輪請提供：①【今日60m短線雷達】②【今日60m掃描診斷】。本版已把今日雷達與歷史回測拆開；下一步檢查最新K棒時間、訊號完整性與Yahoo資料延遲，再決定Shioaji接入層。")
+    st.info("下一輪請提供：①【今日60m短線雷達】②【今日60m掃描診斷】。本版修正週末新訊號判定；若最新K棒與狀態一致，下一版開始建立Shioaji即時行情接入層與Yahoo備援模式。")
 
 mtf_state = st.session_state.get("st_v130_mtf")
 if research_mode == "多週期當沖/隔日驗證" and mtf_state:
@@ -2545,6 +2553,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.10.0 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.10.1 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
