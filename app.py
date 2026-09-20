@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.4.0
+黑嚕嚕－短線交易雷達 ST V1.4.1
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -36,13 +36,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.4.0"
+APP_VERSION = "ST V1.4.1"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.4.0"
-EXPORT_PREFIX = "ST_V1.4.0"
+APP_VERSION = "ST_V1.4.1"
+EXPORT_PREFIX = "ST_V1.4.1"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1265,27 +1265,7 @@ with st.sidebar:
     if research_mode == "跨股票批次":
         st.caption("V1.2.7 驗證門檻：優先觀察 60m｜KD黃金交叉+K<30｜4~7日；若TOP50仍維持正期望股票比例≥70%、期望中位數>0、PF中位數>1.2，再進入下一階段。")
 
-    if research_mode == "60m五日OOS驗證":
-        with st.spinner("建立固定股票池並進行60m五日時間OOS…"):
-            ranked_pool = rank_short_term_pool(SHORT_TERM_UNIVERSE, top_n=top_n)
-        symbols = ranked_pool["股票"].tolist() if not ranked_pool.empty else []
-        if not symbols:
-            st.error("股票池建立失敗：沒有可用股票。")
-            st.stop()
-        try:
-            oos_detail, oos_summary, oos_trades = run_oos_60m_5d(
-                symbols, cost, period, allow_overlap=False, train_ratio=0.60
-            )
-        except Exception as e:
-            st.error(f"OOS驗證中斷：{type(e).__name__}: {e}")
-            st.stop()
-        st.session_state["st_v140_oos"] = {
-            "detail":oos_detail, "summary":oos_summary, "trades":oos_trades,
-            "pool":ranked_pool, "symbols":symbols
-        }
-        summary, data_map, trade_map = pd.DataFrame(), {}, {}
-        symbol = symbols[0]
-    elif research_mode == "多週期當沖/隔日驗證":
+    if research_mode == "多週期當沖/隔日驗證":
         st.markdown("#### V1.3.0 多週期進場")
         st.caption("固定60m K<30＋15m KD黃金交叉；V1.3.3加入「15m確認後首根5m」對照組，檢查等待5m KD是否反而延遲進場。")
         mtf_entry_rules = st.multiselect(
@@ -1322,7 +1302,30 @@ if run:
         st.error("請至少選擇一個K棒週期、進場規則與持有方式。")
         st.stop()
 
-    if research_mode == "多週期當沖/隔日驗證":
+    if research_mode == "60m五日OOS驗證":
+        # V1.4.1：OOS 執行移到按下「開始策略健診」之後；
+        # 此時交易成本 cost 已完成建立，避免 V1.4.0 的 NameError。
+        with st.spinner("建立固定股票池並進行60m五日時間OOS…"):
+            ranked_pool = rank_short_term_pool(SHORT_TERM_UNIVERSE, top_n=top_n)
+        symbols = ranked_pool["股票"].tolist() if not ranked_pool.empty else []
+        if not symbols:
+            st.error("股票池建立失敗：沒有可用股票。")
+            st.stop()
+        try:
+            with st.spinner(f"60m五日OOS驗證：{len(symbols)}檔…"):
+                oos_detail, oos_summary, oos_trades = run_oos_60m_5d(
+                    symbols, cost, period, allow_overlap=False, train_ratio=0.60
+                )
+        except Exception as e:
+            st.error(f"OOS驗證中斷：{type(e).__name__}: {e}")
+            st.stop()
+        st.session_state["st_v141_oos"] = {
+            "detail": oos_detail, "summary": oos_summary, "trades": oos_trades,
+            "pool": ranked_pool, "symbols": symbols
+        }
+        summary, data_map, trade_map = pd.DataFrame(), {}, {}
+        symbol = symbols[0]
+    elif research_mode == "多週期當沖/隔日驗證":
         # 多週期版沿用動態短線池；預設50檔即可，避免再擴大樣本造成不必要負載。
         with st.spinner("建立多週期驗證股票池…"):
             ranked_pool = rank_short_term_pool(SHORT_TERM_UNIVERSE, top_n=top_n)
@@ -1399,7 +1402,7 @@ if run:
         "trade_map": trade_map,
     }
 
-oos_state = st.session_state.get("st_v140_oos")
+oos_state = st.session_state.get("st_v141_oos")
 if research_mode == "60m五日OOS驗證" and oos_state:
     st.markdown("## 🧪 60m＋K<30＋5日｜時間OOS驗證")
     st.caption("規則完全固定；每檔交易依時間前60%/後40%切割。股票池仍由近期流動性建立，所以本版屬固定股票池時間OOS，不把它誤稱為完整walk-forward。")
@@ -1740,6 +1743,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.4.0 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.4.1 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
