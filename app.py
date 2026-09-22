@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.6
+黑嚕嚕－短線交易雷達 ST V1.16.7
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.6"
+APP_VERSION = "ST V1.16.7"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.6"
-EXPORT_PREFIX = "ST_V1.16.6"
+APP_VERSION = "ST_V1.16.7"
+EXPORT_PREFIX = "ST_V1.16.7"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1544,12 +1544,13 @@ def validate_top50_warmup_correction(cost: CostConfig):
     return summary,blocks,warm_top,errors,compare
 
 
-def validate_top50_signal_quality(cost: CostConfig, period: str="3mo"):
+def validate_top50_signal_quality(cost: CostConfig, period: str="6mo"):
     """
-    V1.15.1：
-    固定真正Walk-Forward TOP50 + 固定60m KD黃金交叉/K<30/5日，
-    只診斷既有訊號內部品質，不新增指標、不改買進規則。
-    診斷項目：K深度、量比20、MA30/MA60斜率、60m訊號時段。
+    V1.16.7：
+    固定真正Walk-Forward TOP50 + 60m KD黃金交叉/K<30/5日，
+    使用6mo資料暖機、只評估最後3mo。
+    訊號時間統一為台北時間。
+    只診斷既有訊號品質：K深度、量比20、MA30/MA60方向、60m時段。
     """
     elig, _, errors = build_fullmarket_walkforward_eligibility(lookback_months=6, top_n=100)
     if elig is None or elig.empty:
@@ -1559,40 +1560,39 @@ def validate_top50_signal_quality(cost: CostConfig, period: str="3mo"):
     if not union:
         return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
 
-    _,_,trades=run_oos_60m_5d(union,cost,period,allow_overlap=False,train_ratio=0.60)
+    _,_,trades=run_oos_60m_5d(
+        union,cost,period,allow_overlap=False,train_ratio=0.60,evaluation_months=3
+    )
     if trades is None or trades.empty:
         return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
 
-    t=trades.copy()
-    sig=pd.to_datetime(t["訊號時間"],utc=True,errors="coerce").dt.tz_convert("Asia/Taipei")
-    t["訊號日期"]=sig.dt.date
-    t["訊號小時"]=sig.dt.hour
+    t=_filter_historical_top50(trades,elig)
+    if t is None or t.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
 
-    # 歷史TOP50資格
-    keep=[]; ranks=[]; pool_dates=[]
-    for _,r in t.iterrows():
-        q=elig[(elig["股票"]==r["股票"])&(elig["基準完成日"]<r["訊號日期"])]
-        if q.empty:
-            keep.append(False); ranks.append(np.nan); pool_dates.append(None)
-        else:
-            z=q.sort_values("基準完成日").iloc[-1]
-            rank=float(z["流動性排名"])
-            keep.append(rank<=50); ranks.append(rank); pool_dates.append(z["基準完成日"])
-    t["WF流動性排名"]=ranks
-    t["WF股票池基準日"]=pool_dates
-    t=t[pd.Series(keep,index=t.index)].copy()
+    _tw=_as_taipei_series(t["訊號時間"])
+    t["訊號時間_台北"]=_tw.astype(str)
+    t["訊號小時_台北"]=_tw.dt.hour
 
-    # 預先固定分桶，避免看完績效後再微調邊界。
-    t["K深度"]=pd.cut(pd.to_numeric(t["訊號K"],errors="coerce"),
-                       bins=[-np.inf,10,20,30],labels=["K<10","K10-20","K20-30"]).astype(str)
+    t["K深度"]=pd.cut(
+        pd.to_numeric(t["訊號K"],errors="coerce"),
+        bins=[-np.inf,10,20,30],
+        labels=["K<10","K10-20","K20-30"]
+    ).astype(str)
+
     vr=pd.to_numeric(t.get("量比20"),errors="coerce")
-    t["量比區間"]=pd.cut(vr,bins=[-np.inf,0.8,1.0,1.5,np.inf],
-                         labels=["<0.8","0.8-1.0","1.0-1.5",">=1.5"]).astype(str)
+    t["量比區間"]=pd.cut(
+        vr,bins=[-np.inf,0.8,1.0,1.5,np.inf],
+        labels=["<0.8","0.8-1.0","1.0-1.5",">=1.5"]
+    ).astype(str)
+
     ma30=pd.to_numeric(t.get("MA30斜率3"),errors="coerce")
     ma60=pd.to_numeric(t.get("MA60斜率3"),errors="coerce")
     t["MA30方向"]=np.where(ma30>0,"向上","未向上")
     t["MA60方向"]=np.where(ma60>0,"向上","未向上")
-    t["60m時段"]=t["訊號小時"].map(lambda h:f"{int(h):02d}:00" if pd.notna(h) else "資料不足")
+    t["60m時段"]=t["訊號小時_台北"].map(
+        lambda h:f"{int(h):02d}:00" if pd.notna(h) else "資料不足"
+    )
 
     specs=[
         ("K深度",["K<10","K10-20","K20-30"]),
@@ -1616,9 +1616,8 @@ def validate_top50_signal_quality(cost: CostConfig, period: str="3mo"):
                 })
     summary=pd.DataFrame(rows)
 
-    # 四段時間只追三個最核心既有結構：K深度、量比、MA60方向。
     blocks=[]
-    ts=pd.to_datetime(t["訊號時間"],errors="coerce")
+    ts=_as_taipei_series(t["訊號時間"])
     ok=ts.notna()
     z=t.loc[ok].copy(); ts=ts.loc[ok]
     if len(z):
@@ -3227,11 +3226,11 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
+                ["TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
             if research_mode == "TOP50暖機修正驗證":
                 st.caption("比較舊3mo直接計算 vs 6mo指標暖機後只評估最後3mo；同時修正訊號時間誤當UTC的問題。")
             elif research_mode == "TOP50訊號品質健診":
-                st.caption("固定真正Walk-Forward TOP50與核心策略，只診斷K深度、量比20、MA30/60方向與60m訊號時段。")
+                st.caption("固定真正Walk-Forward TOP50與核心策略；使用6mo暖機、只評估最後3mo，診斷K深度、量比20、MA30/60方向與台北時間60m時段。")
             elif research_mode == "市場環境健診_TOP50":
                 st.caption("固定真正Walk-Forward TOP50與核心策略，只診斷訊號前一完成日的TAIEX MA15與5日市場狀態。")
             elif research_mode == "核心池規模WalkForward":
@@ -3341,7 +3340,7 @@ if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and 
     st.success("四份檔案可連續下載，不需重跑。")
 
 if simple_mode=="進階研究" and research_mode=="TOP50訊號品質健診" and not run:
-    st.info("V1.15.0 顯示MA15/市場狀態無法穩定解釋第1段失效，且部分關係在樣本內外反轉。這一版不加市場Gate，改固定TOP50檢查訊號本身品質。")
+    st.info("V1.16.6 已確認暖機後量比20與MA60斜率缺值率都降到0%，且第1段仍明顯虧損，所以第1段失效不是暖機缺值造成。這版改用暖機後資料重新檢查訊號品質。")
 
 if run and simple_mode=="進階研究" and research_mode=="TOP50訊號品質健診":
     st.subheader("🔬 TOP50訊號品質健診")
@@ -4213,6 +4212,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.6 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.7 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
