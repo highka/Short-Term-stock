@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.4
+黑嚕嚕－短線交易雷達 ST V1.16.5
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -19,8 +19,20 @@
 
 import math
 import warnings
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
+
+# V1.16.5：Streamlit Cloud 資源保護。
+# 必須在 numpy/pandas 載入前限制底層 BLAS/OpenMP 執行緒，
+# 避免 yfinance + pandas/numpy + Streamlit 疊加後耗盡可建立的 thread。
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("BLIS_NUM_THREADS", "1")
+os.environ.setdefault("MALLOC_ARENA_MAX", "2")
 
 import numpy as np
 import pandas as pd
@@ -39,13 +51,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.4"
+APP_VERSION = "ST V1.16.5"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.4"
-EXPORT_PREFIX = "ST_V1.16.4"
+APP_VERSION = "ST_V1.16.5"
+EXPORT_PREFIX = "ST_V1.16.5"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -113,7 +125,6 @@ def fetch_official_tw_stock_universe():
     return df,errors
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
 def download_daily_batches(symbols: List[str], period: str="2mo", batch_size: int=25):
     """
     V1.16.3 全市場日K下載：
@@ -1075,7 +1086,7 @@ def build_pool_20_diagnostics(universe: List[str], top_n: int = 100) -> Tuple[pd
     tickers=list(dict.fromkeys(universe))
     raw=yf.download(tickers=tickers, period="2mo", interval="1d",
                     group_by="ticker", auto_adjust=False, progress=False,
-                    threads=True)
+                    threads=False)
     rows=[]
     for s in tickers:
         try:
@@ -1727,7 +1738,7 @@ def research_theme(symbol: str) -> str:
             return theme
     return "其他/對照"
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=1800, max_entries=4, show_spinner=False)
 def rank_short_term_pool(symbols: List[str], top_n: int = 30, lookback: str = "1mo") -> pd.DataFrame:
     """一次批次下載母池日線，避免逐檔請求造成 Streamlit Cloud 中斷。"""
     if not symbols:
@@ -1739,7 +1750,7 @@ def rank_short_term_pool(symbols: List[str], top_n: int = 30, lookback: str = "1
             interval="1d",
             auto_adjust=False,
             progress=False,
-            threads=True,
+            threads=False,
             group_by="ticker",
         )
     except Exception:
@@ -1787,7 +1798,7 @@ def rank_short_term_pool(symbols: List[str], top_n: int = 30, lookback: str = "1
     return r.sort_values("短線可交易分", ascending=False).head(int(top_n)).reset_index(drop=True)
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=900, max_entries=4, show_spinner=False)
 def download_intraday_batch(symbols: List[str], interval: str, period: str) -> Dict[str, pd.DataFrame]:
     """
     V1.16.1：
@@ -1807,7 +1818,7 @@ def download_intraday_batch(symbols: List[str], interval: str, period: str) -> D
                 interval=interval,
                 auto_adjust=False,
                 progress=False,
-                threads=True,
+                threads=False,
                 prepost=False,
                 group_by="ticker",
             )
@@ -1815,7 +1826,7 @@ def download_intraday_batch(symbols: List[str], interval: str, period: str) -> D
             return pd.DataFrame()
 
     # 60m + 長期間時用較小批次，減少Yahoo整批失敗。
-    batch_size=30 if interval=="60m" and period in ["6mo","1y","2y","5y","10y","max"] else 60
+    batch_size=15 if interval=="60m" and period in ["6mo","1y","2y","5y","10y","max"] else 30
 
     for i in range(0,len(symbols),batch_size):
         batch=symbols[i:i+batch_size]
@@ -2251,18 +2262,18 @@ if simple_mode == "今日雷達":
     st.markdown("""<style>div[data-baseweb="tab-list"]{display:none!important;}</style>""", unsafe_allow_html=True)
 
 if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and not run:
-    st.warning("V1.16.3 的 NameError 已確認：我在重寫全市場日K下載函式時，誤把前面的官方股票清單函式 fetch_official_tw_stock_universe 一起覆蓋掉了。V1.16.4 已完整補回該函式，並保留25檔小批、重試、缺漏補抓與資料完整度診斷。")
+    st.warning("V1.16.4 出現 RuntimeError: can't start new thread / MemoryError，表示 Streamlit Cloud 執行緒與記憶體資源被耗盡。V1.16.5 已全面關閉 yfinance 多執行緒、限制 BLAS/OpenMP 為單執行緒、縮小60m長期間批次，並取消全市場原始日K的大型 Streamlit cache，避免重複佔用記憶體。")
 
 if run and simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證":
     st.subheader("🧰 TOP50暖機修正驗證")
     with st.spinner("同時跑舊3mo版本與6mo暖機版本，比較最後3個月結果…"):
         _wu_sum,_wu_blocks,_wu_trades,_wu_errs,_wu_check=validate_top50_warmup_correction(cost)
-    st.session_state["st_v1164_warmup"]={
+    st.session_state["st_v1165_warmup"]={
         "summary":_wu_sum,"blocks":_wu_blocks,"trades":_wu_trades,
         "check":_wu_check,"errors":_wu_errs
     }
 
-_wu=st.session_state.get("st_v1164_warmup")
+_wu=st.session_state.get("st_v1165_warmup")
 if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and _wu:
     _us=_wu.get("summary",pd.DataFrame()); _ub=_wu.get("blocks",pd.DataFrame())
     _ut=_wu.get("trades",pd.DataFrame()); _uc=_wu.get("check",pd.DataFrame()); _ue=_wu.get("errors",[])
@@ -3164,6 +3175,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.4 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.5 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
