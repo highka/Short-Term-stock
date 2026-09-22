@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.0
+黑嚕嚕－短線交易雷達 ST V1.16.1
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -38,13 +38,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.0"
+APP_VERSION = "ST V1.16.1"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.0"
-EXPORT_PREFIX = "ST_V1.16.0"
+APP_VERSION = "ST_V1.16.1"
+EXPORT_PREFIX = "ST_V1.16.1"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1417,21 +1417,41 @@ def validate_top50_warmup_correction(cost: CostConfig):
     old_top=_filter_historical_top50(old_trades,elig)
     warm_top=_filter_historical_top50(warm_trades,elig)
 
+    _old_raw_count=0 if old_trades is None else len(old_trades)
+    _warm_raw_count=0 if warm_trades is None else len(warm_trades)
+
     s1,b1=_warmup_summary(old_top,"舊3mo直接計算")
     s2,b2=_warmup_summary(warm_top,"6mo暖機_評估末3mo")
     summary=pd.concat([s1,s2],ignore_index=True)
     blocks=pd.concat([b1,b2],ignore_index=True)
 
+    def _missing_rate(df,col):
+        if df is None or df.empty or col not in df.columns:
+            return np.nan
+        return float(df[col].isna().mean()*100)
+
     compare=pd.DataFrame([
-        {"檢查":"舊版逐筆數","數值":len(old_top)},
-        {"檢查":"暖機版逐筆數","數值":len(warm_top)},
-        {"檢查":"舊版量比20缺值率%","數值":float(old_top["量比20"].isna().mean()*100) if len(old_top) else np.nan},
-        {"檢查":"暖機版量比20缺值率%","數值":float(warm_top["量比20"].isna().mean()*100) if len(warm_top) else np.nan},
-        {"檢查":"舊版MA60斜率缺值率%","數值":float(old_top["MA60斜率3"].isna().mean()*100) if len(old_top) else np.nan},
-        {"檢查":"暖機版MA60斜率缺值率%","數值":float(warm_top["MA60斜率3"].isna().mean()*100) if len(warm_top) else np.nan},
+        {"檢查":"舊3mo原始策略交易數","數值":_old_raw_count},
+        {"檢查":"6mo暖機原始策略交易數","數值":_warm_raw_count},
+        {"檢查":"舊版TOP50逐筆數","數值":len(old_top)},
+        {"檢查":"暖機版TOP50逐筆數","數值":len(warm_top)},
+        {"檢查":"舊版量比20缺值率%","數值":_missing_rate(old_top,"量比20")},
+        {"檢查":"暖機版量比20缺值率%","數值":_missing_rate(warm_top,"量比20")},
+        {"檢查":"舊版MA60斜率缺值率%","數值":_missing_rate(old_top,"MA60斜率3")},
+        {"檢查":"暖機版MA60斜率缺值率%","數值":_missing_rate(warm_top,"MA60斜率3")},
     ])
-    warm_top["訊號時間_台北"]=_as_taipei_series(warm_top["訊號時間"]).astype(str)
-    warm_top["訊號小時_台北"]=_as_taipei_series(warm_top["訊號時間"]).dt.hour
+
+    if warm_top is None:
+        warm_top=pd.DataFrame()
+
+    if not warm_top.empty and "訊號時間" in warm_top.columns:
+        _tw=_as_taipei_series(warm_top["訊號時間"])
+        warm_top["訊號時間_台北"]=_tw.astype(str)
+        warm_top["訊號小時_台北"]=_tw.dt.hour
+    else:
+        # V1.16.1：不再因空資料KeyError中斷，並把真正問題回報在畫面。
+        errors=list(errors)+["6mo暖機版沒有產生有效TOP50交易；請查看資料完整度，不再以KeyError中斷。"]
+
     return summary,blocks,warm_top,errors,compare
 
 
@@ -2729,51 +2749,87 @@ def rank_short_term_pool(symbols: List[str], top_n: int = 30, lookback: str = "1
 
 @st.cache_data(ttl=900, show_spinner=False)
 def download_intraday_batch(symbols: List[str], interval: str, period: str) -> Dict[str, pd.DataFrame]:
-    """每個週期一次抓整批股票，再切回單檔；大幅減少 Yahoo 請求數。"""
-    out = {s: pd.DataFrame() for s in symbols}
+    """
+    V1.16.1：
+    Yahoo 60m 在「較長期間 + 較多股票」一次下載時，可能整批失敗。
+    改為分批下載，單批失敗時再縮小重試，避免整個暖機版變成空資料。
+    """
+    symbols=list(dict.fromkeys(symbols))
+    out={s:pd.DataFrame() for s in symbols}
     if not symbols:
         return out
-    try:
-        raw = yf.download(
-            tickers=" ".join(symbols),
-            period=period,
-            interval=interval,
-            auto_adjust=False,
-            progress=False,
-            threads=True,
-            prepost=False,
-            group_by="ticker",
-        )
-    except Exception:
-        return out
 
-    for symbol in symbols:
+    def _fetch(batch):
         try:
-            if isinstance(raw.columns, pd.MultiIndex):
-                if symbol not in raw.columns.get_level_values(0):
-                    continue
-                d = raw[symbol].copy()
-            else:
-                d = raw.copy()
-            need = ["Open","High","Low","Close","Volume"]
-            if not all(c in d.columns for c in need):
-                continue
-            d = d[need].copy()
-            for c in need:
-                d[c] = pd.to_numeric(d[c], errors="coerce")
-            d = d.dropna(subset=["Open","High","Low","Close"])
-            if d.empty:
-                continue
-            idx = pd.to_datetime(d.index)
-            if getattr(idx, "tz", None) is not None:
-                try:
-                    idx = idx.tz_convert("Asia/Taipei").tz_localize(None)
-                except Exception:
-                    idx = idx.tz_localize(None)
-            d.index = idx
-            out[symbol] = d.sort_index()
+            return yf.download(
+                tickers=" ".join(batch),
+                period=period,
+                interval=interval,
+                auto_adjust=False,
+                progress=False,
+                threads=True,
+                prepost=False,
+                group_by="ticker",
+            )
         except Exception:
-            continue
+            return pd.DataFrame()
+
+    # 60m + 長期間時用較小批次，減少Yahoo整批失敗。
+    batch_size=30 if interval=="60m" and period in ["6mo","1y","2y","5y","10y","max"] else 60
+
+    for i in range(0,len(symbols),batch_size):
+        batch=symbols[i:i+batch_size]
+        raw=_fetch(batch)
+
+        # 若整批失敗，再拆成10檔重試。
+        sub_batches=[batch]
+        if raw is None or raw.empty:
+            sub_batches=[batch[j:j+10] for j in range(0,len(batch),10)]
+        else:
+            sub_batches=None
+
+        raws=[]
+        if sub_batches is None:
+            raws=[(batch,raw)]
+        else:
+            for sb in sub_batches:
+                rr=_fetch(sb)
+                raws.append((sb,rr))
+
+        for sb,rr in raws:
+            if rr is None or rr.empty:
+                continue
+            for symbol in sb:
+                try:
+                    if isinstance(rr.columns,pd.MultiIndex):
+                        if symbol not in rr.columns.get_level_values(0):
+                            continue
+                        d=rr[symbol].copy()
+                    else:
+                        if len(sb)!=1:
+                            continue
+                        d=rr.copy()
+
+                    need=["Open","High","Low","Close","Volume"]
+                    if not all(c in d.columns for c in need):
+                        continue
+                    d=d[need].copy()
+                    for c in need:
+                        d[c]=pd.to_numeric(d[c],errors="coerce")
+                    d=d.dropna(subset=["Open","High","Low","Close"])
+                    if d.empty:
+                        continue
+
+                    idx=pd.to_datetime(d.index)
+                    if getattr(idx,"tz",None) is not None:
+                        try:
+                            idx=idx.tz_convert("Asia/Taipei").tz_localize(None)
+                        except Exception:
+                            idx=idx.tz_localize(None)
+                    d.index=idx
+                    out[symbol]=d.sort_index()
+                except Exception:
+                    continue
     return out
 
 
@@ -3155,7 +3211,7 @@ if simple_mode == "今日雷達":
     st.markdown("""<style>div[data-baseweb="tab-list"]{display:none!important;}</style>""", unsafe_allow_html=True)
 
 if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and not run:
-    st.warning("V1.15.1 發現兩個資料問題：① 60m訊號時間被誤當UTC，所以09~13時段全部顯示成17~21；② 3mo資料直接起算造成早期量比/MA60暖機不足。這版先修資料品質，不新增策略條件。")
+    st.warning("V1.16.0 執行時發現6mo暖機資料可能因Yahoo大量60m長期間下載整批失敗，warm_top變空表後又觸發KeyError。V1.16.1已改成分批下載＋失敗縮小重試＋空資料防呆；同時保留時區與暖機修正。")
 
 if run and simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證":
     st.subheader("🧰 TOP50暖機修正驗證")
@@ -4068,6 +4124,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.0 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.1 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
