@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.1
+黑嚕嚕－短線交易雷達 ST V1.16.2
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -38,13 +38,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.1"
+APP_VERSION = "ST V1.16.2"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.1"
-EXPORT_PREFIX = "ST_V1.16.1"
+APP_VERSION = "ST_V1.16.2"
+EXPORT_PREFIX = "ST_V1.16.2"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1403,10 +1403,14 @@ def validate_top50_warmup_correction(cost: CostConfig):
     """
     elig, _, errors=build_fullmarket_walkforward_eligibility(lookback_months=6,top_n=100)
     if elig is None or elig.empty:
-        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors,pd.DataFrame([
+            {"檢查":"錯誤","數值":"歷史Walk-Forward資格資料為空"}
+        ])
     union=sorted(elig.loc[elig["流動性排名"]<=50,"股票"].dropna().astype(str).unique().tolist())
     if not union:
-        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors,pd.DataFrame([
+            {"檢查":"錯誤","數值":"歷史TOP50股票聯集為空"}
+        ])
 
     _,_,old_trades=run_oos_60m_5d(
         union,cost,"3mo",allow_overlap=False,train_ratio=0.60,evaluation_months=None
@@ -1443,6 +1447,10 @@ def validate_top50_warmup_correction(cost: CostConfig):
 
     if warm_top is None:
         warm_top=pd.DataFrame()
+    if errors is None:
+        errors=[]
+    elif not isinstance(errors,list):
+        errors=list(errors) if isinstance(errors,(tuple,set)) else [str(errors)]
 
     if not warm_top.empty and "訊號時間" in warm_top.columns:
         _tw=_as_taipei_series(warm_top["訊號時間"])
@@ -3211,18 +3219,18 @@ if simple_mode == "今日雷達":
     st.markdown("""<style>div[data-baseweb="tab-list"]{display:none!important;}</style>""", unsafe_allow_html=True)
 
 if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and not run:
-    st.warning("V1.16.0 執行時發現6mo暖機資料可能因Yahoo大量60m長期間下載整批失敗，warm_top變空表後又觸發KeyError。V1.16.1已改成分批下載＋失敗縮小重試＋空資料防呆；同時保留時區與暖機修正。")
+    st.warning("V1.16.1 的新錯誤已確認：validate_top50_warmup_correction 在「資格資料為空 / TOP50聯集為空」的早期分支只回傳4個值，但畫面固定接5個值，因而觸發 ValueError。V1.16.2 已統一所有分支固定回傳5個物件，並保留6mo分批下載與空資料診斷。")
 
 if run and simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證":
     st.subheader("🧰 TOP50暖機修正驗證")
     with st.spinner("同時跑舊3mo版本與6mo暖機版本，比較最後3個月結果…"):
         _wu_sum,_wu_blocks,_wu_trades,_wu_errs,_wu_check=validate_top50_warmup_correction(cost)
-    st.session_state["st_v1160_warmup"]={
+    st.session_state["st_v1162_warmup"]={
         "summary":_wu_sum,"blocks":_wu_blocks,"trades":_wu_trades,
         "check":_wu_check,"errors":_wu_errs
     }
 
-_wu=st.session_state.get("st_v1160_warmup")
+_wu=st.session_state.get("st_v1162_warmup")
 if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and _wu:
     _us=_wu.get("summary",pd.DataFrame()); _ub=_wu.get("blocks",pd.DataFrame())
     _ut=_wu.get("trades",pd.DataFrame()); _uc=_wu.get("check",pd.DataFrame()); _ue=_wu.get("errors",[])
@@ -4124,6 +4132,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.1 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.2 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
