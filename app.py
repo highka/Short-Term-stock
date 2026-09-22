@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.8
+黑嚕嚕－短線交易雷達 ST V1.16.9
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.8"
+APP_VERSION = "ST V1.16.9"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.8"
-EXPORT_PREFIX = "ST_V1.16.8"
+APP_VERSION = "ST_V1.16.9"
+EXPORT_PREFIX = "ST_V1.16.9"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1544,6 +1544,94 @@ def validate_top50_warmup_correction(cost: CostConfig):
     return summary,blocks,warm_top,errors,compare
 
 
+
+def validate_top50_candidate_gates(cost: CostConfig):
+    """
+    V1.16.9 候選Gate A/B：
+    固定真正Walk-Forward TOP50 + 6mo暖機/末3mo評估 +
+    60m KD黃金交叉/K<30/5日。
+    只比較事先鎖定的三個候選：
+      A 基準：不加Gate
+      B 量比20>=1.5
+      C MA60斜率3<=0（MA60未向上）
+      D B+C 組合
+    不加入時段或其他事後最佳化條件。
+    """
+    elig, _, errors = build_fullmarket_walkforward_eligibility(lookback_months=6, top_n=100)
+    if elig is None or elig.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    union=sorted(elig.loc[elig["流動性排名"]<=50,"股票"].dropna().astype(str).unique().tolist())
+    if not union:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    _,_,trades=run_oos_60m_5d(
+        union,cost,"6mo",allow_overlap=False,train_ratio=0.60,evaluation_months=3
+    )
+    if trades is None or trades.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    t=_filter_historical_top50(trades,elig)
+    if t is None or t.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    vr=pd.to_numeric(t.get("量比20"),errors="coerce")
+    ma60=pd.to_numeric(t.get("MA60斜率3"),errors="coerce")
+    t["Gate_量比>=1.5"]=vr>=1.5
+    t["Gate_MA60未向上"]=ma60<=0
+    t["Gate_組合"]=(t["Gate_量比>=1.5"] & t["Gate_MA60未向上"])
+    t["訊號時間_台北"]=_as_taipei_series(t["訊號時間"]).astype(str)
+    t["指標資料期間"]="6mo"
+    t["評估期間"]="最後3mo"
+
+    gates=[
+        ("A_基準",pd.Series(True,index=t.index)),
+        ("B_量比>=1.5",t["Gate_量比>=1.5"]),
+        ("C_MA60未向上",t["Gate_MA60未向上"]),
+        ("D_量比>=1.5且MA60未向上",t["Gate_組合"]),
+    ]
+
+    rows=[]
+    for sample in ["全部","樣本內60%","樣本外40%"]:
+        xs=t if sample=="全部" else t[t["樣本"]==sample]
+        for name,mask in gates:
+            g=xs[mask.reindex(xs.index,fill_value=False)]
+            m=aggregate_trade_metrics(g)
+            rows.append({
+                "樣本":sample,"Gate":name,
+                "股票數":int(g["股票"].nunique()) if len(g) else 0,
+                "交易數":len(g),**m
+            })
+    summary=pd.DataFrame(rows)
+
+    blocks=[]
+    ts=_as_taipei_series(t["訊號時間"])
+    ok=ts.notna()
+    z=t.loc[ok].copy(); ts=ts.loc[ok]
+    if len(z):
+        edges=pd.date_range(ts.min(),ts.max(),periods=5)
+        labels=["第1段","第2段","第3段","第4段"]
+        z["時間段"]=pd.cut(ts,bins=edges,labels=labels,include_lowest=True,right=True)
+        for block in labels:
+            q=z[z["時間段"]==block]
+            local_gates=[
+                ("A_基準",pd.Series(True,index=q.index)),
+                ("B_量比>=1.5",q["Gate_量比>=1.5"]),
+                ("C_MA60未向上",q["Gate_MA60未向上"]),
+                ("D_量比>=1.5且MA60未向上",q["Gate_組合"]),
+            ]
+            for name,mask in local_gates:
+                g=q[mask.reindex(q.index,fill_value=False)]
+                m=aggregate_trade_metrics(g)
+                blocks.append({
+                    "時間段":block,
+                    "起始":str(edges[labels.index(block)]),
+                    "結束":str(edges[labels.index(block)+1]),
+                    "Gate":name,
+                    "股票數":int(g["股票"].nunique()) if len(g) else 0,
+                    "交易數":len(g),**m
+                })
+    return summary,pd.DataFrame(blocks),t,errors
 def validate_top50_signal_quality(cost: CostConfig, period: str="6mo"):
     """
     V1.16.7：
@@ -3248,7 +3336,7 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
+                ["TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
             if research_mode == "TOP50暖機修正驗證":
                 st.caption("比較舊3mo直接計算 vs 6mo指標暖機後只評估最後3mo；同時修正訊號時間誤當UTC的問題。")
             elif research_mode == "TOP50訊號品質健診":
@@ -3303,6 +3391,7 @@ with st.sidebar:
         _btn_label="🔄 更新今日雷達"
     else:
         _btn_label={
+            "TOP50候選Gate驗證":"🧪 執行TOP50候選Gate A/B",
             "TOP50暖機修正驗證":"🧰 執行TOP50暖機修正驗證",
             "TOP50訊號品質健診":"🔬 執行TOP50訊號品質健診",
             "市場環境健診_TOP50":"🌤️ 執行TOP50市場環境健診",
@@ -3360,6 +3449,41 @@ if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and 
     st.download_button("⬇️ 下載【TOP50暖機資料完整度】",_uc.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"{APP_VERSION}_TOP50暖機資料完整度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
     st.success("四份檔案可連續下載，不需重跑。")
+
+if simple_mode=="進階研究" and research_mode=="TOP50候選Gate驗證" and not run:
+    st.info("V1.16.8 已確認暖機完整度三項缺值率皆為0%。本版不再加新指標，只把先前鎖定的量比>=1.5與MA60未向上做正式A/B；11:00時段等事後現象不納入。")
+
+if run and simple_mode=="進階研究" and research_mode=="TOP50候選Gate驗證":
+    st.subheader("🧪 TOP50候選Gate A/B")
+    with st.spinner("重建6mo暖機、末3mo評估的TOP50 Walk-Forward交易，驗證候選Gate…"):
+        _ga_sum,_ga_blocks,_ga_trades,_ga_errs=validate_top50_candidate_gates(cost)
+    st.session_state["st_v1169_gate"]={
+        "summary":_ga_sum,"blocks":_ga_blocks,"trades":_ga_trades,"errors":_ga_errs
+    }
+
+_ga=st.session_state.get("st_v1169_gate")
+if simple_mode=="進階研究" and research_mode=="TOP50候選Gate驗證" and _ga:
+    _gs=_ga.get("summary",pd.DataFrame()); _gb=_ga.get("blocks",pd.DataFrame())
+    _gt=_ga.get("trades",pd.DataFrame()); _ge=_ga.get("errors",[])
+    st.subheader("🧪 TOP50候選Gate驗證結果")
+    if _ge:
+        st.warning("資料來源異常："+"；".join(_ge))
+    st.info("候選Gate若只改善整體平均、但樣本外或四段不穩定，就不會納入正式雷達。")
+    if not _gs.empty:
+        st.markdown("#### 全部 / 樣本內 / 樣本外")
+        st.dataframe(_gs.round(3),use_container_width=True,hide_index=True)
+    if not _gb.empty:
+        st.markdown("#### 四段時間穩定度")
+        st.dataframe(_gb.round(3),use_container_width=True,hide_index=True)
+    with st.expander("查看Gate逐筆交易"):
+        st.dataframe(_gt.round(3),use_container_width=True,hide_index=True)
+    st.download_button("⬇️ 下載【TOP50候選Gate驗證摘要】",_gs.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_TOP50候選Gate驗證摘要.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【TOP50候選Gate四段穩定度】",_gb.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_TOP50候選Gate四段穩定度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【TOP50候選Gate逐筆交易】",_gt.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_TOP50候選Gate逐筆交易.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.success("三份檔案可連續下載，不需重跑。")
 
 if simple_mode=="進階研究" and research_mode=="TOP50訊號品質健診" and not run:
     st.info("V1.16.7 的結果不能採用：函式雖然預設6mo暖機，但UI仍明確傳入3mo，把暖機設定覆蓋掉，因此量比20與MA60又出現缺值。V1.16.8 已移除3mo覆蓋，固定6mo暖機＋只評估最後3mo，並在輸出中直接標示資料窗與缺值率。")
@@ -4234,6 +4358,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.8 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.9 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
