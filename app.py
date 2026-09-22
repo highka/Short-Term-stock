@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.3
+黑嚕嚕－短線交易雷達 ST V1.16.4
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -39,13 +39,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.3"
+APP_VERSION = "ST V1.16.4"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.3"
-EXPORT_PREFIX = "ST_V1.16.3"
+APP_VERSION = "ST_V1.16.4"
+EXPORT_PREFIX = "ST_V1.16.4"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -70,6 +70,47 @@ def normalize_symbol(code: str, market: str) -> str:
         return code
     suffix = ".TW" if market == "上市" else ".TWO"
     return f"{code}{suffix}"
+
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_official_tw_stock_universe():
+    """
+    官方上市/上櫃公司基本資料。
+    只保留4位數字公司代號；上市加.TW、上櫃加.TWO。
+    官方來源失敗時回傳空表與錯誤訊息，不靜默冒充全市場。
+    """
+    endpoints=[
+        ("上市","https://openapi.twse.com.tw/v1/opendata/t187ap03_L",".TW"),
+        ("上櫃","https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O",".TWO"),
+    ]
+    rows=[]
+    errors=[]
+    for market,url,suffix in endpoints:
+        try:
+            req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0"})
+            with urllib.request.urlopen(req,timeout=20) as resp:
+                data=json.loads(resp.read().decode("utf-8"))
+            for item in data:
+                code=str(item.get("公司代號",item.get("SecuritiesCompanyCode",""))).strip()
+                name=str(item.get("公司簡稱",item.get("CompanyName",""))).strip()
+                industry=str(item.get("產業別",item.get("SecuritiesIndustryCode",""))).strip()
+                if len(code)==4 and code.isdigit():
+                    rows.append({
+                        "股票":code+suffix,
+                        "代號":code,
+                        "公司":name,
+                        "市場":market,
+                        "官方產業別":industry,
+                        "官方來源":url
+                    })
+        except Exception as e:
+            errors.append(f"{market}: {e}")
+
+    df=pd.DataFrame(rows)
+    if not df.empty:
+        df=df.drop_duplicates("股票").reset_index(drop=True)
+    return df,errors
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -2210,18 +2251,18 @@ if simple_mode == "今日雷達":
     st.markdown("""<style>div[data-baseweb="tab-list"]{display:none!important;}</style>""", unsafe_allow_html=True)
 
 if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and not run:
-    st.warning("V1.16.2 已不再崩潰，但畫面顯示「歷史Walk-Forward資格資料為空」，表示真正問題在全市場6mo日K下載階段。V1.16.3 將日K改成25檔小批、關閉threads、失敗重試並對缺漏股票5檔補抓，同時把官方股票數、日K成功數、有效歷史序列數與資格列數直接顯示在資料完整度。")
+    st.warning("V1.16.3 的 NameError 已確認：我在重寫全市場日K下載函式時，誤把前面的官方股票清單函式 fetch_official_tw_stock_universe 一起覆蓋掉了。V1.16.4 已完整補回該函式，並保留25檔小批、重試、缺漏補抓與資料完整度診斷。")
 
 if run and simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證":
     st.subheader("🧰 TOP50暖機修正驗證")
     with st.spinner("同時跑舊3mo版本與6mo暖機版本，比較最後3個月結果…"):
         _wu_sum,_wu_blocks,_wu_trades,_wu_errs,_wu_check=validate_top50_warmup_correction(cost)
-    st.session_state["st_v1163_warmup"]={
+    st.session_state["st_v1164_warmup"]={
         "summary":_wu_sum,"blocks":_wu_blocks,"trades":_wu_trades,
         "check":_wu_check,"errors":_wu_errs
     }
 
-_wu=st.session_state.get("st_v1163_warmup")
+_wu=st.session_state.get("st_v1164_warmup")
 if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and _wu:
     _us=_wu.get("summary",pd.DataFrame()); _ub=_wu.get("blocks",pd.DataFrame())
     _ut=_wu.get("trades",pd.DataFrame()); _uc=_wu.get("check",pd.DataFrame()); _ue=_wu.get("errors",[])
@@ -3123,6 +3164,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.3 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.4 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
