@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.2
+黑嚕嚕－短線交易雷達 ST V1.16.3
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -28,6 +28,7 @@ import streamlit as st
 import yfinance as yf
 import urllib.request
 import json
+import time
 
 warnings.filterwarnings("ignore")
 
@@ -38,13 +39,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.2"
+APP_VERSION = "ST V1.16.3"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.2"
-EXPORT_PREFIX = "ST_V1.16.2"
+APP_VERSION = "ST_V1.16.3"
+EXPORT_PREFIX = "ST_V1.16.3"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -71,1113 +72,79 @@ def normalize_symbol(code: str, market: str) -> str:
     return f"{code}{suffix}"
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def download_intraday(symbol: str, interval: str, period: str = "60d") -> pd.DataFrame:
-    try:
-        d = yf.download(
-            symbol,
-            period=period,
-            interval=interval,
-            auto_adjust=False,
-            progress=False,
-            threads=False,
-            prepost=False,
-        )
-    except Exception:
-        return pd.DataFrame()
+@st.cache_data(ttl=1800, show_spinner=False)
+def download_daily_batches(symbols: List[str], period: str="2mo", batch_size: int=25):
+    """
+    V1.16.3 全市場日K下載：
+    - 小批次、threads=False，降低Yahoo大量請求整批失敗。
+    - 每批最多3次重試。
+    - 批次成功但個股遺漏時，再以5檔小批補抓。
+    - 回傳 {symbol: DataFrame}；空資料不冒充成功。
+    """
+    syms=list(dict.fromkeys(symbols))
+    out={}
+    if not syms:
+        return out
 
-    if d is None or d.empty:
-        return pd.DataFrame()
-
-    if isinstance(d.columns, pd.MultiIndex):
-        # yfinance 單檔有時仍回 MultiIndex
-        if symbol in d.columns.get_level_values(-1):
+    def _extract(raw, batch):
+        got={}
+        if raw is None or getattr(raw,"empty",True):
+            return got
+        for s in batch:
             try:
-                d = d.xs(symbol, axis=1, level=-1)
+                if isinstance(raw.columns,pd.MultiIndex):
+                    lvl0=raw.columns.get_level_values(0)
+                    if s not in lvl0:
+                        continue
+                    d=raw[s].copy()
+                else:
+                    if len(batch)!=1:
+                        continue
+                    d=raw.copy()
+                if not {"Close","Volume"}.issubset(d.columns):
+                    continue
+                d=d.dropna(subset=["Close","Volume"]).copy()
+                if len(d):
+                    got[s]=d.sort_index()
+            except Exception:
+                continue
+        return got
+
+    def _fetch(batch, attempts=3):
+        for attempt in range(attempts):
+            try:
+                raw=yf.download(
+                    tickers=batch,
+                    period=period,
+                    interval="1d",
+                    group_by="ticker",
+                    auto_adjust=False,
+                    progress=False,
+                    threads=False,
+                    prepost=False,
+                )
+                got=_extract(raw,batch)
+                if got:
+                    return got
             except Exception:
                 pass
-        if isinstance(d.columns, pd.MultiIndex):
-            d.columns = [str(c[0]) for c in d.columns]
-
-    rename = {c: str(c).title() for c in d.columns}
-    d = d.rename(columns=rename)
-    need = ["Open", "High", "Low", "Close", "Volume"]
-    if not all(c in d.columns for c in need):
-        return pd.DataFrame()
-
-    d = d[need].copy()
-    for c in need:
-        d[c] = pd.to_numeric(d[c], errors="coerce")
-    d = d.dropna(subset=["Open", "High", "Low", "Close"])
-    d = d[~d.index.duplicated(keep="last")].sort_index()
-
-    # 僅保留台股一般交易時段。Yahoo 時區若可用，轉台北。
-    try:
-        if d.index.tz is not None:
-            d.index = d.index.tz_convert("Asia/Taipei")
-    except Exception:
-        pass
-    try:
-        d = d.between_time("09:00", "13:30")
-    except Exception:
-        pass
-    return d
-
-
-def add_indicators(d: pd.DataFrame) -> pd.DataFrame:
-    x = d.copy()
-    for n in MA_LIST:
-        x[f"MA{n}"] = x["Close"].rolling(n, min_periods=n).mean()
-
-    # 台灣常用 KD：RSV 9，K/D 平滑 1/3；以 50 為初始值。
-    low9 = x["Low"].rolling(9, min_periods=9).min()
-    high9 = x["High"].rolling(9, min_periods=9).max()
-    den = (high9 - low9).replace(0, np.nan)
-    x["RSV"] = ((x["Close"] - low9) / den * 100).clip(0, 100)
-
-    k_vals, d_vals = [], []
-    k_prev = 50.0
-    d_prev = 50.0
-    for rsv in x["RSV"]:
-        if pd.isna(rsv):
-            k_vals.append(np.nan)
-            d_vals.append(np.nan)
-            continue
-        k_prev = (2/3) * k_prev + (1/3) * float(rsv)
-        d_prev = (2/3) * d_prev + (1/3) * k_prev
-        k_vals.append(k_prev)
-        d_vals.append(d_prev)
-    x["K"] = k_vals
-    x["D"] = d_vals
-
-    x["MA_BULL_5_15"] = x["MA5"] > x["MA15"]
-    x["MA_BULL_15_30"] = x["MA15"] > x["MA30"]
-    x["MA_BULL_30_60"] = x["MA30"] > x["MA60"]
-    x["FULL_BULL"] = (
-        (x["MA5"] > x["MA15"]) &
-        (x["MA15"] > x["MA30"]) &
-        (x["MA30"] > x["MA60"]) &
-        (x["MA60"] > x["MA200"])
-    )
-    x["PRICE_GT_MA200"] = x["Close"] > x["MA200"]
-
-    x["MA5_XUP_MA15"] = (x["MA5"] > x["MA15"]) & (x["MA5"].shift(1) <= x["MA15"].shift(1))
-    x["MA15_XUP_MA30"] = (x["MA15"] > x["MA30"]) & (x["MA15"].shift(1) <= x["MA30"].shift(1))
-    x["KD_GOLD"] = (x["K"] > x["D"]) & (x["K"].shift(1) <= x["D"].shift(1))
-    x["KD_DEAD"] = (x["K"] < x["D"]) & (x["K"].shift(1) >= x["D"].shift(1))
-
-    x["K_ZONE"] = pd.cut(
-        x["K"],
-        bins=[-np.inf, 20, 30, 50, 80, np.inf],
-        labels=["K<20", "K20-30", "K30-50", "K50-80", "K>80"],
-    )
-
-    # V1.1：均線斜率，以目前 MA - 3 根前 MA 表示方向。
-    for n in MA_LIST:
-        x[f"MA{n}_SLOPE3"] = x[f"MA{n}"] - x[f"MA{n}"].shift(3)
-
-    # V1.1：量能比 = 當根成交量 / 前20期平均量（shift 1 避免把當根放入基準）。
-    x["VOL_MA20_PREV"] = x["Volume"].shift(1).rolling(20, min_periods=20).mean()
-    x["VOL_RATIO20"] = x["Volume"] / x["VOL_MA20_PREV"].replace(0, np.nan)
-
-    # V1.1：日內 VWAP，每個交易日重新累積。
-    tp = (x["High"] + x["Low"] + x["Close"]) / 3.0
-    dates = pd.Index([pd.Timestamp(i).date() for i in x.index])
-    pv = tp * x["Volume"].fillna(0)
-    cum_pv = pv.groupby(dates).cumsum()
-    cum_v = x["Volume"].fillna(0).groupby(dates).cumsum().replace(0, np.nan)
-    x["VWAP"] = cum_pv / cum_v
-    x["PRICE_GT_VWAP"] = x["Close"] > x["VWAP"]
-
-    return x
-
-
-def signal_mask(d: pd.DataFrame, rule: str) -> pd.Series:
-    false = pd.Series(False, index=d.index)
-    rules = {
-        "MA5上穿MA15": d.get("MA5_XUP_MA15", false),
-        "MA15上穿MA30": d.get("MA15_XUP_MA30", false),
-        "KD黃金交叉": d.get("KD_GOLD", false),
-        "MA5>15 + KD黃金交叉": d.get("MA_BULL_5_15", false) & d.get("KD_GOLD", false),
-        "MA5>15>30 + KD黃金交叉": (
-            d.get("MA_BULL_5_15", false) &
-            d.get("MA_BULL_15_30", false) &
-            d.get("KD_GOLD", false)
-        ),
-        "MA5>15>30>60 + KD黃金交叉": (
-            d.get("MA_BULL_5_15", false) &
-            d.get("MA_BULL_15_30", false) &
-            d.get("MA_BULL_30_60", false) &
-            d.get("KD_GOLD", false)
-        ),
-        "完整多頭排列": d.get("FULL_BULL", false) & (~d.get("FULL_BULL", false).shift(1).fillna(False)),
-        "完整多頭排列 + KD黃金交叉": d.get("FULL_BULL", false) & d.get("KD_GOLD", false),
-        "站上MA200 + KD黃金交叉": d.get("PRICE_GT_MA200", false) & d.get("KD_GOLD", false),
-        "KD黃金交叉 + K<30": d.get("KD_GOLD", false) & (d.get("K", pd.Series(np.nan, index=d.index)) < 30),
-        "KD黃金交叉 + K30-50": d.get("KD_GOLD", false) & (d.get("K", pd.Series(np.nan, index=d.index)) >= 30) & (d.get("K", pd.Series(np.nan, index=d.index)) < 50),
-        "KD黃金交叉 + K50-80": d.get("KD_GOLD", false) & (d.get("K", pd.Series(np.nan, index=d.index)) >= 50) & (d.get("K", pd.Series(np.nan, index=d.index)) < 80),
-        "KD黃金交叉 + K>80": d.get("KD_GOLD", false) & (d.get("K", pd.Series(np.nan, index=d.index)) >= 80),
-        "KD黃金交叉 + MA30向上": d.get("KD_GOLD", false) & (d.get("MA30_SLOPE3", pd.Series(np.nan, index=d.index)) > 0),
-        "KD黃金交叉 + MA60向上": d.get("KD_GOLD", false) & (d.get("MA60_SLOPE3", pd.Series(np.nan, index=d.index)) > 0),
-        "KD黃金交叉 + 量比>1.2": d.get("KD_GOLD", false) & (d.get("VOL_RATIO20", pd.Series(np.nan, index=d.index)) > 1.2),
-        "KD黃金交叉 + 量比>1.5": d.get("KD_GOLD", false) & (d.get("VOL_RATIO20", pd.Series(np.nan, index=d.index)) > 1.5),
-        "KD黃金交叉 + 站上VWAP": d.get("KD_GOLD", false) & d.get("PRICE_GT_VWAP", false),
-        "MA5>15 + KD + 站上VWAP": d.get("MA_BULL_5_15", false) & d.get("KD_GOLD", false) & d.get("PRICE_GT_VWAP", false),
-        "多週期條件": d.get("MTF_SIGNAL", false),
-    }
-    return rules.get(rule, false).fillna(False)
-
-
-
-
-def _profit_factor_series(df: pd.DataFrame) -> pd.Series:
-    for c in ["PF", "ProfitFactor", "Profit Factor"]:
-        if c in df.columns:
-            return pd.to_numeric(df[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
-    return pd.Series(dtype=float)
-
-
-def aggregate_trade_metrics(trades: pd.DataFrame) -> dict:
-    if trades is None or trades.empty or "淨報酬%" not in trades.columns:
-        return {"整體交易勝率":np.nan,"整體平均淨報酬":np.nan,"整體PF":np.nan}
-    r=pd.to_numeric(trades["淨報酬%"],errors="coerce").dropna()
-    if r.empty:
-        return {"整體交易勝率":np.nan,"整體平均淨報酬":np.nan,"整體PF":np.nan}
-    gp=r[r>0].sum()
-    gl=-r[r<0].sum()
-    pf=np.inf if gl==0 and gp>0 else (gp/gl if gl>0 else np.nan)
-    return {"整體交易勝率":float((r>0).mean()*100),"整體平均淨報酬":float(r.mean()),"整體PF":float(pf) if np.isfinite(pf) else pf}
-
-
-
-
-def summarize_pool20_stability(trades: pd.DataFrame):
-    """V1.12.4：爆量分層的樣本內外與四段時間穩定度。"""
-    if trades is None or trades.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-
-    x=trades.copy()
-    buckets=["全部基準","<1倍","1-1.5倍","1.5-2倍","2-3倍",">3倍","爆量>=1.5倍","熱門動能"]
-
-    def mask_for(name):
-        if name=="全部基準":
-            return pd.Series(True,index=x.index)
-        if name in ["<1倍","1-1.5倍","1.5-2倍","2-3倍",">3倍"]:
-            return x["爆量分層"]==name
-        if name=="爆量>=1.5倍":
-            return x["前日爆量>=1.5"]=="是"
-        return x["前日熱門動能"]=="是"
-
-    # IS / OOS
-    sample_rows=[]
-    for sample in [z for z in ["樣本內60%","樣本外40%"] if z in set(x["樣本"].dropna())]:
-        xs=x[x["樣本"]==sample]
-        for b in buckets:
-            g=xs[mask_for(b).reindex(xs.index,fill_value=False)]
-            m=aggregate_trade_metrics(g)
-            sample_rows.append({"樣本":sample,"分組":b,"交易數":len(g),
-                                "涵蓋股票數":int(g["股票"].nunique()) if len(g) else 0,**m})
-    sample_df=pd.DataFrame(sample_rows)
-
-    # 四段等時間區間，不以交易數等分，避免大量交易期被強迫平均。
-    ts=pd.to_datetime(x["訊號時間"],errors="coerce")
-    ok=ts.notna()
-    xb=x.loc[ok].copy()
-    ts=ts.loc[ok]
-    block_rows=[]
-    if len(xb):
-        t0,t1=ts.min(),ts.max()
-        edges=pd.date_range(t0,t1,periods=5)
-        # 最後一段包含右界。
-        labels=["第1段","第2段","第3段","第4段"]
-        xb["時間段"]=pd.cut(ts,bins=edges,labels=labels,include_lowest=True,right=True)
-        for block in labels:
-            z=xb[xb["時間段"]==block]
-            for b in buckets:
-                if b=="全部基準":
-                    g=z
-                elif b in ["<1倍","1-1.5倍","1.5-2倍","2-3倍",">3倍"]:
-                    g=z[z["爆量分層"]==b]
-                elif b=="爆量>=1.5倍":
-                    g=z[z["前日爆量>=1.5"]=="是"]
-                else:
-                    g=z[z["前日熱門動能"]=="是"]
-                m=aggregate_trade_metrics(g)
-                block_rows.append({"時間段":block,
-                                   "起始":str(edges[labels.index(block)]),
-                                   "結束":str(edges[labels.index(block)+1]),
-                                   "分組":b,"交易數":len(g),
-                                   "涵蓋股票數":int(g["股票"].nunique()) if len(g) else 0,**m})
-    return sample_df,pd.DataFrame(block_rows)
-
-
-def validate_pool20_historical(symbols: List[str], cost: CostConfig, period: str = "3mo"):
-    """
-    V1.12.2：固定核心策略 60m KD黃金交叉+K<30+5日，
-    以「訊號當下已知的前一個完成日K」建立爆量/熱門標籤，避免偷看當日收盤量。
-    """
-    _, _, trades = run_oos_60m_5d(symbols, cost, period, allow_overlap=False, train_ratio=0.60)
-    if trades is None or trades.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
-    tickers=list(dict.fromkeys(symbols))
-    daily=yf.download(tickers=tickers, period="6mo", interval="1d",
-                      group_by="ticker", auto_adjust=False, progress=False, threads=True)
-    contexts={}
-    for s in tickers:
-        try:
-            if isinstance(daily.columns,pd.MultiIndex):
-                if s not in daily.columns.get_level_values(0):
-                    continue
-                d=daily[s].copy()
-            else:
-                d=daily.copy()
-            d=d.dropna(subset=["Close","Volume"])
-            if d.empty:
-                continue
-            d.index=pd.to_datetime(d.index,errors="coerce")
-            d=d[d.index.notna()].copy()
-            d=d[d.index.weekday < 5]
-            close=pd.to_numeric(d["Close"],errors="coerce")
-            vol=pd.to_numeric(d["Volume"],errors="coerce")
-            turn=close*vol
-            rows=[]
-            for i in range(20,len(d)):
-                prev20=vol.iloc[i-20:i]
-                prev20_turn=turn.iloc[i-20:i]
-                base_vol=float(prev20.mean()) if len(prev20) else np.nan
-                base_turn=float(prev20_turn.median()) if len(prev20_turn) else np.nan
-                day_vol=float(vol.iloc[i])
-                day_turn=float(turn.iloc[i])
-                vol_ratio=day_vol/base_vol if base_vol>0 else np.nan
-                turn_ratio=day_turn/base_turn if base_turn>0 else np.nan
-                # 近3個「已完成」交易日（含該日）
-                vol3=float(vol.iloc[max(0,i-2):i+1].mean())
-                vol3_ratio=vol3/base_vol if base_vol>0 else np.nan
-                rows.append({
-                    "context_date":d.index[i].date(),
-                    "前一完成日量比20日":vol_ratio,
-                    "前一完成日成交金額比20日":turn_ratio,
-                    "近3完成日均量比20日":vol3_ratio,
-                })
-            contexts[s]=pd.DataFrame(rows)
-        except Exception:
-            continue
-
-    x=trades.copy()
-    sig=pd.to_datetime(x["訊號時間"],utc=True,errors="coerce").dt.tz_convert("Asia/Taipei")
-    x["訊號日期"]=sig.dt.date
-    vals=[]
-    for _,r in x.iterrows():
-        s=r["股票"]; sd=r["訊號日期"]
-        c=contexts.get(s,pd.DataFrame())
-        if c.empty or pd.isna(sd):
-            vals.append((np.nan,np.nan,np.nan,None))
-            continue
-        # 嚴格使用訊號日期以前的完成日K，杜絕使用訊號當日收盤量。
-        q=c[c["context_date"] < sd]
-        if q.empty:
-            vals.append((np.nan,np.nan,np.nan,None))
-        else:
-            z=q.iloc[-1]
-            vals.append((z["前一完成日量比20日"],z["前一完成日成交金額比20日"],
-                         z["近3完成日均量比20日"],z["context_date"]))
-    vv=pd.DataFrame(vals,columns=["前一完成日量比20日","前一完成日成交金額比20日","近3完成日均量比20日","量能基準日"],index=x.index)
-    x=pd.concat([x,vv],axis=1)
-
-    x["爆量分層"]=pd.cut(x["前一完成日量比20日"],
-        bins=[-np.inf,1.0,1.5,2.0,3.0,np.inf],
-        labels=["<1倍","1-1.5倍","1.5-2倍","2-3倍",">3倍"]).astype(str)
-    x["前日爆量>=1.5"]=np.where(x["前一完成日量比20日"]>=1.5,"是","否")
-    x["前日熱門動能"]=np.where(
-        (x["前一完成日成交金額比20日"]>=1.5)&(x["近3完成日均量比20日"]>=1.2),"是","否")
-
-    groups=[]
-    specs=[
-        ("全部基準",pd.Series(True,index=x.index)),
-        ("<1倍",x["爆量分層"]=="<1倍"),
-        ("1-1.5倍",x["爆量分層"]=="1-1.5倍"),
-        ("1.5-2倍",x["爆量分層"]=="1.5-2倍"),
-        ("2-3倍",x["爆量分層"]=="2-3倍"),
-        (">3倍",x["爆量分層"]==">3倍"),
-        ("爆量>=1.5倍",x["前日爆量>=1.5"]=="是"),
-        ("熱門動能",x["前日熱門動能"]=="是"),
-    ]
-    for name,mask in specs:
-        g=x[mask].copy()
-        m=aggregate_trade_metrics(g)
-        groups.append({"分組":name,"交易數":len(g),
-                       "涵蓋股票數":int(g["股票"].nunique()) if len(g) else 0,**m})
-    _sample_stability,_block_stability=summarize_pool20_stability(x)
-    return pd.DataFrame(groups),x,_sample_stability,_block_stability
-
-
-
-def _as_taipei_series(s):
-    """將交易時間統一視為台北時間；naive時間不再誤當UTC。"""
-    x=pd.to_datetime(s,errors="coerce")
-    try:
-        if x.dt.tz is None:
-            return x.dt.tz_localize("Asia/Taipei")
-        return x.dt.tz_convert("Asia/Taipei")
-    except Exception:
-        return x
-
-
-def run_oos_60m_5d(symbols: List[str], cost: CostConfig, period: str, allow_overlap: bool = False,
-                     train_ratio: float = 0.60, evaluation_months: Optional[int] = None):
-    """
-    V1.4.2 固定模型驗證：
-    60m KD黃金交叉 + K<30，持有5日。
-    先收集所有股票交易，再以「全體訊號時間」建立同一個時間切點：
-    前60%時間區段 = 樣本內；後40%時間區段 = 樣本外。
-    這比每檔依交易筆數各自切割更接近真正的時間OOS。
-    股票池仍由近期流動性建立，因此仍不是完整 walk-forward 股票池OOS。
-    """
-    raw = download_intraday_batch(symbols, "60m", period)
-    raw_trades = []
-    p = st.progress(0, text="60m固定模型：建立全體交易…")
-    for n, symbol in enumerate(symbols, 1):
-        if symbol in raw and not raw[symbol].empty:
-            d = add_indicators(raw[symbol])
-            t = backtest(d, "60m", "KD黃金交叉 + K<30", "5日", cost)
-            if not allow_overlap:
-                t = enforce_non_overlapping(t)
-            if not t.empty:
-                x=t.copy()
-                x.insert(0,"股票",symbol)
-                x["研究主題"]=research_theme(symbol)
-                x["_signal_dt"]=_as_taipei_series(x["訊號時間"])
-                raw_trades.append(x)
-        p.progress(n/max(1,len(symbols)), text=f"建立交易 {symbol}｜{n}/{len(symbols)}")
-    p.empty()
-
-    if not raw_trades:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-
-    all_t=pd.concat(raw_trades,ignore_index=True).dropna(subset=["_signal_dt"]).sort_values("_signal_dt")
-    # V1.16.0：可用更長資料做指標暖機，但只評估最後N個月。
-    if evaluation_months is not None and not all_t.empty:
-        _eval_end=all_t["_signal_dt"].max()
-        _eval_start=_eval_end-pd.DateOffset(months=int(evaluation_months))
-        all_t=all_t[all_t["_signal_dt"]>=_eval_start].copy()
-    unique_times=pd.Series(all_t["_signal_dt"].drop_duplicates().sort_values().to_list())
-    if len(unique_times)<2:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-    cut_idx=max(1,min(len(unique_times)-1,int(len(unique_times)*train_ratio)))
-    cutoff=unique_times.iloc[cut_idx]
-    all_t["樣本"]=np.where(all_t["_signal_dt"] < cutoff, "樣本內60%", "樣本外40%")
-    all_t["切割時間"]=cutoff
-    all_t["回測版本"]=APP_VERSION
-
-    rows=[]
-    for symbol in symbols:
-        stx=all_t[all_t["股票"]==symbol]
-        for sample_name in ["樣本內60%","樣本外40%"]:
-            part=stx[stx["樣本"]==sample_name].drop(columns=["_signal_dt"],errors="ignore")
-            m=metrics(part)
-            rows.append({
-                "股票":symbol,"研究主題":research_theme(symbol),"樣本":sample_name,
-                "切割時間":cutoff,"週期":"60m","規則":"KD黃金交叉 + K<30","持有":"5日",**m
-            })
-
-    detail=pd.DataFrame(rows)
-    trades=all_t.drop(columns=["_signal_dt"],errors="ignore").reset_index(drop=True)
-    summaries=[]
-    for sample_name,g in detail.groupby("樣本"):
-        valid=g[g["交易數"]>0].copy()
-        pf=_profit_factor_series(valid)
-        tm=aggregate_trade_metrics(trades[trades["樣本"]==sample_name])
-        summaries.append({
-            "回測版本":APP_VERSION,"樣本":sample_name,"共同切割時間":cutoff,
-            "股票數":int(valid["股票"].nunique()),"總交易數":int(valid["交易數"].sum()),
-            "正期望股票比例":float((valid["期望值%"]>0).mean()*100) if len(valid) else np.nan,
-            "平均期望值":float(valid["期望值%"].mean()) if len(valid) else np.nan,
-            "期望值中位數":float(valid["期望值%"].median()) if len(valid) else np.nan,
-            "PF中位數":float(pf.median()) if not pf.empty else np.nan,
-            **tm,
-            "平均勝率":float(valid["勝率%"].mean()) if len(valid) else np.nan,
-            "平均最大回撤":float(valid["最大回撤%"].mean()) if len(valid) else np.nan,
-        })
-    return detail,pd.DataFrame(summaries),trades
-
-
-def state_at_entry_diagnostics(trades: pd.DataFrame) -> pd.DataFrame:
-    """描述訊號發生當下的狀態；只做診斷，不自動把最佳分組變成新規則。"""
-    if trades is None or trades.empty:
-        return pd.DataFrame()
-    t=trades.copy()
-    groups=[]
-
-    def add_group(factor, label, mask):
-        g=t.loc[mask].copy()
-        if g.empty:
-            return
-        r=pd.to_numeric(g["淨報酬%"],errors="coerce").dropna()
-        if r.empty:
-            return
-        gp=r[r>0].sum(); gl=-r[r<0].sum()
-        pf=np.inf if gl==0 and gp>0 else (gp/gl if gl>0 else np.nan)
-        groups.append({
-            "狀態因子":factor,"分組":label,"交易數":len(r),
-            "股票數":int(g["股票"].nunique()),
-            "勝率%":float((r>0).mean()*100),"平均淨報酬%":float(r.mean()),
-            "中位淨報酬%":float(r.median()),"整體PF":pf
-        })
-
-    if "K區間" in t:
-        add_group("K深度","K<20",t["K區間"].eq("K<20"))
-        add_group("K深度","K20-30",t["K區間"].eq("K20-30"))
-    if {"訊號收盤","訊號VWAP"}.issubset(t.columns):
-        add_group("VWAP位置","收盤>VWAP",t["訊號收盤"]>t["訊號VWAP"])
-        add_group("VWAP位置","收盤<=VWAP",t["訊號收盤"]<=t["訊號VWAP"])
-    for c,label in [("MA30斜率3","MA30"),("MA60斜率3","MA60")]:
-        if c in t:
-            x=pd.to_numeric(t[c],errors="coerce")
-            add_group(f"{label}方向",f"{label}上彎",x>0)
-            add_group(f"{label}方向",f"{label}下彎/平",x<=0)
-    if "量比20" in t:
-        x=pd.to_numeric(t["量比20"],errors="coerce")
-        add_group("量比","量比<1",x<1)
-        add_group("量比","量比>=1",x>=1)
-    if "研究主題" in t:
-        for theme,gidx in t.groupby("研究主題").groups.items():
-            add_group("研究主題",str(theme),t.index.isin(gidx))
-    return pd.DataFrame(groups)
-
-
-def state_filter_robustness(trades: pd.DataFrame, blocks: int = 4) -> pd.DataFrame:
-    """
-    V1.5.2：把V1.5.1觀察到的狀態只當「候選假說」。
-    比較基準與少量預先固定的候選濾網，要求跨連續時間區段仍成立；
-    不自動挑最佳參數、不回寫成正式交易規則。
-    """
-    if trades is None or trades.empty:
-        return pd.DataFrame()
-    t=trades.copy()
-    t["_dt"]=pd.to_datetime(t["訊號時間"],utc=True,errors="coerce")
-    t=t.dropna(subset=["_dt"]).sort_values("_dt").reset_index(drop=True)
-    if len(t)<blocks:
-        return pd.DataFrame()
-
-    q=np.linspace(0,1,blocks+1)
-    bounds=t["_dt"].quantile(q).tolist()
-
-    def num(col):
-        return pd.to_numeric(t[col],errors="coerce") if col in t.columns else pd.Series(np.nan,index=t.index)
-
-    k=t["K區間"] if "K區間" in t.columns else pd.Series("",index=t.index)
-    vol=num("量比20")
-    ma60=num("MA60斜率3")
-
-    candidates={
-        "基準｜K<30": pd.Series(True,index=t.index),
-        "候選A｜K<20": k.eq("K<20"),
-        "候選B｜量比>=1": vol.ge(1),
-        "候選C｜MA60下彎/平": ma60.le(0),
-        "候選D｜MA60下彎/平＋量比>=1": ma60.le(0) & vol.ge(1),
-    }
-
-    rows=[]
-    for name,mask in candidates.items():
-        for i in range(blocks):
-            lo,hi=bounds[i],bounds[i+1]
-            tm=(t["_dt"]>=lo) & ((t["_dt"]<=hi) if i==blocks-1 else (t["_dt"]<hi))
-            g=t.loc[mask & tm].copy()
-            m=aggregate_trade_metrics(g)
-            r=pd.to_numeric(g["淨報酬%"],errors="coerce").dropna() if not g.empty else pd.Series(dtype=float)
-            rows.append({
-                "候選狀態":name,"區段":f"時間區段{i+1}/{blocks}",
-                "開始":lo,"結束":hi,"交易數":len(r),
-                "股票數":int(g["股票"].nunique()) if not g.empty else 0,
-                "涵蓋率%":float(len(r)/max(1,int(tm.sum()))*100),
-                "勝率%":float((r>0).mean()*100) if len(r) else np.nan,
-                "平均淨報酬%":float(r.mean()) if len(r) else np.nan,
-                "中位淨報酬%":float(r.median()) if len(r) else np.nan,
-                "整體PF":m["整體PF"],
-            })
-    return pd.DataFrame(rows)
-
-
-def market_regime_diagnostics(trades: pd.DataFrame, period: str) -> pd.DataFrame:
-    """
-    V1.6.0：用台股加權指數 ^TWII 的日線，描述每筆60m訊號當時的大盤環境。
-    僅做診斷，不把結果直接變成交易濾網。
-    使用前一個已完成交易日的日線，避免把訊號之後才知道的資料帶入。
-    """
-    if trades is None or trades.empty:
-        return pd.DataFrame()
-    try:
-        idx=yf.download("^TWII", period="6mo", interval="1d", auto_adjust=False,
-                        progress=False, threads=False)
-    except Exception:
-        return pd.DataFrame()
-    if idx is None or idx.empty:
-        return pd.DataFrame()
-    if isinstance(idx.columns,pd.MultiIndex):
-        # yfinance 單一ticker在不同版本可能仍回傳MultiIndex
-        try:
-            idx=idx.xs("^TWII",axis=1,level=-1)
-        except Exception:
-            idx.columns=[c[0] if isinstance(c,tuple) else c for c in idx.columns]
-    idx=idx.rename(columns={c:str(c).title() for c in idx.columns})
-    if "Close" not in idx.columns:
-        return pd.DataFrame()
-    idx=idx.copy()
-    idx.index=pd.to_datetime(idx.index,utc=True,errors="coerce")
-    idx=idx[~idx.index.isna()].sort_index()
-    idx["MKT_MA5"]=idx["Close"].rolling(5).mean()
-    idx["MKT_MA15"]=idx["Close"].rolling(15).mean()
-    idx["MKT_RET5"]=idx["Close"].pct_change(5)*100
-    idx["MKT_RET15"]=idx["Close"].pct_change(15)*100
-    idx["MKT_MA15_SLOPE"]=idx["MKT_MA15"].diff(3)
-    # shift(1)：訊號當天只使用前一個完成日
-    m=idx[["Close","MKT_MA5","MKT_MA15","MKT_RET5","MKT_RET15","MKT_MA15_SLOPE"]].shift(1).dropna().reset_index()
-    m=m.rename(columns={m.columns[0]:"_mkt_dt","Close":"大盤收盤"})
-    m["_mkt_dt"]=pd.to_datetime(m["_mkt_dt"],utc=True,errors="coerce")
-
-    t=trades.copy()
-    t["_dt"]=pd.to_datetime(t["訊號時間"],utc=True,errors="coerce")
-    t=t.dropna(subset=["_dt"]).sort_values("_dt")
-    x=pd.merge_asof(t,m.sort_values("_mkt_dt"),left_on="_dt",right_on="_mkt_dt",direction="backward")
-    x["大盤站上MA15"]=x["大盤收盤"]>=x["MKT_MA15"]
-    x["大盤MA15上彎"]=x["MKT_MA15_SLOPE"]>0
-    x["大盤5日報酬正"]=x["MKT_RET5"]>0
-
-    rows=[]
-    for factor,col in [("大盤位置","大盤站上MA15"),("大盤趨勢","大盤MA15上彎"),("大盤短動能","大盤5日報酬正")]:
-        for val,label in [(True,"是"),(False,"否")]:
-            g=x[x[col].eq(val)]
-            if g.empty: continue
-            r=pd.to_numeric(g["淨報酬%"],errors="coerce").dropna()
-            gp=r[r>0].sum(); gl=-r[r<0].sum()
-            pf=np.inf if gl==0 and gp>0 else (gp/gl if gl>0 else np.nan)
-            rows.append({"市場因子":factor,"狀態":label,"交易數":len(r),
-                         "股票數":int(g["股票"].nunique()),"勝率%":float((r>0).mean()*100),
-                         "平均淨報酬%":float(r.mean()),"中位淨報酬%":float(r.median()),"整體PF":pf})
-    return pd.DataFrame(rows)
-
-
-def market_regime_by_timeblock(trades: pd.DataFrame, blocks: int = 4) -> pd.DataFrame:
-    """
-    把 ^TWII 前一完成交易日的市場狀態，與四段時間直接交叉。
-    目的：確認第1段失效是否真的由某一大盤regime主導，而非只看全期間分組。
-    """
-    if trades is None or trades.empty:
-        return pd.DataFrame()
-    try:
-        idx=yf.download("^TWII", period="6mo", interval="1d", auto_adjust=False,
-                        progress=False, threads=False)
-    except Exception:
-        return pd.DataFrame()
-    if idx is None or idx.empty:
-        return pd.DataFrame()
-    if isinstance(idx.columns,pd.MultiIndex):
-        try:
-            idx=idx.xs("^TWII",axis=1,level=-1)
-        except Exception:
-            idx.columns=[c[0] if isinstance(c,tuple) else c for c in idx.columns]
-    idx=idx.rename(columns={c:str(c).title() for c in idx.columns})
-    if "Close" not in idx.columns:
-        return pd.DataFrame()
-    idx.index=pd.to_datetime(idx.index,utc=True,errors="coerce")
-    idx=idx[~idx.index.isna()].sort_index()
-    idx["MKT_MA15"]=idx["Close"].rolling(15).mean()
-    idx["MKT_RET5"]=idx["Close"].pct_change(5)*100
-    idx["MKT_MA15_SLOPE"]=idx["MKT_MA15"].diff(3)
-    m=idx[["Close","MKT_MA15","MKT_RET5","MKT_MA15_SLOPE"]].shift(1).dropna().reset_index()
-    m=m.rename(columns={m.columns[0]:"_mkt_dt","Close":"大盤收盤"})
-    m["_mkt_dt"]=pd.to_datetime(m["_mkt_dt"],utc=True,errors="coerce")
-
-    t=trades.copy()
-    t["_dt"]=pd.to_datetime(t["訊號時間"],utc=True,errors="coerce")
-    t=t.dropna(subset=["_dt"]).sort_values("_dt").reset_index(drop=True)
-    x=pd.merge_asof(t,m.sort_values("_mkt_dt"),left_on="_dt",right_on="_mkt_dt",direction="backward")
-    x["大盤MA15上彎"]=x["MKT_MA15_SLOPE"]>0
-    x["大盤5日報酬正"]=x["MKT_RET5"]>0
-
-    bounds=x["_dt"].quantile(np.linspace(0,1,blocks+1)).tolist()
-    rows=[]
-    for i in range(blocks):
-        lo,hi=bounds[i],bounds[i+1]
-        tm=(x["_dt"]>=lo) & ((x["_dt"]<=hi) if i==blocks-1 else (x["_dt"]<hi))
-        for factor,col in [("大盤MA15上彎","大盤MA15上彎"),("大盤5日報酬正","大盤5日報酬正")]:
-            for val,label in [(True,"是"),(False,"否")]:
-                g=x[tm & x[col].eq(val)]
-                r=pd.to_numeric(g["淨報酬%"],errors="coerce").dropna()
-                if r.empty: continue
-                gp=r[r>0].sum(); gl=-r[r<0].sum()
-                pf=np.inf if gl==0 and gp>0 else (gp/gl if gl>0 else np.nan)
-                rows.append({
-                    "區段":f"時間區段{i+1}/{blocks}","開始":lo,"結束":hi,
-                    "市場因子":factor,"狀態":label,"交易數":len(r),
-                    "占該段交易%":float(len(r)/max(1,int(tm.sum()))*100),
-                    "勝率%":float((r>0).mean()*100),"平均淨報酬%":float(r.mean()),
-                    "中位淨報酬%":float(r.median()),"整體PF":pf
-                })
-    return pd.DataFrame(rows)
-
-
-def walkforward_tradability_validation(trades: pd.DataFrame, daily_lookback: int = 20) -> pd.DataFrame:
-    """
-    V1.7.0：Walk-Forward股票池偏誤診斷。
-    對每筆既有60m交易，使用該股票「訊號日前一交易日以前」的日線資料，
-    計算過去20日成交金額/成交量/振幅的相對排名。
-    不使用訊號日之後資料，也不使用目前最新流動性來決定歷史排名。
-    注意：這仍是在目前候選universe內做歷史可交易性重建，不等於完整歷史上市櫃成分重建。
-    """
-    if trades is None or trades.empty or "股票" not in trades.columns:
-        return pd.DataFrame(), pd.DataFrame(), "沒有可用的OOS逐筆交易或缺少股票欄位。"
-
-    t=trades.copy()
-    t["_dt"]=pd.to_datetime(t["訊號時間"],utc=True,errors="coerce")
-    t=t.dropna(subset=["_dt"]).copy()
-    symbols=sorted(t["股票"].dropna().astype(str).unique().tolist())
-    if not symbols:
-        return pd.DataFrame(), pd.DataFrame(), "逐筆交易中沒有股票代號。"
-
-    def wf_yf_symbol(s: str) -> str:
-        s=str(s).strip()
-        if s.endswith(".TW") or s.endswith(".TWO"):
-            return s
-        # 現有universe多數已在SHORT_TERM_UNIVERSE；優先沿用其yfinance代碼。
-        for item in SHORT_TERM_UNIVERSE:
-            code=str(item).split(".")[0]
-            if code==s:
-                return str(item)
-        # fallback：台股四位數先以上市 .TW 嘗試
-        return f"{s}.TW"
-
-    # 下載足夠長的日線，供每個訊號點向前看20個完成交易日。
-    try:
-        raw=yf.download(
-            tickers=" ".join([wf_yf_symbol(s) for s in symbols]),
-            period="6mo", interval="1d", auto_adjust=False,
-            progress=False, threads=True, group_by="ticker"
-        )
-    except Exception as e:
-        return pd.DataFrame(), pd.DataFrame(), f"Yahoo日線下載失敗：{type(e).__name__}: {e}"
-    if raw is None or raw.empty:
-        return pd.DataFrame(), pd.DataFrame(), "Yahoo日線下載結果為空。"
-
-    rows=[]
-    for symbol in symbols:
-        yf_sym=wf_yf_symbol(symbol)
-        try:
-            if isinstance(raw.columns,pd.MultiIndex):
-                if yf_sym in raw.columns.get_level_values(0):
-                    d=raw[yf_sym].copy()
-                elif yf_sym in raw.columns.get_level_values(-1):
-                    d=raw.xs(yf_sym,axis=1,level=-1).copy()
-                else:
-                    continue
-            else:
-                d=raw.copy()
-            d.columns=[str(c).title() for c in d.columns]
-            if not {"Close","High","Low","Volume"}.issubset(d.columns):
-                continue
-            d=d.dropna(subset=["Close"]).copy()
-            d.index=pd.to_datetime(d.index,utc=True,errors="coerce")
-            d=d[~d.index.isna()].sort_index()
-            d["成交金額代理"]=pd.to_numeric(d["Close"],errors="coerce")*pd.to_numeric(d["Volume"],errors="coerce")
-            d["振幅%"]=(pd.to_numeric(d["High"],errors="coerce")-pd.to_numeric(d["Low"],errors="coerce"))/pd.to_numeric(d["Close"],errors="coerce").replace(0,np.nan)*100
-            d["WF成交金額"]=d["成交金額代理"].rolling(daily_lookback,min_periods=10).median().shift(1)
-            d["WF成交量"]=pd.to_numeric(d["Volume"],errors="coerce").rolling(daily_lookback,min_periods=10).median().shift(1)
-            d["WF振幅"]=d["振幅%"].rolling(daily_lookback,min_periods=10).median().shift(1)
-            dd=d[["WF成交金額","WF成交量","WF振幅"]].dropna().reset_index()
-            dd=dd.rename(columns={dd.columns[0]:"_daily_dt"})
-            dd["_daily_dt"]=pd.to_datetime(dd["_daily_dt"],utc=True,errors="coerce")
-            stx=t[t["股票"].astype(str)==symbol].sort_values("_dt").copy()
-            if stx.empty or dd.empty: continue
-            z=pd.merge_asof(stx,dd.sort_values("_daily_dt"),left_on="_dt",right_on="_daily_dt",direction="backward")
-            rows.append(z)
-        except Exception:
-            continue
-
-    if not rows:
-        return pd.DataFrame(), pd.DataFrame(), "沒有任何股票成功完成歷史日線與訊號時間配對。"
-
-    x=pd.concat(rows,ignore_index=True)
-    x=x.dropna(subset=["WF成交金額","WF成交量","WF振幅"]).copy()
-    if x.empty:
-        return pd.DataFrame(), pd.DataFrame(), "完成配對後，20日歷史可交易性欄位全部為空；可能是日線暖機資料不足。"
-
-    # 每個交易日橫向排名：只用當時可取得的歷史20日資訊。
-    x["_signal_day"]=x["_dt"].dt.floor("D")
-    for c,outc in [("WF成交金額","成交金額百分位"),("WF成交量","成交量百分位"),("WF振幅","振幅百分位")]:
-        x[outc]=x.groupby("_signal_day")[c].rank(pct=True,method="average")*100
-    x["WF可交易分數"]=x["成交金額百分位"]*0.50+x["成交量百分位"]*0.20+x["振幅百分位"]*0.30
-
-    # 固定分層，不事後最佳化切點。
-    x["WF分層"]=pd.cut(
-        x["WF可交易分數"],[-np.inf,40,60,80,np.inf],
-        labels=["低於40","40-60","60-80","80以上"],right=False
-    )
-
-    summary=[]
-    for layer,g in x.groupby("WF分層",observed=True):
-        r=pd.to_numeric(g["淨報酬%"],errors="coerce").dropna()
-        if r.empty: continue
-        gp=r[r>0].sum(); gl=-r[r<0].sum()
-        pf=np.inf if gl==0 and gp>0 else (gp/gl if gl>0 else np.nan)
-        summary.append({
-            "歷史可交易性分層":str(layer),"交易數":len(r),
-            "股票數":int(g["股票"].nunique()),
-            "勝率%":float((r>0).mean()*100),
-            "平均淨報酬%":float(r.mean()),"中位淨報酬%":float(r.median()),
-            "整體PF":pf
-        })
-
-    detail_cols=[c for c in [
-        "股票","研究主題","訊號時間","進場時間","出場時間","淨報酬%",
-        "WF成交金額","WF成交量","WF振幅","成交金額百分位","成交量百分位",
-        "振幅百分位","WF可交易分數","WF分層"
-    ] if c in x.columns]
-    return pd.DataFrame(summary),x[detail_cols].sort_values("訊號時間").reset_index(drop=True), f"成功：{x['股票'].nunique()}檔、{len(x)}筆交易完成Walk-Forward歷史可交易性配對。"
-
-
-def walkforward_layer_time_validation(wf_detail: pd.DataFrame, blocks: int = 4) -> pd.DataFrame:
-    """固定WF分層 × 連續四段時間；避免只看全期間平均後誤判股票池規則。"""
-    if wf_detail is None or wf_detail.empty:
-        return pd.DataFrame()
-    x=wf_detail.copy()
-    x["_dt"]=pd.to_datetime(x["訊號時間"],utc=True,errors="coerce")
-    x=x.dropna(subset=["_dt"]).sort_values("_dt").reset_index(drop=True)
-    if len(x)<blocks:
-        return pd.DataFrame()
-    bounds=x["_dt"].quantile(np.linspace(0,1,blocks+1)).tolist()
-    rows=[]
-    order=["低於40","40-60","60-80","80以上"]
-    for i in range(blocks):
-        lo,hi=bounds[i],bounds[i+1]
-        tm=(x["_dt"]>=lo) & ((x["_dt"]<=hi) if i==blocks-1 else (x["_dt"]<hi))
-        for layer in order:
-            g=x[tm & x["WF分層"].astype(str).eq(layer)]
-            r=pd.to_numeric(g["淨報酬%"],errors="coerce").dropna()
-            if r.empty: continue
-            gp=r[r>0].sum(); gl=-r[r<0].sum()
-            pf=np.inf if gl==0 and gp>0 else (gp/gl if gl>0 else np.nan)
-            rows.append({
-                "區段":f"時間區段{i+1}/{blocks}","開始":lo,"結束":hi,
-                "歷史可交易性分層":layer,"交易數":len(r),
-                "勝率%":float((r>0).mean()*100),
-                "平均淨報酬%":float(r.mean()),"中位淨報酬%":float(r.median()),
-                "整體PF":pf
-            })
-    return pd.DataFrame(rows)
-
-
-def build_research_radar_candidates(trades: pd.DataFrame, wf_detail: pd.DataFrame) -> pd.DataFrame:
-    """
-    V1.8.0 研究雷達候選：
-    - 核心訊號固定：60m KD黃金交叉 + K<30
-    - 不把WF可交易分數當預測報酬排名；只標示歷史可交易性層級
-    - 80以上不直接排除，因V1.7.2顯示其弱勢並非所有時間段都成立
-    - 排序優先使用訊號新鮮度與K深度；此表是研究候選，不是投資建議/自動下單
-    """
-    if trades is None or trades.empty:
-        return pd.DataFrame()
-    t=trades.copy()
-    t["_dt"]=pd.to_datetime(t["訊號時間"],utc=True,errors="coerce")
-    t=t.dropna(subset=["_dt"]).copy()
-
-    # 合併當時的WF可交易性資訊
-    if wf_detail is not None and not wf_detail.empty:
-        w=wf_detail.copy()
-        w["_dt"]=pd.to_datetime(w["訊號時間"],utc=True,errors="coerce")
-        keep=[c for c in ["股票","_dt","WF可交易分數","WF分層","WF成交金額","WF成交量","WF振幅"] if c in w.columns]
-        w=w[keep].drop_duplicates(["股票","_dt"])
-        t=t.merge(w,on=["股票","_dt"],how="left",suffixes=("","_wf"))
-
-    # K值欄位若存在，K越低只作研究排序輔助；不改核心訊號門檻K<30。
-    kval=None
-    for c in ["訊號K","K"]:
-        if c in t.columns:
-            kval=pd.to_numeric(t[c],errors="coerce")
-            break
-    if kval is None:
-        kval=pd.Series(np.nan,index=t.index)
-
-    latest=t["_dt"].max()
-    t["距最新訊號小時"]=(latest-t["_dt"]).dt.total_seconds()/3600
-    t["K深度分"]=np.where(kval.notna(),(30-kval).clip(lower=0,upper=30)/30*100,np.nan)
-    t["訊號新鮮度分"]=(100-(t["距最新訊號小時"]/24*8)).clip(lower=0,upper=100)
-
-    # 不用WF分數預測報酬；只給可交易性標籤。研究排序=新鮮度70% + K深度30%(有K時)
-    # V1.8.1 不再把「新鮮度70%＋K深度30%」當成有效預測排名。
-    # 保留兩個原始維度供使用者判讀；排序只依訊號時間由新到舊。
-    t["核心規則"]="60m KD黃金交叉 + K<30｜研究持有5日"
-    t["用途"]="研究雷達候選（非投資建議）"
-
-    cols=[c for c in [
-        "股票","研究主題","訊號時間","核心規則","WF分層","WF可交易分數",
-        "訊號新鮮度分","K深度分","用途"
-    ] if c in t.columns]
-    return t[cols].sort_values(["訊號時間","股票"],ascending=[False,True]).reset_index(drop=True)
-
-
-def validate_radar_ranking(radar: pd.DataFrame, trades: pd.DataFrame) -> pd.DataFrame:
-    """
-    V1.8.1：驗證雷達研究分數是否真的具有排序資訊。
-    以既有逐筆交易實現報酬回填，固定切成五分位；只做驗證，不自動調權重。
-    """
-    if radar is None or radar.empty or trades is None or trades.empty:
-        return pd.DataFrame()
-    r=radar.copy()
-    t=trades.copy()
-    r["_dt"]=pd.to_datetime(r["訊號時間"],utc=True,errors="coerce")
-    t["_dt"]=pd.to_datetime(t["訊號時間"],utc=True,errors="coerce")
-    keep=[c for c in ["股票","_dt","淨報酬%"] if c in t.columns]
-    x=r.merge(t[keep].drop_duplicates(["股票","_dt"]),on=["股票","_dt"],how="left")
-    x=x.dropna(subset=["雷達研究分數","淨報酬%"]).copy()
-    if len(x)<20:
-        return pd.DataFrame()
-    # rank(method=first) only resolves duplicate score edges; quintile definitions are fixed.
-    x["_rank"]=pd.to_numeric(x["雷達研究分數"],errors="coerce").rank(method="first")
-    x["雷達分數五分位"]=pd.qcut(x["_rank"],5,labels=["Q1低","Q2","Q3","Q4","Q5高"])
-    rows=[]
-    for q,g in x.groupby("雷達分數五分位",observed=True):
-        ret=pd.to_numeric(g["淨報酬%"],errors="coerce").dropna()
-        gp=ret[ret>0].sum(); gl=-ret[ret<0].sum()
-        pf=np.inf if gl==0 and gp>0 else (gp/gl if gl>0 else np.nan)
-        rows.append({
-            "雷達分數五分位":str(q),"交易數":len(ret),
-            "勝率%":float((ret>0).mean()*100),
-            "平均淨報酬%":float(ret.mean()),"中位淨報酬%":float(ret.median()),
-            "整體PF":pf
-        })
-    return pd.DataFrame(rows)
-
-
-def build_daily_radar_status(trades: pd.DataFrame, wf_detail: pd.DataFrame, observe_days: int = 5) -> pd.DataFrame:
-    """
-    V1.9.0 每日雷達狀態表。
-    固定研究主線：60m KD黃金交叉 + K<30，5個交易日觀察。
-    不建立預測性總分；只呈現訊號、時間、KD與可交易性背景。
-    """
-    if trades is None or trades.empty:
-        return pd.DataFrame()
-
-    x = trades.copy()
-    x["_dt"] = pd.to_datetime(x["訊號時間"], utc=True, errors="coerce")
-    x = x.dropna(subset=["_dt"]).copy()
-    if x.empty:
-        return pd.DataFrame()
-
-    # 合併 WF 背景
-    if wf_detail is not None and not wf_detail.empty:
-        w = wf_detail.copy()
-        w["_dt"] = pd.to_datetime(w["訊號時間"], utc=True, errors="coerce")
-        keep = [c for c in ["股票","_dt","WF可交易分數","WF分層"] if c in w.columns]
-        if "股票" in keep and "_dt" in keep:
-            w = w[keep].drop_duplicates(["股票","_dt"])
-            x = x.merge(w, on=["股票","_dt"], how="left", suffixes=("","_wf"))
-
-    # 每檔只留最新一個有效歷史訊號，避免雷達同股重複
-    x = x.sort_values("_dt").groupby("股票", as_index=False).tail(1).copy()
-    latest_signal_time = x["_dt"].max()
-    now_tw = pd.Timestamp.now(tz="Asia/Taipei")
-    now_utc = now_tw.tz_convert("UTC")
-
-    # 以工作日估算5日研究觀察窗；後續接正式交易日曆/Shioaji時再處理國定假日。
-    sig_date = x["_dt"].dt.tz_convert("Asia/Taipei").dt.date
-    x["預計觀察至"] = [pd.Timestamp(np.busday_offset(d, observe_days, roll="forward")).date() for d in sig_date]
-    current_date = now_tw.date()
-
-    # V1.9.1：狀態必須相對「現在」而不是相對「最後一筆訊號」。
-    # 新訊號暫定24小時內；觀察中則依5工作日觀察窗。
-    age_hours = (now_utc - x["_dt"]).dt.total_seconds() / 3600
-    x["距現在小時"] = age_hours.round(1)
-    x["目前狀態"] = np.where(
-        (age_hours >= 0) & (age_hours <= 24), "🟢 新訊號",
-        np.where(pd.to_datetime(x["預計觀察至"]) >= pd.Timestamp(current_date), "🟡 觀察中", "⚪ 已逾期")
-    )
-
-    kval = None
-    for c in ["訊號K","K"]:
-        if c in x.columns:
-            kval = pd.to_numeric(x[c], errors="coerce")
-            break
-    if kval is not None:
-        x["60m K值"] = kval.round(2)
-
-    x["KD狀態"] = "黃金交叉＋K<30"
-    x["訊號時間"] = x["_dt"].dt.tz_convert("Asia/Taipei").dt.strftime("%Y-%m-%d %H:%M")
-    x["核心規則"] = "60m KD黃金交叉 + K<30｜5日研究觀察"
-
-    cols = [c for c in [
-        "股票","研究主題","60m K值","KD狀態","訊號時間","距現在小時",
-        "預計觀察至","WF分層","WF可交易分數","目前狀態","核心規則"
-    ] if c in x.columns]
-
-    status_order = {"🟢 新訊號":0, "🟡 觀察中":1, "⚪ 已逾期":2}
-    x["_status_order"] = x["目前狀態"].map(status_order).fillna(9)
-    x = x.sort_values(["_status_order","_dt"], ascending=[True,False])
-    return x[cols].reset_index(drop=True)
-
-
-def scan_latest_60m_radar(symbols: List[str], ranked_pool: pd.DataFrame, period: str = "3mo",
-                            observe_days: int = 5) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    V1.10.0 真正的最新60m雷達：
-    直接掃描最新60m行情，不從歷史回測交易表反推「今天」。
-    規則固定：KD黃金交叉 + K<30。
-    回傳：(有效/近期雷達, 掃描診斷)
-    """
-    if not symbols:
-        return pd.DataFrame(), pd.DataFrame()
-
-    raw_map = download_intraday_batch(symbols, "60m", period)
-    now_tw = pd.Timestamp.now(tz="Asia/Taipei")
-    rows, diag = [], []
-
-    pool_map = {}
-    if ranked_pool is not None and not ranked_pool.empty and "股票" in ranked_pool.columns:
-        pool_map = ranked_pool.set_index("股票").to_dict("index")
-
-    for symbol in symbols:
-        d = raw_map.get(symbol, pd.DataFrame())
-        if d is None or d.empty:
-            diag.append({"股票":symbol,"狀態":"無60m資料","行情最後K棒":pd.NaT,"有效K棒數":0})
-            continue
-        x = add_indicators(d)
-        if x.empty:
-            diag.append({"股票":symbol,"狀態":"指標資料不足","行情最後K棒":pd.NaT,"有效K棒數":0})
-            continue
-
-        # 保守處理：只使用已開始至少60分鐘的bar，避免盤中未完成K棒觸發假訊號。
-        idx = pd.DatetimeIndex(x.index)
-        if idx.tz is None:
-            idx_tw = idx.tz_localize("Asia/Taipei")
-        else:
-            idx_tw = idx.tz_convert("Asia/Taipei")
-        complete = (idx_tw + pd.Timedelta(minutes=60)) <= now_tw
-        xc = x.loc[complete].copy()
-        if xc.empty:
-            diag.append({"股票":symbol,"狀態":"沒有已完成60m K棒","行情最後K棒":pd.NaT,"有效K棒數":0})
-            continue
-
-        last_bar = pd.Timestamp(xc.index[-1])
-        last_bar_tw = last_bar.tz_localize("Asia/Taipei") if last_bar.tzinfo is None else last_bar.tz_convert("Asia/Taipei")
-        mask = xc["KD_GOLD"].fillna(False) & (pd.to_numeric(xc["K"],errors="coerce") < 30)
-        sig = xc.loc[mask]
-        diag.append({
-            "股票":symbol,"狀態":"掃描完成","行情最後K棒":last_bar_tw.strftime("%Y-%m-%d %H:%M"),
-            "有效K棒數":len(xc),"目前K":float(xc["K"].iloc[-1]) if pd.notna(xc["K"].iloc[-1]) else np.nan,
-            "目前D":float(xc["D"].iloc[-1]) if pd.notna(xc["D"].iloc[-1]) else np.nan
-        })
-        if sig.empty:
-            continue
-
-        srow=sig.iloc[-1]
-        stime=pd.Timestamp(sig.index[-1])
-        stime_tw=stime.tz_localize("Asia/Taipei") if stime.tzinfo is None else stime.tz_convert("Asia/Taipei")
-        sdate=stime_tw.date()
-        observe_to=pd.Timestamp(np.busday_offset(sdate, observe_days, roll="forward")).date()
-        age_h=(now_tw-stime_tw).total_seconds()/3600
-        # 最新交易日判斷稍後依全體行情最後K棒日期統一修正；
-        # 這裡先依5工作日窗判斷觀察中/逾期，避免週末用24小時誤殺週五新訊號。
-        if pd.Timestamp(observe_to) >= pd.Timestamp(now_tw.date()):
-            status="🟡 觀察中"
-        else:
-            status="⚪ 已逾期"
-
-        pm=pool_map.get(symbol,{})
-        rows.append({
-            "股票":symbol,
-            "研究主題":research_theme(symbol),
-            "目前狀態":status,
-            "訊號時間":stime_tw.strftime("%Y-%m-%d %H:%M"),
-            "訊號K":round(float(srow["K"]),2) if pd.notna(srow["K"]) else np.nan,
-            "訊號D":round(float(srow["D"]),2) if pd.notna(srow["D"]) else np.nan,
-            "目前K":round(float(xc["K"].iloc[-1]),2) if pd.notna(xc["K"].iloc[-1]) else np.nan,
-            "目前D":round(float(xc["D"].iloc[-1]),2) if pd.notna(xc["D"].iloc[-1]) else np.nan,
-            "行情最後K棒":last_bar_tw.strftime("%Y-%m-%d %H:%M"),
-            "距訊號小時":round(age_h,1),
-            "預計觀察至":observe_to,
-            "目前短線可交易分":pm.get("短線可交易分",np.nan),
-            "核心規則":"60m KD黃金交叉 + K<30｜5日研究觀察"
-        })
-
-    radar=pd.DataFrame(rows)
-    diagnostics=pd.DataFrame(diag)
-    if radar.empty:
-        return radar, diagnostics
-
-    # V1.10.1：以本批100檔共同的「行情最後交易日」定義新訊號。
-    # 例如週日執行時，週五訊號仍應是新訊號，而不是因超過24小時被降成觀察中。
-    last_market_dates=pd.to_datetime(diagnostics["行情最後K棒"],errors="coerce").dropna()
-    if not last_market_dates.empty:
-        latest_market_date=last_market_dates.max().date()
-        sig_dates=pd.to_datetime(radar["訊號時間"],errors="coerce").dt.date
-        radar.loc[sig_dates==latest_market_date,"目前狀態"]="🟢 新訊號"
-
-    order={"🟢 新訊號":0,"🟡 觀察中":1,"⚪ 已逾期":2}
-    radar["_o"]=radar["目前狀態"].map(order).fillna(9)
-    radar=radar.sort_values(["_o","訊號時間"],ascending=[True,False]).drop(columns="_o").reset_index(drop=True)
-    return radar, diagnostics
-
-
-
-def fetch_official_tw_stock_universe():
-    """
-    V1.13.0：官方上市/上櫃公司基本資料。
-    只保留4位數字公司代號；上市加.TW、上櫃加.TWO。
-    官方來源失敗時回傳空表，由UI明確提示，不靜默冒充全市場。
-    """
-    endpoints=[
-        ("上市","https://openapi.twse.com.tw/v1/opendata/t187ap03_L",".TW"),
-        ("上櫃","https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O",".TWO"),
-    ]
-    rows=[]
-    errors=[]
-    for market,url,suffix in endpoints:
-        try:
-            req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0"})
-            with urllib.request.urlopen(req,timeout=20) as resp:
-                data=json.loads(resp.read().decode("utf-8"))
-            for item in data:
-                code=str(item.get("公司代號",item.get("SecuritiesCompanyCode",""))).strip()
-                name=str(item.get("公司簡稱",item.get("CompanyName",""))).strip()
-                industry=str(item.get("產業別",item.get("SecuritiesIndustryCode",""))).strip()
-                if len(code)==4 and code.isdigit():
-                    rows.append({"股票":code+suffix,"代號":code,"公司":name,
-                                 "市場":market,"官方產業別":industry,"官方來源":url})
-        except Exception as e:
-            errors.append(f"{market}: {e}")
-    df=pd.DataFrame(rows).drop_duplicates("股票") if rows else pd.DataFrame()
-    return df,errors
-
-
-def download_daily_batches(symbols: List[str], period: str="2mo", batch_size: int=80):
-    """分批下載日K，避免全市場一次向Yahoo請求過大。"""
-    out={}
-    syms=list(dict.fromkeys(symbols))
+            if attempt < attempts-1:
+                time.sleep(0.8*(attempt+1))
+        return {}
+
+    # 主批次
     for i in range(0,len(syms),batch_size):
         batch=syms[i:i+batch_size]
-        try:
-            raw=yf.download(tickers=batch,period=period,interval="1d",
-                            group_by="ticker",auto_adjust=False,progress=False,threads=True)
-            for s in batch:
-                try:
-                    if isinstance(raw.columns,pd.MultiIndex):
-                        if s not in raw.columns.get_level_values(0):
-                            continue
-                        d=raw[s].copy()
-                    else:
-                        if len(batch)!=1:
-                            continue
-                        d=raw.copy()
-                    d=d.dropna(subset=["Close","Volume"])
-                    if len(d):
-                        out[s]=d
-                except Exception:
-                    continue
-        except Exception:
-            continue
+        got=_fetch(batch,attempts=3)
+        out.update(got)
+
+        # 補抓主批次中缺漏者
+        missing=[s for s in batch if s not in got]
+        for j in range(0,len(missing),5):
+            sb=missing[j:j+5]
+            out.update(_fetch(sb,attempts=2))
+
     return out
-
-
 
 
 
@@ -1195,15 +162,24 @@ def build_fullmarket_walkforward_eligibility(lookback_months: int = 6, top_n: in
     if official.empty:
         return pd.DataFrame(), [], errors
 
-    dmap = download_daily_batches(official["股票"].tolist(), period=f"{lookback_months}mo", batch_size=80)
+    dmap = download_daily_batches(official["股票"].tolist(), period=f"{lookback_months}mo", batch_size=25)
     rows_by_symbol={}
     all_dates=set()
+    _wf_diag={
+        "官方股票數":len(official),
+        "日K下載成功股票數":len(dmap),
+        "至少25根日K股票數":0,
+        "建立歷史序列股票數":0,
+        "歷史交易日數":0,
+        "WalkForward資格列數":0,
+    }
 
     for _,meta in official.iterrows():
         s=meta["股票"]
         d=dmap.get(s)
         if d is None or len(d)<25:
             continue
+        _wf_diag["至少25根日K股票數"]+=1
         try:
             d=d.copy()
             d.index=pd.to_datetime(d.index,errors="coerce")
@@ -1248,6 +224,9 @@ def build_fullmarket_walkforward_eligibility(lookback_months: int = 6, top_n: in
         except Exception:
             continue
 
+    _wf_diag["建立歷史序列股票數"]=len(rows_by_symbol)
+    _wf_diag["歷史交易日數"]=len(all_dates)
+
     # 逐日做橫斷面排名，完全不用未來資料。
     elig_rows=[]
     sorted_dates=sorted(all_dates)
@@ -1283,6 +262,15 @@ def build_fullmarket_walkforward_eligibility(lookback_months: int = 6, top_n: in
         elig_rows.append(day)
 
     elig=pd.concat(elig_rows,ignore_index=True) if elig_rows else pd.DataFrame()
+    _wf_diag["WalkForward資格列數"]=len(elig)
+    if isinstance(elig,pd.DataFrame):
+        elig.attrs["wf_diag"]=_wf_diag
+
+    # 只有嚴重不足才列為錯誤；正常診斷另由暖機頁面顯示。
+    if len(dmap) < 500:
+        errors=list(errors)+[
+            f"Yahoo日K覆蓋過低：{len(dmap)}/{len(official)}，可能遇到Yahoo限流或暫時性下載失敗。"
+        ]
     union=sorted(elig.loc[elig["WalkForward候選"],"股票"].unique().tolist()) if not elig.empty else []
     return elig, union, errors
 
@@ -1402,10 +390,12 @@ def validate_top50_warmup_correction(cost: CostConfig):
     股票池、策略、成本與持有期完全相同。
     """
     elig, _, errors=build_fullmarket_walkforward_eligibility(lookback_months=6,top_n=100)
+    _diag=getattr(elig,"attrs",{}).get("wf_diag",{}) if isinstance(elig,pd.DataFrame) else {}
     if elig is None or elig.empty:
-        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors,pd.DataFrame([
-            {"檢查":"錯誤","數值":"歷史Walk-Forward資格資料為空"}
-        ])
+        _rows=[{"檢查":"錯誤","數值":"歷史Walk-Forward資格資料為空"}]
+        for k,val in _diag.items():
+            _rows.append({"檢查":k,"數值":val})
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors,pd.DataFrame(_rows)
     union=sorted(elig.loc[elig["流動性排名"]<=50,"股票"].dropna().astype(str).unique().tolist())
     if not union:
         return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors,pd.DataFrame([
@@ -1434,7 +424,8 @@ def validate_top50_warmup_correction(cost: CostConfig):
             return np.nan
         return float(df[col].isna().mean()*100)
 
-    compare=pd.DataFrame([
+    _diag_rows=[{"檢查":k,"數值":val} for k,val in _diag.items()]
+    compare=pd.DataFrame(_diag_rows+[
         {"檢查":"舊3mo原始策略交易數","數值":_old_raw_count},
         {"檢查":"6mo暖機原始策略交易數","數值":_warm_raw_count},
         {"檢查":"舊版TOP50逐筆數","數值":len(old_top)},
@@ -3219,18 +2210,18 @@ if simple_mode == "今日雷達":
     st.markdown("""<style>div[data-baseweb="tab-list"]{display:none!important;}</style>""", unsafe_allow_html=True)
 
 if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and not run:
-    st.warning("V1.16.1 的新錯誤已確認：validate_top50_warmup_correction 在「資格資料為空 / TOP50聯集為空」的早期分支只回傳4個值，但畫面固定接5個值，因而觸發 ValueError。V1.16.2 已統一所有分支固定回傳5個物件，並保留6mo分批下載與空資料診斷。")
+    st.warning("V1.16.2 已不再崩潰，但畫面顯示「歷史Walk-Forward資格資料為空」，表示真正問題在全市場6mo日K下載階段。V1.16.3 將日K改成25檔小批、關閉threads、失敗重試並對缺漏股票5檔補抓，同時把官方股票數、日K成功數、有效歷史序列數與資格列數直接顯示在資料完整度。")
 
 if run and simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證":
     st.subheader("🧰 TOP50暖機修正驗證")
     with st.spinner("同時跑舊3mo版本與6mo暖機版本，比較最後3個月結果…"):
         _wu_sum,_wu_blocks,_wu_trades,_wu_errs,_wu_check=validate_top50_warmup_correction(cost)
-    st.session_state["st_v1162_warmup"]={
+    st.session_state["st_v1163_warmup"]={
         "summary":_wu_sum,"blocks":_wu_blocks,"trades":_wu_trades,
         "check":_wu_check,"errors":_wu_errs
     }
 
-_wu=st.session_state.get("st_v1162_warmup")
+_wu=st.session_state.get("st_v1163_warmup")
 if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and _wu:
     _us=_wu.get("summary",pd.DataFrame()); _ub=_wu.get("blocks",pd.DataFrame())
     _ut=_wu.get("trades",pd.DataFrame()); _uc=_wu.get("check",pd.DataFrame()); _ue=_wu.get("errors",[])
@@ -4132,6 +3123,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.2 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.3 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
