@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.7
+黑嚕嚕－短線交易雷達 ST V1.16.8
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.7"
+APP_VERSION = "ST V1.16.8"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.7"
-EXPORT_PREFIX = "ST_V1.16.7"
+APP_VERSION = "ST_V1.16.8"
+EXPORT_PREFIX = "ST_V1.16.8"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1570,6 +1570,10 @@ def validate_top50_signal_quality(cost: CostConfig, period: str="6mo"):
     if t is None or t.empty:
         return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
 
+    # V1.16.8：將實際資料窗寫進輸出，避免UI覆蓋期間後不易察覺。
+    t["指標資料期間"]="6mo"
+    t["評估期間"]="最後3mo"
+
     _tw=_as_taipei_series(t["訊號時間"])
     t["訊號時間_台北"]=_tw.astype(str)
     t["訊號小時_台北"]=_tw.dt.hour
@@ -1615,6 +1619,24 @@ def validate_top50_signal_quality(cost: CostConfig, period: str="6mo"):
                     "交易數":len(g),**m
                 })
     summary=pd.DataFrame(rows)
+
+    # 暖機資料品質監控：三項缺值率會直接出現在摘要底部。
+    _quality_rows=[]
+    for _col,_label in [
+        ("量比20","量比20缺值率%"),
+        ("MA30斜率3","MA30斜率缺值率%"),
+        ("MA60斜率3","MA60斜率缺值率%")
+    ]:
+        _miss=float(t[_col].isna().mean()*100) if _col in t.columns and len(t) else np.nan
+        _quality_rows.append({
+            "樣本":"資料品質","診斷分類":"暖機完整度","分組":_label,
+            "股票數":int(t["股票"].nunique()) if len(t) else 0,
+            "交易數":len(t),
+            "整體交易勝率":np.nan,
+            "整體平均淨報酬":_miss,
+            "整體PF":np.nan
+        })
+    summary=pd.concat([summary,pd.DataFrame(_quality_rows)],ignore_index=True)
 
     blocks=[]
     ts=_as_taipei_series(t["訊號時間"])
@@ -3340,17 +3362,17 @@ if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and 
     st.success("四份檔案可連續下載，不需重跑。")
 
 if simple_mode=="進階研究" and research_mode=="TOP50訊號品質健診" and not run:
-    st.info("V1.16.6 已確認暖機後量比20與MA60斜率缺值率都降到0%，且第1段仍明顯虧損，所以第1段失效不是暖機缺值造成。這版改用暖機後資料重新檢查訊號品質。")
+    st.info("V1.16.7 的結果不能採用：函式雖然預設6mo暖機，但UI仍明確傳入3mo，把暖機設定覆蓋掉，因此量比20與MA60又出現缺值。V1.16.8 已移除3mo覆蓋，固定6mo暖機＋只評估最後3mo，並在輸出中直接標示資料窗與缺值率。")
 
 if run and simple_mode=="進階研究" and research_mode=="TOP50訊號品質健診":
     st.subheader("🔬 TOP50訊號品質健診")
     with st.spinner("重建真正Walk-Forward TOP50交易，檢查K深度、量比20、MA30/60方向與60m時段…"):
-        _sq_sum,_sq_blocks,_sq_trades,_sq_errs=validate_top50_signal_quality(cost,period="3mo")
-    st.session_state["st_v1151_signal_quality"]={
+        _sq_sum,_sq_blocks,_sq_trades,_sq_errs=validate_top50_signal_quality(cost)
+    st.session_state["st_v1168_signal_quality"]={
         "summary":_sq_sum,"blocks":_sq_blocks,"trades":_sq_trades,"errors":_sq_errs
     }
 
-_sq=st.session_state.get("st_v1151_signal_quality")
+_sq=st.session_state.get("st_v1168_signal_quality")
 if simple_mode=="進階研究" and research_mode=="TOP50訊號品質健診" and _sq:
     _qs=_sq.get("summary",pd.DataFrame()); _qb=_sq.get("blocks",pd.DataFrame())
     _qt=_sq.get("trades",pd.DataFrame()); _qe=_sq.get("errors",[])
@@ -4212,6 +4234,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.7 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.8 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
