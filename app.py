@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.11
+黑嚕嚕－短線交易雷達 ST V1.16.12
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.11"
+APP_VERSION = "ST V1.16.12"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.11"
-EXPORT_PREFIX = "ST_V1.16.11"
+APP_VERSION = "ST_V1.16.12"
+EXPORT_PREFIX = "ST_V1.16.12"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1546,6 +1546,92 @@ def validate_top50_warmup_correction(cost: CostConfig):
 
 
 
+
+def validate_top50_signal_grades(cost: CostConfig):
+    """
+    V1.16.12 訊號等級驗證：
+    固定真正Walk-Forward TOP50 + 6mo暖機/末3mo評估 + 核心策略。
+    不硬砍訊號，改成三層品質標籤：
+      S級：量比20>=1.5 且 MA60未向上
+      A級：兩者只符合一項
+      B級：兩者皆不符合
+    驗證重點：等級是否在全部/樣本外/四段時間呈現合理品質差異。
+    """
+    elig, _, errors = build_fullmarket_walkforward_eligibility(lookback_months=6, top_n=100)
+    if elig is None or elig.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    union=sorted(elig.loc[elig["流動性排名"]<=50,"股票"].dropna().astype(str).unique().tolist())
+    if not union:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    _,_,trades=run_oos_60m_5d(
+        union,cost,"6mo",allow_overlap=False,train_ratio=0.60,evaluation_months=3
+    )
+    if trades is None or trades.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    t=_filter_historical_top50(trades,elig)
+    if t is None or t.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    vr=pd.to_numeric(t.get("量比20"),errors="coerce")
+    ma60=pd.to_numeric(t.get("MA60斜率3"),errors="coerce")
+    t["量比Gate"]=vr>=1.5
+    t["MA60Gate"]=ma60<=0
+
+    def _grade(r):
+        a=bool(r["量比Gate"]); b=bool(r["MA60Gate"])
+        if a and b:
+            return "S級_量比+MA60"
+        if a or b:
+            return "A級_符合一項"
+        return "B級_基準"
+    t["訊號等級"]=t.apply(_grade,axis=1)
+    t["訊號時間_台北"]=_as_taipei_series(t["訊號時間"]).astype(str)
+    t["指標資料期間"]="6mo"
+    t["評估期間"]="最後3mo"
+
+    grades=["S級_量比+MA60","A級_符合一項","B級_基準"]
+    rows=[]
+    for sample in ["全部","樣本內60%","樣本外40%"]:
+        xs=t if sample=="全部" else t[t["樣本"]==sample]
+        for grade in grades:
+            g=xs[xs["訊號等級"]==grade]
+            m=aggregate_trade_metrics(g)
+            rows.append({
+                "樣本":sample,"訊號等級":grade,
+                "股票數":int(g["股票"].nunique()) if len(g) else 0,
+                "交易數":len(g),
+                "交易占比%":float(len(g)/len(xs)*100) if len(xs) else np.nan,
+                **m
+            })
+    summary=pd.DataFrame(rows)
+
+    blocks=[]
+    ts=_as_taipei_series(t["訊號時間"])
+    ok=ts.notna()
+    z=t.loc[ok].copy(); ts=ts.loc[ok]
+    if len(z):
+        edges=pd.date_range(ts.min(),ts.max(),periods=5)
+        labels=["第1段","第2段","第3段","第4段"]
+        z["時間段"]=pd.cut(ts,bins=edges,labels=labels,include_lowest=True,right=True)
+        for block in labels:
+            q=z[z["時間段"]==block]
+            for grade in grades:
+                g=q[q["訊號等級"]==grade]
+                m=aggregate_trade_metrics(g)
+                blocks.append({
+                    "時間段":block,
+                    "起始":str(edges[labels.index(block)]),
+                    "結束":str(edges[labels.index(block)+1]),
+                    "訊號等級":grade,
+                    "股票數":int(g["股票"].nunique()) if len(g) else 0,
+                    "交易數":len(g),
+                    "交易占比%":float(len(g)/len(q)*100) if len(q) else np.nan,
+                    **m
+                })
+    return summary,pd.DataFrame(blocks),t,errors
 def validate_top50_gate_decomposition(cost: CostConfig):
     """
     V1.16.11 Gate拆解驗證：
@@ -3423,7 +3509,7 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
+                ["TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
             if research_mode == "TOP50暖機修正驗證":
                 st.caption("比較舊3mo直接計算 vs 6mo指標暖機後只評估最後3mo；同時修正訊號時間誤當UTC的問題。")
             elif research_mode == "TOP50訊號品質健診":
@@ -3478,6 +3564,7 @@ with st.sidebar:
         _btn_label="🔄 更新今日雷達"
     else:
         _btn_label={
+            "TOP50訊號等級驗證":"🏷️ 驗證TOP50訊號S/A/B等級",
             "TOP50Gate拆解驗證":"🧬 執行TOP50 Gate拆解",
             "TOP50候選Gate驗證":"🧪 執行TOP50候選Gate A/B",
             "TOP50暖機修正驗證":"🧰 執行TOP50暖機修正驗證",
@@ -3537,6 +3624,41 @@ if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and 
     st.download_button("⬇️ 下載【TOP50暖機資料完整度】",_uc.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"{APP_VERSION}_TOP50暖機資料完整度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
     st.success("四份檔案可連續下載，不需重跑。")
+
+if simple_mode=="進階研究" and research_mode=="TOP50訊號等級驗證" and not run:
+    st.info("V1.16.11 顯示：兩者同時符合的D組品質最高，但樣本較少；只有MA60與只有量比的效果不同且量比單獨樣本很小。這版不再做硬Gate，而是驗證S/A/B訊號等級是否適合實際雷達。")
+
+if run and simple_mode=="進階研究" and research_mode=="TOP50訊號等級驗證":
+    st.subheader("🏷️ TOP50訊號S/A/B等級驗證")
+    with st.spinner("重建6mo暖機、末3mo評估的TOP50交易並驗證訊號等級…"):
+        _gr_sum,_gr_blocks,_gr_trades,_gr_errs=validate_top50_signal_grades(cost)
+    st.session_state["st_v11612_grades"]={
+        "summary":_gr_sum,"blocks":_gr_blocks,"trades":_gr_trades,"errors":_gr_errs
+    }
+
+_gr=st.session_state.get("st_v11612_grades")
+if simple_mode=="進階研究" and research_mode=="TOP50訊號等級驗證" and _gr:
+    _rs=_gr.get("summary",pd.DataFrame()); _rb=_gr.get("blocks",pd.DataFrame())
+    _rt=_gr.get("trades",pd.DataFrame()); _re=_gr.get("errors",[])
+    st.subheader("🏷️ TOP50訊號等級驗證結果")
+    if _re:
+        st.warning("資料來源異常："+"；".join(_re))
+    st.info("S級=量比>=1.5且MA60未向上；A級=只符合其中一項；B級=兩者皆否。這版只驗證等級，不改進出場規則。")
+    if not _rs.empty:
+        st.markdown("#### 全部 / 樣本內 / 樣本外")
+        st.dataframe(_rs.round(3),use_container_width=True,hide_index=True)
+    if not _rb.empty:
+        st.markdown("#### 四段時間穩定度")
+        st.dataframe(_rb.round(3),use_container_width=True,hide_index=True)
+    with st.expander("查看等級逐筆交易"):
+        st.dataframe(_rt.round(3),use_container_width=True,hide_index=True)
+    st.download_button("⬇️ 下載【TOP50訊號等級驗證摘要】",_rs.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_TOP50訊號等級驗證摘要.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【TOP50訊號等級四段穩定度】",_rb.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_TOP50訊號等級四段穩定度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【TOP50訊號等級逐筆交易】",_rt.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_TOP50訊號等級逐筆交易.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.success("三份檔案可連續下載，不需重跑。")
 
 if simple_mode=="進階研究" and research_mode=="TOP50Gate拆解驗證" and not run:
     st.info("V1.16.10 顯示量比>=1.5與MA60未向上都可能有增益，但B/C/D彼此重疊。這一版改成四個互斥組別，確認量比與MA60各自帶來多少獨立資訊。")
@@ -3941,6 +4063,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 單股總�
 # V1.16.10：所有「上方已有獨立執行流程」的研究模式集中管理。
 # 後續新增研究模式時只要加入此集合，就不會再掉進舊版共用流程而引用未定義的 summary。
 INDEPENDENT_RESEARCH_MODES = {
+    "TOP50訊號等級驗證",
     "TOP50Gate拆解驗證",
     "TOP50候選Gate驗證",
     "TOP50訊號品質健診",
@@ -4503,6 +4626,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.11 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.12 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
