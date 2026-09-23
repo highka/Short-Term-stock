@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.15
+黑嚕嚕－短線交易雷達 ST V1.16.16
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.15"
+APP_VERSION = "ST V1.16.16"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.15"
-EXPORT_PREFIX = "ST_V1.16.15"
+APP_VERSION = "ST_V1.16.16"
+EXPORT_PREFIX = "ST_V1.16.16"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1095,9 +1095,31 @@ def scan_latest_60m_radar(symbols: List[str], ranked_pool: pd.DataFrame, period:
             status="⚪ 已逾期"
 
         pm=pool_map.get(symbol,{})
+        _vr=float(srow["VOL_RATIO20"]) if "VOL_RATIO20" in srow.index and pd.notna(srow["VOL_RATIO20"]) else np.nan
+        _ma60=float(srow["MA60_SLOPE3"]) if "MA60_SLOPE3" in srow.index and pd.notna(srow["MA60_SLOPE3"]) else np.nan
+        _g1=pd.notna(_vr) and _vr>=1.5
+        _g2=pd.notna(_ma60) and _ma60<=0
+        _grade="S級" if (_g1 and _g2) else ("A級" if (_g1 or _g2) else "B級")
+        _rank=pd.to_numeric(pd.Series([pm.get("流動性排名",np.nan)]),errors="coerce").iloc[0]
+        if pd.notna(_rank) and _rank<=50:
+            _layer="核心_TOP1-50"
+        elif pd.notna(_rank) and _rank<=100:
+            _layer="觀察_TOP51-100"
+        elif pd.notna(_rank) and _rank<=150:
+            _layer="擴充_TOP101-150"
+        else:
+            _layer=pm.get("股票池層級","")
+
         rows.append({
             "股票":symbol,
+            "公司":pm.get("公司",""),
+            "市場":pm.get("市場",""),
             "研究主題":research_theme(symbol),
+            "流動性排名":_rank,
+            "股票池層級":_layer,
+            "訊號等級":_grade,
+            "量比20":round(_vr,3) if pd.notna(_vr) else np.nan,
+            "MA60斜率3":round(_ma60,3) if pd.notna(_ma60) else np.nan,
             "目前狀態":status,
             "訊號時間":stime_tw.strftime("%Y-%m-%d %H:%M"),
             "訊號K":round(float(srow["K"]),2) if pd.notna(srow["K"]) else np.nan,
@@ -1126,7 +1148,10 @@ def scan_latest_60m_radar(symbols: List[str], ranked_pool: pd.DataFrame, period:
 
     order={"🟢 新訊號":0,"🟡 觀察中":1,"⚪ 已逾期":2}
     radar["_o"]=radar["目前狀態"].map(order).fillna(9)
-    radar=radar.sort_values(["_o","訊號時間"],ascending=[True,False]).drop(columns="_o").reset_index(drop=True)
+    _grade_order={"S級":0,"A級":1,"B級":2}
+    radar["_g"]=radar.get("訊號等級",pd.Series(index=radar.index,dtype=str)).map(_grade_order).fillna(9)
+    radar=radar.sort_values(["_o","_g","流動性排名","訊號時間"],
+                            ascending=[True,True,True,False]).drop(columns=["_o","_g"]).reset_index(drop=True)
     return radar, diagnostics
 
 
@@ -1236,6 +1261,119 @@ def download_daily_batches(symbols: List[str], period: str="2mo", batch_size: in
 
 
 
+
+
+
+@st.cache_data(ttl=1800, max_entries=2, show_spinner=False)
+def build_current_formal_radar_pool(max_rank: int = 150):
+    """
+    V1.16.16 正式今日雷達股票池：
+    - 母池：官方上市+上櫃完整公司名單。
+    - 只用「今天以前」已完成日K，避免盤中日K不完整造成排名前視。
+    - 以最近20個完成交易日的成交金額中位數做全市場流動性排名。
+    - 正式掃描到TOP150：
+        TOP1-50 核心
+        TOP51-100 觀察
+        TOP101-150 擴充（只有S級訊號才進正式雷達）
+    """
+    official, errors=fetch_official_tw_stock_universe()
+    if official is None or official.empty:
+        return pd.DataFrame(),pd.DataFrame(),errors
+
+    dmap=download_daily_batches(official["股票"].tolist(),period="2mo",batch_size=25)
+    today_tw=pd.Timestamp.now(tz="Asia/Taipei").date()
+    rows=[]
+    for _,meta in official.iterrows():
+        s=meta["股票"]
+        d=dmap.get(s)
+        if d is None or d.empty:
+            continue
+        try:
+            x=d.copy()
+            x.index=pd.to_datetime(x.index,errors="coerce")
+            x=x[x.index.notna()]
+            # 永遠排除今天這根日K，只用前一完成交易日以前資料。
+            x=x[pd.Index([pd.Timestamp(i).date() for i in x.index]) < today_tw]
+            x=x.dropna(subset=["Close","Volume"]).tail(20)
+            if len(x)<20:
+                continue
+            close=pd.to_numeric(x["Close"],errors="coerce")
+            vol=pd.to_numeric(x["Volume"],errors="coerce")
+            turn=(close*vol).replace([np.inf,-np.inf],np.nan)
+            med=float(turn.median()) if turn.notna().any() else np.nan
+            if not np.isfinite(med):
+                continue
+            rows.append({
+                "股票":s,
+                "公司":meta.get("公司",""),
+                "市場":meta.get("市場",""),
+                "官方產業別":meta.get("官方產業別",""),
+                "20日成交金額中位數":med,
+                "排名基準完成日":pd.Timestamp(x.index[-1]).date(),
+            })
+        except Exception:
+            continue
+
+    pool=pd.DataFrame(rows)
+    if pool.empty:
+        diag=pd.DataFrame([{
+            "官方股票數":len(official),"日K成功股票數":len(dmap),
+            "可排名股票數":0,"正式掃描股票數":0
+        }])
+        return pool,diag,errors
+
+    pool=pool.sort_values(["20日成交金額中位數","股票"],ascending=[False,True]).reset_index(drop=True)
+    pool["流動性排名"]=np.arange(1,len(pool)+1)
+    pool["股票池層級"]=np.select(
+        [pool["流動性排名"]<=50,pool["流動性排名"]<=100,pool["流動性排名"]<=150],
+        ["核心_TOP1-50","觀察_TOP51-100","擴充_TOP101-150"],
+        default="池外"
+    )
+    selected=pool[pool["流動性排名"]<=int(max_rank)].copy()
+
+    diag=pd.DataFrame([{
+        "官方股票數":len(official),
+        "日K成功股票數":len(dmap),
+        "可排名股票數":len(pool),
+        "正式掃描股票數":len(selected),
+        "核心_TOP1-50":int((selected["流動性排名"]<=50).sum()),
+        "觀察_TOP51-100":int(((selected["流動性排名"]>50)&(selected["流動性排名"]<=100)).sum()),
+        "擴充_TOP101-150":int(((selected["流動性排名"]>100)&(selected["流動性排名"]<=150)).sum()),
+        "最新排名基準日":str(selected["排名基準完成日"].max()) if len(selected) else "",
+    }])
+    return selected.reset_index(drop=True),diag,errors
+
+
+def build_formal_daily_radar(cost: CostConfig):
+    """
+    V1.16.16 正式今日雷達：
+    採 V1.16.15 驗證後的 C 架構：
+      TOP1-100：保留全部核心KD訊號
+      TOP101-150：只保留S級（量比20>=1.5 且 MA60未向上）
+    """
+    pool,pool_diag,errors=build_current_formal_radar_pool(max_rank=150)
+    if pool is None or pool.empty:
+        return pd.DataFrame(),pd.DataFrame(),pool_diag,pool,errors
+
+    symbols=pool["股票"].tolist()
+    radar,scan_diag=scan_latest_60m_radar(symbols,pool,period="60d",observe_days=5)
+    if radar is None or radar.empty:
+        return pd.DataFrame(),scan_diag,pool_diag,pool,errors
+
+    rank=pd.to_numeric(radar["流動性排名"],errors="coerce")
+    formal=(rank<=100)|((rank>100)&(rank<=150)&(radar["訊號等級"]=="S級"))
+    radar["正式雷達納入"]=np.where(formal,"是","否")
+    radar=radar[formal].copy()
+
+    layer_order={"核心_TOP1-50":0,"觀察_TOP51-100":1,"擴充_TOP101-150":2}
+    grade_order={"S級":0,"A級":1,"B級":2}
+    status_order={"🟢 新訊號":0,"🟡 觀察中":1,"⚪ 已逾期":2}
+    radar["_s"]=radar["目前狀態"].map(status_order).fillna(9)
+    radar["_g"]=radar["訊號等級"].map(grade_order).fillna(9)
+    radar["_l"]=radar["股票池層級"].map(layer_order).fillna(9)
+    radar=radar.sort_values(["_s","_g","_l","流動性排名","訊號時間"],
+                            ascending=[True,True,True,True,False]).drop(columns=["_s","_g","_l"])
+    return radar.reset_index(drop=True),scan_diag,pool_diag,pool,errors
 
 
 def build_fullmarket_walkforward_eligibility(lookback_months: int = 6, top_n: int = 100):
@@ -3809,8 +3947,8 @@ def plot_chart(d: pd.DataFrame, interval: str):
 
 
 st.title(f"⚡ {APP_NAME}")
-st.caption(f"{APP_VERSION}｜今日60m短線雷達｜核心：KD黃金交叉 + K<30")
-st.info("主畫面只保留每天會看的雷達；研究參數與成本設定收進進階區，減少操作干擾。")
+st.caption(f"{APP_VERSION}｜全市場動態雷達｜TOP1-100核心/觀察 + TOP101-150 S級擴充｜60m KD黃金交叉 + K<30")
+st.info("正式股票池已不再使用人工母池：每天由官方上市/上櫃全市場，以前20個完成交易日流動性動態建立TOP150，再依驗證後架構顯示訊號。")
 
 with st.sidebar:
     st.header("⚡ 今日雷達")
@@ -4528,7 +4666,15 @@ if run:
         st.error("請至少選擇一個K棒週期、進場規則與持有方式。")
         st.stop()
 
-    if research_mode in INDEPENDENT_RESEARCH_MODES:
+    if simple_mode=="今日雷達":
+        with st.spinner("建立官方上市/上櫃動態股票池並掃描最新60m訊號…"):
+            _dr,_dd,_pd,_pp,_pe=build_formal_daily_radar(cost)
+        st.session_state["st_v11616_daily"]={
+            "radar":_dr,"scan_diag":_dd,"pool_diag":_pd,"pool":_pp,"errors":_pe
+        }
+        # 今日雷達使用獨立正式流程，不再進入舊版人工母池/OOS流程。
+        summary, data_map, trade_map = pd.DataFrame(), {}, {}
+    elif research_mode in INDEPENDENT_RESEARCH_MODES:
         # 獨立研究模式已在上方完成；此處不再進入舊版策略流程。
         pass
     elif research_mode == "60m五日OOS驗證":
@@ -4657,6 +4803,61 @@ if run:
         "data_map": data_map if isinstance(data_map,dict) else {},
         "trade_map": trade_map if isinstance(trade_map,dict) else {},
     }
+
+
+_daily=st.session_state.get("st_v11616_daily")
+if simple_mode=="今日雷達":
+    st.markdown("## 📡 今日60m正式雷達")
+    st.caption("正式架構：TOP1-100保留全部核心KD訊號；TOP101-150只有S級訊號進雷達。股票池每天依前20個已完成交易日成交金額重新排名。")
+    if _daily:
+        _dr=_daily.get("radar",pd.DataFrame())
+        _dd=_daily.get("scan_diag",pd.DataFrame())
+        _pd=_daily.get("pool_diag",pd.DataFrame())
+        _pp=_daily.get("pool",pd.DataFrame())
+        _pe=_daily.get("errors",[])
+        if _pe:
+            st.warning("資料來源異常："+"；".join(_pe))
+        if not _pd.empty:
+            d0=_pd.iloc[0]
+            c1,c2,c3,c4=st.columns(4)
+            c1.metric("官方母池",int(d0.get("官方股票數",0)))
+            c2.metric("可排名",int(d0.get("可排名股票數",0)))
+            c3.metric("60m掃描",int(d0.get("正式掃描股票數",0)))
+            c4.metric("正式訊號",len(_dr))
+            st.caption(f"日K排名基準完成日：{d0.get('最新排名基準日','')}｜掃描範圍：核心50＋觀察50＋擴充50")
+        if _dr.empty:
+            st.info("本次TOP150最新60m掃描沒有符合正式雷達架構的近期訊號。可查看診斷確認150檔是否正常完成掃描。")
+        else:
+            _active=_dr[_dr["目前狀態"].isin(["🟢 新訊號","🟡 觀察中"])]
+            _show=_active if not _active.empty else _dr.head(30)
+            _cols=[c for c in [
+                "股票","公司","市場","流動性排名","股票池層級","訊號等級",
+                "目前狀態","訊號時間","訊號K","量比20","MA60斜率3",
+                "目前K","目前D","預計觀察至"
+            ] if c in _show.columns]
+            st.dataframe(_show[_cols],use_container_width=True,hide_index=True)
+            st.download_button("⬇️ 下載【今日60m正式雷達】",
+                               _dr.to_csv(index=False).encode("utf-8-sig"),
+                               file_name=f"{APP_VERSION}_今日60m正式雷達.csv",
+                               mime="text/csv",use_container_width=True,on_click="ignore")
+        if not _pp.empty:
+            st.download_button("⬇️ 下載【今日正式股票池】",
+                               _pp.to_csv(index=False).encode("utf-8-sig"),
+                               file_name=f"{APP_VERSION}_今日正式股票池.csv",
+                               mime="text/csv",use_container_width=True,on_click="ignore")
+        with st.expander("🔧 今日雷達掃描診斷"):
+            if not _pd.empty:
+                st.dataframe(_pd,use_container_width=True,hide_index=True)
+            if not _dd.empty:
+                _ok=int((_dd["狀態"]=="掃描完成").sum()) if "狀態" in _dd.columns else 0
+                st.caption(f"60m成功掃描：{_ok}/{len(_dd)}")
+                st.dataframe(_dd,use_container_width=True,hide_index=True)
+                st.download_button("⬇️ 下載【今日60m掃描診斷】",
+                                   _dd.to_csv(index=False).encode("utf-8-sig"),
+                                   file_name=f"{APP_VERSION}_今日60m掃描診斷.csv",
+                                   mime="text/csv",use_container_width=True,on_click="ignore")
+    else:
+        st.info("按左側「🔄 更新今日雷達」後，會先從官方上市/上櫃母池建立當日動態排名，再掃描最新60m訊號。")
 
 oos_state = st.session_state.get("st_v1120_oos")
 if research_mode == "60m五日OOS驗證" and oos_state:
@@ -5065,6 +5266,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.15 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.16 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
