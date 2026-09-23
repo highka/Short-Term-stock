@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.14
+黑嚕嚕－短線交易雷達 ST V1.16.15
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.14"
+APP_VERSION = "ST V1.16.15"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.14"
-EXPORT_PREFIX = "ST_V1.16.14"
+APP_VERSION = "ST_V1.16.15"
+EXPORT_PREFIX = "ST_V1.16.15"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1548,6 +1548,136 @@ def validate_top50_warmup_correction(cost: CostConfig):
 
 
 
+
+def validate_radar_architectures(cost: CostConfig):
+    """
+    V1.16.15 雷達架構驗證：
+    固定真正Walk-Forward + 6mo暖機/末3mo評估 + 核心策略，
+    比較不同「廣度 vs 品質」雷達架構。
+
+    A 核心50：TOP1-50全部訊號
+    B 核心+觀察100：TOP1-100全部訊號
+    C 100 + 擴充S：TOP1-100全部 + TOP101-150僅S級
+    D 100 + 外圍S：TOP1-100全部 + TOP101-200僅S級
+    E 全TOP150：TOP1-150全部訊號（廣度對照）
+    F 全TOP200：TOP1-200全部訊號（最大廣度對照）
+
+    S級定義沿用既有驗證：量比20>=1.5 且 MA60斜率3<=0。
+    """
+    elig, _, errors = build_fullmarket_walkforward_eligibility(lookback_months=6, top_n=100)
+    if elig is None or elig.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    union=sorted(
+        elig.loc[elig["流動性排名"]<=200,"股票"].dropna().astype(str).unique().tolist()
+    )
+    if not union:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    _,_,trades=run_oos_60m_5d(
+        union,cost,"6mo",allow_overlap=False,train_ratio=0.60,evaluation_months=3
+    )
+    if trades is None or trades.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    t=trades.copy()
+    t["訊號日期"]=_as_taipei_series(t["訊號時間"]).dt.date
+
+    ranks=[]; basedates=[]
+    for _,r in t.iterrows():
+        q=elig[(elig["股票"]==r["股票"])&(elig["基準完成日"]<r["訊號日期"])]
+        if q.empty:
+            ranks.append(np.nan); basedates.append(None)
+        else:
+            z=q.sort_values("基準完成日").iloc[-1]
+            ranks.append(float(z["流動性排名"]))
+            basedates.append(z["基準完成日"])
+    t["WF流動性排名"]=ranks
+    t["WF股票池基準日"]=basedates
+    t=t[t["WF流動性排名"].notna() & (t["WF流動性排名"]<=200)].copy()
+
+    vr=pd.to_numeric(t.get("量比20"),errors="coerce")
+    ma60=pd.to_numeric(t.get("MA60斜率3"),errors="coerce")
+    t["S級"]=(vr>=1.5)&(ma60<=0)
+    t["訊號時間_台北"]=_as_taipei_series(t["訊號時間"]).astype(str)
+
+    def mask_arch(name,df):
+        r=df["WF流動性排名"]
+        s=df["S級"]
+        if name=="A_核心50":
+            return r<=50
+        if name=="B_核心+觀察100":
+            return r<=100
+        if name=="C_TOP100+101-150僅S":
+            return (r<=100)|((r>100)&(r<=150)&s)
+        if name=="D_TOP100+101-200僅S":
+            return (r<=100)|((r>100)&(r<=200)&s)
+        if name=="E_全TOP150":
+            return r<=150
+        return r<=200
+
+    archs=[
+        "A_核心50",
+        "B_核心+觀察100",
+        "C_TOP100+101-150僅S",
+        "D_TOP100+101-200僅S",
+        "E_全TOP150",
+        "F_全TOP200",
+    ]
+
+    rows=[]
+    total_all=len(t)
+    for sample in ["全部","樣本內60%","樣本外40%"]:
+        xs=t if sample=="全部" else t[t["樣本"]==sample]
+        for name in archs:
+            mask=mask_arch(name,xs)
+            g=xs[mask]
+            m=aggregate_trade_metrics(g)
+            rows.append({
+                "樣本":sample,"雷達架構":name,
+                "股票數":int(g["股票"].nunique()) if len(g) else 0,
+                "交易數":len(g),
+                "相對TOP200訊號涵蓋率%":float(len(g)/len(xs)*100) if len(xs) else np.nan,
+                "S級交易數":int(g["S級"].sum()) if len(g) else 0,
+                **m
+            })
+    summary=pd.DataFrame(rows)
+
+    # 四段時間穩定度
+    blocks=[]
+    ts=_as_taipei_series(t["訊號時間"])
+    ok=ts.notna()
+    z=t.loc[ok].copy(); ts=ts.loc[ok]
+    if len(z):
+        edges=pd.date_range(ts.min(),ts.max(),periods=5)
+        labels=["第1段","第2段","第3段","第4段"]
+        z["時間段"]=pd.cut(ts,bins=edges,labels=labels,include_lowest=True,right=True)
+        for block in labels:
+            q=z[z["時間段"]==block]
+            for name in archs:
+                g=q[mask_arch(name,q)]
+                m=aggregate_trade_metrics(g)
+                blocks.append({
+                    "時間段":block,
+                    "起始":str(edges[labels.index(block)]),
+                    "結束":str(edges[labels.index(block)+1]),
+                    "雷達架構":name,
+                    "股票數":int(g["股票"].nunique()) if len(g) else 0,
+                    "交易數":len(g),
+                    "相對該段TOP200訊號涵蓋率%":float(len(g)/len(q)*100) if len(q) else np.nan,
+                    **m
+                })
+
+    # 各架構新增訊號來源，方便理解廣度增加從哪裡來
+    detail=t.copy()
+    detail["A_核心50"]=mask_arch("A_核心50",detail)
+    detail["B_核心+觀察100"]=mask_arch("B_核心+觀察100",detail)
+    detail["C_TOP100+101-150僅S"]=mask_arch("C_TOP100+101-150僅S",detail)
+    detail["D_TOP100+101-200僅S"]=mask_arch("D_TOP100+101-200僅S",detail)
+    detail["E_全TOP150"]=mask_arch("E_全TOP150",detail)
+    detail["F_全TOP200"]=mask_arch("F_全TOP200",detail)
+
+    return summary,pd.DataFrame(blocks),detail,errors
 def validate_pool_band_layers(cost: CostConfig):
     """
     V1.16.14 股票池分層驗證：
@@ -3707,7 +3837,7 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
+                ["雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
             if research_mode == "TOP50暖機修正驗證":
                 st.caption("比較舊3mo直接計算 vs 6mo指標暖機後只評估最後3mo；同時修正訊號時間誤當UTC的問題。")
             elif research_mode == "TOP50訊號品質健診":
@@ -3762,6 +3892,7 @@ with st.sidebar:
         _btn_label="🔄 更新今日雷達"
     else:
         _btn_label={
+            "雷達架構驗證":"🛰️ 驗證正式雷達架構",
             "股票池分層驗證":"🧱 執行股票池分層驗證",
             "股票池覆蓋健診":"🌐 執行股票池覆蓋健診",
             "TOP50訊號等級驗證":"🏷️ 驗證TOP50訊號S/A/B等級",
@@ -3824,6 +3955,42 @@ if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and 
     st.download_button("⬇️ 下載【TOP50暖機資料完整度】",_uc.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"{APP_VERSION}_TOP50暖機資料完整度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
     st.success("四份檔案可連續下載，不需重跑。")
+
+if simple_mode=="進階研究" and research_mode=="雷達架構驗證" and not run:
+    st.info("V1.16.14 顯示TOP51-100仍有穩定正向價值、TOP101-150品質較弱但S級仍強、TOP151-200整體已接近無優勢。這版直接驗證幾種可落地的正式雷達架構。")
+
+if run and simple_mode=="進階研究" and research_mode=="雷達架構驗證":
+    st.subheader("🛰️ 正式雷達架構驗證")
+    with st.spinner("重建TOP200 Walk-Forward交易並比較核心/觀察/S級擴充架構…"):
+        _ra_sum,_ra_blocks,_ra_detail,_ra_errs=validate_radar_architectures(cost)
+    st.session_state["st_v11615_radar_arch"]={
+        "summary":_ra_sum,"blocks":_ra_blocks,"detail":_ra_detail,"errors":_ra_errs
+    }
+
+_ra=st.session_state.get("st_v11615_radar_arch")
+if simple_mode=="進階研究" and research_mode=="雷達架構驗證" and _ra:
+    _as=_ra.get("summary",pd.DataFrame()); _ab=_ra.get("blocks",pd.DataFrame())
+    _ad=_ra.get("detail",pd.DataFrame()); _ae=_ra.get("errors",[])
+    st.subheader("🛰️ 雷達架構驗證結果")
+    if _ae:
+        st.warning("資料來源異常："+"；".join(_ae))
+    st.info("比較重點不是只看最高報酬，而是同時看樣本外PF、四段穩定度與相對TOP200的訊號涵蓋率。")
+    if not _as.empty:
+        st.markdown("#### 全部 / 樣本內 / 樣本外")
+        st.dataframe(_as.round(3),use_container_width=True,hide_index=True)
+    if not _ab.empty:
+        st.markdown("#### 四段時間穩定度")
+        st.dataframe(_ab.round(3),use_container_width=True,hide_index=True)
+    with st.expander("查看各架構逐筆納入狀態"):
+        st.dataframe(_ad.round(3),use_container_width=True,hide_index=True)
+
+    st.download_button("⬇️ 下載【雷達架構驗證摘要】",_as.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_雷達架構驗證摘要.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【雷達架構四段穩定度】",_ab.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_雷達架構四段穩定度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【雷達架構逐筆明細】",_ad.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_雷達架構逐筆明細.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.success("三份檔案可連續下載，不需重跑。")
 
 if simple_mode=="進階研究" and research_mode=="股票池分層驗證" and not run:
     st.info("V1.16.13 已確認母池夠廣，但TOP50只涵蓋約四分之一的TOP200核心策略交易。這一版不直接把池擴大，而是把TOP200拆成四個互斥層級，確認哪些層值得進正式雷達。")
@@ -4332,6 +4499,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 單股總�
 # V1.16.10：所有「上方已有獨立執行流程」的研究模式集中管理。
 # 後續新增研究模式時只要加入此集合，就不會再掉進舊版共用流程而引用未定義的 summary。
 INDEPENDENT_RESEARCH_MODES = {
+    "雷達架構驗證",
     "股票池分層驗證",
     "股票池覆蓋健診",
     "TOP50訊號等級驗證",
@@ -4897,6 +5065,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.14 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.15 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
