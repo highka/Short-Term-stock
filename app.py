@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.21
+黑嚕嚕－短線交易雷達 ST V1.16.22
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.21"
+APP_VERSION = "ST V1.16.22"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.21"
-EXPORT_PREFIX = "ST_V1.16.21"
+APP_VERSION = "ST_V1.16.22"
+EXPORT_PREFIX = "ST_V1.16.22"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1344,31 +1344,133 @@ def build_current_formal_radar_pool(max_rank: int = 150):
     return selected.reset_index(drop=True),diag,errors
 
 
+
+@st.cache_data(ttl=1800, max_entries=2, show_spinner=False)
+def build_current_market_breadth(top200_pool: pd.DataFrame):
+    """
+    V1.16.22 今日市場環境：
+    使用今天以前已完成日K，針對目前流動性TOP200計算市場廣度。
+    僅作風險提示，不直接過濾今日雷達訊號。
+    """
+    if top200_pool is None or top200_pool.empty:
+        return pd.DataFrame(), ["TOP200股票池為空，無法計算市場廣度。"]
+
+    symbols=top200_pool.loc[top200_pool["流動性排名"]<=200,"股票"].astype(str).tolist()
+    if not symbols:
+        return pd.DataFrame(), ["TOP200股票清單為空。"]
+
+    dmap=download_daily_batches(symbols,period="1y",batch_size=25)
+    today_tw=pd.Timestamp.now(tz="Asia/Taipei").date()
+    rec=[]
+    latest_dates=[]
+
+    for s in symbols:
+        d=dmap.get(s)
+        if d is None or d.empty:
+            continue
+        try:
+            x=d.copy()
+            x.index=pd.to_datetime(x.index,errors="coerce")
+            x=x[x.index.notna()].sort_index()
+            x=x[pd.Index([pd.Timestamp(i).date() for i in x.index]) < today_tw]
+            x=x.dropna(subset=["Close"]).copy()
+            if len(x)<60:
+                continue
+
+            c=pd.to_numeric(x["Close"],errors="coerce")
+            ma15=c.rolling(15,min_periods=15).mean()
+            ma30=c.rolling(30,min_periods=30).mean()
+            ma60=c.rolling(60,min_periods=60).mean()
+            ret5=(c/c.shift(5)-1)*100
+
+            rec.append({
+                "股票":s,
+                "Close":float(c.iloc[-1]) if pd.notna(c.iloc[-1]) else np.nan,
+                "MA15":float(ma15.iloc[-1]) if pd.notna(ma15.iloc[-1]) else np.nan,
+                "MA30":float(ma30.iloc[-1]) if pd.notna(ma30.iloc[-1]) else np.nan,
+                "MA60":float(ma60.iloc[-1]) if pd.notna(ma60.iloc[-1]) else np.nan,
+                "RET5%":float(ret5.iloc[-1]) if pd.notna(ret5.iloc[-1]) else np.nan,
+            })
+            latest_dates.append(pd.Timestamp(x.index[-1]).date())
+        except Exception:
+            continue
+
+    z=pd.DataFrame(rec)
+    if z.empty:
+        return pd.DataFrame(), ["TOP200市場廣度日K資料不足。"]
+
+    v15=z["Close"].notna()&z["MA15"].notna()
+    v30=z["Close"].notna()&z["MA30"].notna()
+    v60=z["Close"].notna()&z["MA60"].notna()
+    v5=z["RET5%"].notna()
+
+    ma15_pct=float((z.loc[v15,"Close"]>z.loc[v15,"MA15"]).mean()*100) if v15.any() else np.nan
+    ma30_pct=float((z.loc[v30,"Close"]>z.loc[v30,"MA30"]).mean()*100) if v30.any() else np.nan
+    ma60_pct=float((z.loc[v60,"Close"]>z.loc[v60,"MA60"]).mean()*100) if v60.any() else np.nan
+    up5_pct=float((z.loc[v5,"RET5%"]>0).mean()*100) if v5.any() else np.nan
+    med5=float(z.loc[v5,"RET5%"].median()) if v5.any() else np.nan
+
+    if pd.isna(ma60_pct):
+        risk="⚪ 資料不足"
+    elif ma60_pct>=65:
+        risk="🔴 高檔風險"
+    else:
+        risk="🟢 正常"
+
+    out=pd.DataFrame([{
+        "市場狀態":risk,
+        "基準完成日":str(max(latest_dates)) if latest_dates else "",
+        "TOP200有效股票數":len(z),
+        "站上MA15比例%":ma15_pct,
+        "站上MA30比例%":ma30_pct,
+        "站上MA60比例%":ma60_pct,
+        "5日上漲家數比例%":up5_pct,
+        "5日報酬中位數%":med5,
+        "風險規則":"MA60廣度>=65%僅顯示高檔風險警示，不過濾訊號"
+    }])
+    return out, []
+
+
 def build_formal_daily_radar(cost: CostConfig):
     """
-    V1.16.16 正式今日雷達：
-    採 V1.16.15 驗證後的 C 架構：
-      TOP1-100：保留全部核心KD訊號
-      TOP101-150：只保留S級（量比20>=1.5 且 MA60未向上）
+    V1.16.22 正式今日雷達：
+    - 全市場先排名到TOP200，用於市場廣度風險提示。
+    - 60m正式掃描仍只掃TOP150：
+        TOP1-100：保留全部核心KD訊號
+        TOP101-150：只保留S級
+    - MA60市場廣度>=65%目前只顯示風險警示，不作硬Gate。
     """
-    pool,pool_diag,errors=build_current_formal_radar_pool(max_rank=150)
-    if pool is None or pool.empty:
-        return pd.DataFrame(),pd.DataFrame(),pool_diag,pool,errors
+    pool200,pool_diag,errors=build_current_formal_radar_pool(max_rank=200)
+    if pool200 is None or pool200.empty:
+        return pd.DataFrame(),pd.DataFrame(),pool_diag,pd.DataFrame(),pd.DataFrame(),errors
+
+    env,env_errors=build_current_market_breadth(pool200)
+    errors=list(errors or [])+list(env_errors or [])
+
+    pool=pool200[pool200["流動性排名"]<=150].copy().reset_index(drop=True)
+    if not pool_diag.empty:
+        pool_diag=pool_diag.copy()
+        pool_diag["正式掃描股票數"]=len(pool)
 
     symbols=pool["股票"].tolist()
     radar,scan_diag=scan_latest_60m_radar(symbols,pool,period="60d",observe_days=5)
     if radar is None or radar.empty:
-        return pd.DataFrame(),scan_diag,pool_diag,pool,errors
+        return pd.DataFrame(),scan_diag,pool_diag,pool,env,errors
 
     rank=pd.to_numeric(radar["流動性排名"],errors="coerce")
     formal=(rank<=100)|((rank>100)&(rank<=150)&(radar["訊號等級"]=="S級"))
     radar["正式雷達納入"]=np.where(formal,"是","否")
     radar=radar[formal].copy()
 
-    # V1.16.17：正式「今日雷達」只保留仍在5交易日觀察窗內的訊號。
-    # 已逾期訊號不再混進今日雷達下載檔，避免104筆看起來像104個當前訊號。
     active=radar["目前狀態"].isin(["🟢 新訊號","🟡 觀察中"])
     radar=radar[active].copy()
+
+    if env is not None and not env.empty:
+        radar["市場狀態"]=env.iloc[0]["市場狀態"]
+        radar["市場MA60廣度%"]=env.iloc[0]["站上MA60比例%"]
+    else:
+        radar["市場狀態"]="⚪ 資料不足"
+        radar["市場MA60廣度%"]=np.nan
 
     layer_order={"核心_TOP1-50":0,"觀察_TOP51-100":1,"擴充_TOP101-150":2}
     grade_order={"S級":0,"A級":1,"B級":2}
@@ -1378,7 +1480,7 @@ def build_formal_daily_radar(cost: CostConfig):
     radar["_l"]=radar["股票池層級"].map(layer_order).fillna(9)
     radar=radar.sort_values(["_s","_g","_l","流動性排名","訊號時間"],
                             ascending=[True,True,True,True,False]).drop(columns=["_s","_g","_l"])
-    return radar.reset_index(drop=True),scan_diag,pool_diag,pool,errors
+    return radar.reset_index(drop=True),scan_diag,pool_diag,pool,env,errors
 
 
 def build_fullmarket_walkforward_eligibility(lookback_months: int = 6, top_n: int = 100):
@@ -5184,9 +5286,10 @@ if run:
 
     if simple_mode=="今日雷達":
         with st.spinner("建立官方上市/上櫃動態股票池並掃描最新60m訊號…"):
-            _dr,_dd,_pd,_pp,_pe=build_formal_daily_radar(cost)
-        st.session_state["st_v11616_daily"]={
-            "radar":_dr,"scan_diag":_dd,"pool_diag":_pd,"pool":_pp,"errors":_pe
+            _dr,_dd,_pd,_pp,_env,_pe=build_formal_daily_radar(cost)
+        st.session_state["st_v11622_daily"]={
+            "radar":_dr,"scan_diag":_dd,"pool_diag":_pd,"pool":_pp,
+            "environment":_env,"errors":_pe
         }
         # 今日雷達使用獨立正式流程，不再進入舊版人工母池/OOS流程。
         summary, data_map, trade_map = pd.DataFrame(), {}, {}
@@ -5321,10 +5424,10 @@ if run:
     }
 
 
-_daily=st.session_state.get("st_v11616_daily")
+_daily=st.session_state.get("st_v11622_daily")
 if simple_mode=="今日雷達":
     st.markdown("## 📡 今日60m正式雷達")
-    st.caption("正式架構：TOP1-100保留全部核心KD訊號；TOP101-150只有S級進雷達。今日雷達只顯示「新訊號＋仍在5交易日觀察窗內」；已逾期訊號不再列入。")
+    st.caption("正式架構：TOP1-100保留全部核心KD訊號；TOP101-150只有S級進雷達。另以TOP200計算今日市場廣度風險，但目前只警示、不作硬Gate。")
     if _daily:
         _dr=_daily.get("radar",pd.DataFrame())
         _dd=_daily.get("scan_diag",pd.DataFrame())
@@ -5333,6 +5436,26 @@ if simple_mode=="今日雷達":
         _pe=_daily.get("errors",[])
         if _pe:
             st.warning("資料來源異常："+"；".join(_pe))
+
+        _env=_daily.get("environment",pd.DataFrame())
+        if not _env.empty:
+            e0=_env.iloc[0]
+            st.markdown("### 🌦️ 今日市場環境")
+            e1,e2,e3,e4,e5=st.columns(5)
+            e1.metric("市場狀態",str(e0.get("市場狀態","")))
+            e2.metric("MA15廣度",f"{float(e0.get('站上MA15比例%',np.nan)):.1f}%")
+            e3.metric("MA30廣度",f"{float(e0.get('站上MA30比例%',np.nan)):.1f}%")
+            e4.metric("MA60廣度",f"{float(e0.get('站上MA60比例%',np.nan)):.1f}%")
+            e5.metric("5日上漲家數",f"{float(e0.get('5日上漲家數比例%',np.nan)):.1f}%")
+            if str(e0.get("市場狀態","")).startswith("🔴"):
+                st.warning("目前屬於MA60高廣度風險環境。研究顯示這類環境歷史表現較差，但樣本外仍有例外，因此目前只警示、不自動過濾S/A/B訊號。")
+            else:
+                st.caption("環境風險目前只做提示，不改變今日雷達S/A/B訊號納入規則。")
+            st.download_button("⬇️ 下載【今日市場環境】",
+                               _env.to_csv(index=False).encode("utf-8-sig"),
+                               file_name=f"{APP_VERSION}_今日市場環境.csv",
+                               mime="text/csv",use_container_width=True,on_click="ignore")
+
         if not _pd.empty:
             d0=_pd.iloc[0]
             c1,c2,c3,c4=st.columns(4)
@@ -5358,7 +5481,7 @@ if simple_mode=="今日雷達":
 
             _cols=[c for c in [
                 "股票","公司","市場","流動性排名","股票池層級","訊號等級",
-                "目前狀態","訊號時間","訊號K","量比20","MA60斜率3",
+                "市場狀態","市場MA60廣度%","目前狀態","訊號時間","訊號K","量比20","MA60斜率3",
                 "目前K","目前D","預計觀察至"
             ] if c in _dr.columns]
             st.dataframe(_dr[_cols],use_container_width=True,hide_index=True)
@@ -5792,6 +5915,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.21 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.22 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
