@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.23
+黑嚕嚕－短線交易雷達 ST V1.16.24
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.23"
+APP_VERSION = "ST V1.16.24"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.23"
-EXPORT_PREFIX = "ST_V1.16.23"
+APP_VERSION = "ST_V1.16.24"
+EXPORT_PREFIX = "ST_V1.16.24"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1873,6 +1873,106 @@ def build_top200_market_breadth_context():
 
 
 
+
+def validate_holding_path_diagnostics(cost: CostConfig):
+    """
+    V1.16.24 持有路徑健診：
+    固定正式架構C與5日持有，不改策略，只用逐筆 MFE / MAE 檢查：
+      - 第1段是否其實有先反彈、之後再回吐
+      - 問題較像進場品質，還是固定持有5日過久
+    這版只診斷，不直接加入停利/停損。
+    """
+    # 沿用目前最完整的正式架構C point-in-time逐筆資料。
+    _,_,_,t,errors=validate_breadth_transition(cost)
+    if t is None or t.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    x=t.copy()
+    net=pd.to_numeric(x.get("淨報酬%"),errors="coerce")
+    mfe=pd.to_numeric(x.get("MFE%"),errors="coerce")
+    mae=pd.to_numeric(x.get("MAE%"),errors="coerce")
+
+    # 固定、事先定義的描述性門檻，不依本輪績效最佳化。
+    x["曾達+3%"]=mfe>=3
+    x["曾達+5%"]=mfe>=5
+    x["曾達+10%"]=mfe>=10
+    x["曾跌-3%"]=mae<=-3
+    x["曾跌-5%"]=mae<=-5
+    x["曾跌-10%"]=mae<=-10
+    x["+3後最終虧損"]=(mfe>=3)&(net<0)
+    x["+5後最終虧損"]=(mfe>=5)&(net<0)
+    x["+10後最終虧損"]=(mfe>=10)&(net<0)
+    x["-5後最終翻正"]=(mae<=-5)&(net>0)
+
+    # MFE利用率：最終淨報酬 / 最大有利幅度，只在MFE>0時觀察。
+    x["MFE利用率%"]=np.where(mfe>0,net/mfe*100,np.nan)
+
+    rows=[]
+    for sample in ["全部","樣本內60%","樣本外40%"]:
+        xs=x if sample=="全部" else x[x["樣本"]==sample]
+        for block in ["第1段","第2段","第3段","第4段"]:
+            g=xs[xs["時間段"]==block]
+            if g.empty:
+                rows.append({
+                    "樣本":sample,"時間段":block,"交易數":0,
+                    "平均淨報酬%":np.nan,"MFE中位數%":np.nan,"MAE中位數%":np.nan,
+                    "曾達+3%占比":np.nan,"曾達+5%占比":np.nan,"曾達+10%占比":np.nan,
+                    "曾跌-5%占比":np.nan,"+3後最終虧損占比":np.nan,
+                    "+5後最終虧損占比":np.nan,"-5後最終翻正占比":np.nan,
+                    "MFE利用率中位數%":np.nan
+                })
+                continue
+            rows.append({
+                "樣本":sample,
+                "時間段":block,
+                "交易數":len(g),
+                "平均淨報酬%":float(pd.to_numeric(g["淨報酬%"],errors="coerce").mean()),
+                "MFE中位數%":float(pd.to_numeric(g["MFE%"],errors="coerce").median()),
+                "MAE中位數%":float(pd.to_numeric(g["MAE%"],errors="coerce").median()),
+                "曾達+3%占比":float(g["曾達+3%"].mean()*100),
+                "曾達+5%占比":float(g["曾達+5%"].mean()*100),
+                "曾達+10%占比":float(g["曾達+10%"].mean()*100),
+                "曾跌-5%占比":float(g["曾跌-5%"].mean()*100),
+                "+3後最終虧損占比":float(g["+3後最終虧損"].mean()*100),
+                "+5後最終虧損占比":float(g["+5後最終虧損"].mean()*100),
+                "-5後最終翻正占比":float(g["-5後最終翻正"].mean()*100),
+                "MFE利用率中位數%":float(pd.to_numeric(g["MFE利用率%"],errors="coerce").median())
+            })
+    summary=pd.DataFrame(rows)
+
+    # 路徑類型：互斥分組，避免重疊。
+    def _path(r):
+        n=pd.to_numeric(pd.Series([r.get("淨報酬%")]),errors="coerce").iloc[0]
+        f=pd.to_numeric(pd.Series([r.get("MFE%")]),errors="coerce").iloc[0]
+        a=pd.to_numeric(pd.Series([r.get("MAE%")]),errors="coerce").iloc[0]
+        if pd.isna(n) or pd.isna(f) or pd.isna(a):
+            return "資料不足"
+        if f>=5 and n<0:
+            return "先漲後吐_曾+5最終虧"
+        if a<=-5 and n>0:
+            return "先跌後拉_-5後翻正"
+        if n>0:
+            return "正常獲利"
+        return "一路偏弱/未達+5"
+    x["持有路徑類型"]=x.apply(_path,axis=1)
+
+    path_rows=[]
+    path_order=["先漲後吐_曾+5最終虧","先跌後拉_-5後翻正","正常獲利","一路偏弱/未達+5","資料不足"]
+    for block in ["第1段","第2段","第3段","第4段"]:
+        xb=x[x["時間段"]==block]
+        for path in path_order:
+            g=xb[xb["持有路徑類型"]==path]
+            m=aggregate_trade_metrics(g)
+            path_rows.append({
+                "時間段":block,"持有路徑類型":path,
+                "交易數":len(g),
+                "占比%":float(len(g)/len(xb)*100) if len(xb) else np.nan,
+                "股票數":int(g["股票"].nunique()) if len(g) else 0,
+                **m
+            })
+    paths=pd.DataFrame(path_rows)
+
+    return summary,paths,x,errors
 def validate_breadth_transition(cost: CostConfig):
     """
     V1.16.23 市場廣度轉折健診：
@@ -4612,8 +4712,10 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
-            if research_mode == "市場廣度轉折健診":
+                ["持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
+            if research_mode == "持有路徑健診":
+                st.caption("固定5日持有規則，檢查MFE/MAE與回吐型態，判斷第1段問題較像進場失效還是持有過久。")
+            elif research_mode == "市場廣度轉折健診":
                 st.caption("不只看MA60廣度高低，進一步檢查MA15/30/60市場廣度5日變化，區分高檔擴散與高檔收斂。")
             elif research_mode == "環境×訊號交互驗證":
                 st.caption("先用1y日K完整暖機TOP200市場MA60廣度，再檢查高檔風險下S/A/B差異；避免早期MA60缺值被誤判為正常環境。")
@@ -4648,7 +4750,7 @@ with st.sidebar:
                 "KD黃金交叉 + MA30向上","KD黃金交叉 + MA60向上","KD黃金交叉 + 量比>1.2",
                 "KD黃金交叉 + 量比>1.5","KD黃金交叉 + 站上VWAP","MA5>15 + KD + 站上VWAP"
             ]
-            if research_mode not in ["市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
+            if research_mode not in ["持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
                 selected_rules = st.multiselect("進場規則", all_rules, default=["KD黃金交叉 + K<30"])
                 selected_modes = st.multiselect("持有方式",
                     ["當沖","隔日","2日","3日","4日","5日","6日","7日"], default=["5日"])
@@ -4675,6 +4777,7 @@ with st.sidebar:
         _btn_label="🔄 更新今日雷達"
     else:
         _btn_label={
+            "持有路徑健診":"🧭 執行持有路徑健診",
             "市場廣度轉折健診":"📉 執行市場廣度轉折健診",
             "環境×訊號交互驗證":"🧩 執行環境×訊號交互驗證",
             "環境Gate驗證":"🧪 執行環境Gate A/B",
@@ -4742,6 +4845,42 @@ if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and 
     st.download_button("⬇️ 下載【TOP50暖機資料完整度】",_uc.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"{APP_VERSION}_TOP50暖機資料完整度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
     st.success("四份檔案可連續下載，不需重跑。")
+
+if simple_mode=="進階研究" and research_mode=="持有路徑健診" and not run:
+    st.info("V1.16.23 顯示『高檔收斂』雖然持續偏弱，但第1段其實不論高檔擴散/收斂都差，代表單靠市場狀態仍無法解決。這版轉而檢查5日持有路徑：訊號有沒有先反彈再把獲利吐回去。")
+
+if run and simple_mode=="進階研究" and research_mode=="持有路徑健診":
+    st.subheader("🧭 持有路徑健診")
+    with st.spinner("沿用正式架構C逐筆交易，分析MFE/MAE與5日持有回吐…"):
+        _hp_sum,_hp_paths,_hp_detail,_hp_errs=validate_holding_path_diagnostics(cost)
+    st.session_state["st_v11624_holding_path"]={
+        "summary":_hp_sum,"paths":_hp_paths,"detail":_hp_detail,"errors":_hp_errs
+    }
+
+_hp=st.session_state.get("st_v11624_holding_path")
+if simple_mode=="進階研究" and research_mode=="持有路徑健診" and _hp:
+    _hs=_hp.get("summary",pd.DataFrame()); _hpaths=_hp.get("paths",pd.DataFrame())
+    _hd=_hp.get("detail",pd.DataFrame()); _he=_hp.get("errors",[])
+    st.subheader("🧭 持有路徑健診結果")
+    if _he:
+        st.warning("資料來源異常："+"；".join(_he))
+    st.info("這版只判斷『進場錯』還是『持有過久』；+3/+5/+10與-3/-5/-10都是固定描述門檻，不會直接當成新版停利停損。")
+    if not _hs.empty:
+        st.markdown("#### 四段 MFE / MAE / 回吐比較")
+        st.dataframe(_hs.round(3),use_container_width=True,hide_index=True)
+    if not _hpaths.empty:
+        st.markdown("#### 四段持有路徑類型")
+        st.dataframe(_hpaths.round(3),use_container_width=True,hide_index=True)
+    with st.expander("查看逐筆MFE/MAE與路徑標記"):
+        st.dataframe(_hd.round(3),use_container_width=True,hide_index=True)
+
+    st.download_button("⬇️ 下載【持有路徑健診摘要】",_hs.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_持有路徑健診摘要.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【持有路徑類型分析】",_hpaths.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_持有路徑類型分析.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【持有路徑逐筆明細】",_hd.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_持有路徑逐筆明細.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.success("三份檔案可連續下載，不需重跑。")
 
 if simple_mode=="進階研究" and research_mode=="市場廣度轉折健診" and not run:
     st.info("今天的MA60廣度77%被標成高檔風險，但同時5日上漲家數89%、5日報酬中位數+5.14%，其實是強勢擴散而不是明顯轉弱。這版改檢查『廣度方向』，避免只靠MA60高低把強勢市場和高檔轉弱混在一起。")
@@ -5450,6 +5589,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 單股總�
 # V1.16.10：所有「上方已有獨立執行流程」的研究模式集中管理。
 # 後續新增研究模式時只要加入此集合，就不會再掉進舊版共用流程而引用未定義的 summary。
 INDEPENDENT_RESEARCH_MODES = {
+    "持有路徑健診",
     "市場廣度轉折健診",
     "環境×訊號交互驗證",
     "環境Gate驗證",
@@ -6114,6 +6254,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.23 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.24 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
