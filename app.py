@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.17
+黑嚕嚕－短線交易雷達 ST V1.16.18
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -22,7 +22,7 @@ import warnings
 import os
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 # V1.16.6：Streamlit Cloud 資源保護。
 # 在 numpy/pandas 載入前限制底層執行緒，避免記憶體/Thread耗盡。
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.17"
+APP_VERSION = "ST V1.16.18"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.17"
-EXPORT_PREFIX = "ST_V1.16.17"
+APP_VERSION = "ST_V1.16.18"
+EXPORT_PREFIX = "ST_V1.16.18"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1692,6 +1692,192 @@ def validate_top50_warmup_correction(cost: CostConfig):
 
 
 
+
+@st.cache_data(ttl=1800, max_entries=2, show_spinner=False)
+def build_top200_market_breadth_context():
+    """
+    V1.16.18：建立歷史TOP200的日K橫斷面市場廣度。
+    只下載歷史TOP200曾出現過的股票聯集；每個基準日只用當日及以前資料。
+    """
+    elig, _, errors = build_fullmarket_walkforward_eligibility(lookback_months=6, top_n=100)
+    if elig is None or elig.empty:
+        return pd.DataFrame(), elig, errors
+
+    union=sorted(
+        elig.loc[elig["流動性排名"]<=200,"股票"].dropna().astype(str).unique().tolist()
+    )
+    if not union:
+        return pd.DataFrame(), elig, errors
+
+    dmap=download_daily_batches(union,period="6mo",batch_size=25)
+    per_symbol={}
+    for s in union:
+        d=dmap.get(s)
+        if d is None or d.empty:
+            continue
+        try:
+            x=d.copy()
+            x.index=pd.to_datetime(x.index,errors="coerce")
+            x=x[x.index.notna()].sort_index().dropna(subset=["Close"]).copy()
+            c=pd.to_numeric(x["Close"],errors="coerce")
+            x["MA15"]=c.rolling(15,min_periods=15).mean()
+            x["MA30"]=c.rolling(30,min_periods=30).mean()
+            x["MA60"]=c.rolling(60,min_periods=60).mean()
+            x["RET5%"]=(c/c.shift(5)-1)*100
+            x["日期"]=[pd.Timestamp(i).date() for i in x.index]
+            per_symbol[s]=x[["日期","Close","MA15","MA30","MA60","RET5%"]].set_index("日期")
+        except Exception:
+            continue
+
+    rows=[]
+    for base_date,q in elig[elig["流動性排名"]<=200].groupby("基準完成日"):
+        rec=[]
+        for s in q["股票"].astype(str):
+            x=per_symbol.get(s)
+            if x is None or base_date not in x.index:
+                continue
+            r=x.loc[base_date]
+            if isinstance(r,pd.DataFrame):
+                r=r.iloc[-1]
+            rec.append({
+                "Close":pd.to_numeric(pd.Series([r.get("Close")]),errors="coerce").iloc[0],
+                "MA15":pd.to_numeric(pd.Series([r.get("MA15")]),errors="coerce").iloc[0],
+                "MA30":pd.to_numeric(pd.Series([r.get("MA30")]),errors="coerce").iloc[0],
+                "MA60":pd.to_numeric(pd.Series([r.get("MA60")]),errors="coerce").iloc[0],
+                "RET5%":pd.to_numeric(pd.Series([r.get("RET5%")]),errors="coerce").iloc[0],
+            })
+        if not rec:
+            continue
+        z=pd.DataFrame(rec)
+        v15=z["Close"].notna()&z["MA15"].notna()
+        v30=z["Close"].notna()&z["MA30"].notna()
+        v60=z["Close"].notna()&z["MA60"].notna()
+        v5=z["RET5%"].notna()
+        rows.append({
+            "基準完成日":base_date,
+            "TOP200有效股票數":len(z),
+            "站上MA15比例%":float((z.loc[v15,"Close"]>z.loc[v15,"MA15"]).mean()*100) if v15.any() else np.nan,
+            "站上MA30比例%":float((z.loc[v30,"Close"]>z.loc[v30,"MA30"]).mean()*100) if v30.any() else np.nan,
+            "站上MA60比例%":float((z.loc[v60,"Close"]>z.loc[v60,"MA60"]).mean()*100) if v60.any() else np.nan,
+            "5日上漲家數比例%":float((z.loc[v5,"RET5%"]>0).mean()*100) if v5.any() else np.nan,
+            "5日報酬中位數%":float(z.loc[v5,"RET5%"].median()) if v5.any() else np.nan,
+        })
+    return pd.DataFrame(rows), elig, errors
+
+
+def validate_failure_environment(cost: CostConfig):
+    """
+    V1.16.18 第一段失效環境健診：
+    固定正式架構C，不新增Gate，只比較第1段與後3段的市場廣度/訊號擁擠差異。
+    """
+    breadth, elig, errors = build_top200_market_breadth_context()
+    if elig is None or elig.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    union=sorted(
+        elig.loc[elig["流動性排名"]<=200,"股票"].dropna().astype(str).unique().tolist()
+    )
+    if not union:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    _,_,trades=run_oos_60m_5d(
+        union,cost,"6mo",allow_overlap=False,train_ratio=0.60,evaluation_months=3
+    )
+    if trades is None or trades.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    t=trades.copy()
+    sig=_as_taipei_series(t["訊號時間"])
+    t["訊號時間_台北"]=sig
+    t["訊號日期"]=sig.dt.date
+
+    # 歷史流動性排名只取訊號日前一個完成日。
+    ranks=[]; basedates=[]
+    for _,r in t.iterrows():
+        q=elig[(elig["股票"]==r["股票"])&(elig["基準完成日"]<r["訊號日期"])]
+        if q.empty:
+            ranks.append(np.nan); basedates.append(None)
+        else:
+            z=q.sort_values("基準完成日").iloc[-1]
+            ranks.append(float(z["流動性排名"]))
+            basedates.append(z["基準完成日"])
+    t["WF流動性排名"]=ranks
+    t["WF股票池基準日"]=basedates
+    t=t[t["WF流動性排名"].notna() & (t["WF流動性排名"]<=200)].copy()
+
+    # 正式架構C：TOP1-100全部 + TOP101-150僅S。
+    vr=pd.to_numeric(t.get("量比20"),errors="coerce")
+    ma60s=pd.to_numeric(t.get("MA60斜率3"),errors="coerce")
+    t["S級"]=(vr>=1.5)&(ma60s<=0)
+    rnk=pd.to_numeric(t["WF流動性排名"],errors="coerce")
+    formal=(rnk<=100)|((rnk>100)&(rnk<=150)&t["S級"])
+    t=t[formal].copy()
+
+    # 市場廣度嚴格取訊號日前一個已完成日K。
+    if breadth is not None and not breadth.empty:
+        b=breadth.sort_values("基準完成日").copy()
+        b_rows=[]
+        for _,r in t.iterrows():
+            q=b[b["基準完成日"]<r["訊號日期"]]
+            b_rows.append(q.iloc[-1].to_dict() if not q.empty else {})
+        bx=pd.DataFrame(b_rows,index=t.index)
+        for c in ["基準完成日","TOP200有效股票數","站上MA15比例%","站上MA30比例%",
+                  "站上MA60比例%","5日上漲家數比例%","5日報酬中位數%"]:
+            if c in bx.columns:
+                t["市場_"+c]=bx[c]
+
+    # 同一個完成60m bar的訊號擁擠度，只看當下同時訊號。
+    t["同時60m訊號數"]=t.groupby("訊號時間_台北")["股票"].transform("count")
+
+    ts=t["訊號時間_台北"]
+    edges=pd.date_range(ts.min(),ts.max(),periods=5)
+    labels=["第1段","第2段","第3段","第4段"]
+    t["時間段"]=pd.cut(ts,bins=edges,labels=labels,include_lowest=True,right=True)
+
+    env_cols=[
+        "市場_站上MA15比例%","市場_站上MA30比例%","市場_站上MA60比例%",
+        "市場_5日上漲家數比例%","市場_5日報酬中位數%","同時60m訊號數"
+    ]
+    block_rows=[]
+    for block in labels:
+        g=t[t["時間段"]==block]
+        m=aggregate_trade_metrics(g)
+        row={
+            "時間段":block,
+            "起始":str(edges[labels.index(block)]),
+            "結束":str(edges[labels.index(block)+1]),
+            "股票數":int(g["股票"].nunique()) if len(g) else 0,
+            "交易數":len(g),**m
+        }
+        for c in env_cols:
+            x=pd.to_numeric(g[c],errors="coerce") if c in g.columns else pd.Series(dtype=float)
+            row[c+"_中位數"]=float(x.median()) if x.notna().any() else np.nan
+            row[c+"_平均"]=float(x.mean()) if x.notna().any() else np.nan
+        block_rows.append(row)
+    blocks=pd.DataFrame(block_rows)
+
+    # 固定分桶，避免根據結果臨時尋找最佳門檻。
+    specs=[
+        ("市場_站上MA15比例%",[-np.inf,35,50,65,np.inf],["<35%","35-50%","50-65%",">=65%"]),
+        ("市場_站上MA30比例%",[-np.inf,35,50,65,np.inf],["<35%","35-50%","50-65%",">=65%"]),
+        ("市場_站上MA60比例%",[-np.inf,35,50,65,np.inf],["<35%","35-50%","50-65%",">=65%"]),
+        ("市場_5日上漲家數比例%",[-np.inf,35,50,65,np.inf],["<35%","35-50%","50-65%",">=65%"]),
+        ("市場_5日報酬中位數%",[-np.inf,-2,0,2,np.inf],["<-2%","-2~0%","0~2%",">=2%"]),
+        ("同時60m訊號數",[-np.inf,2,5,10,np.inf],["1-2","3-5","6-10",">10"]),
+    ]
+    rows=[]
+    for col,bins,names in specs:
+        x=pd.to_numeric(t[col],errors="coerce") if col in t.columns else pd.Series(np.nan,index=t.index)
+        bucket=pd.cut(x,bins=bins,labels=names,include_lowest=True,right=True)
+        for name in names:
+            g=t[bucket==name]
+            m=aggregate_trade_metrics(g)
+            rows.append({
+                "環境因子":col,"分組":name,
+                "股票數":int(g["股票"].nunique()) if len(g) else 0,
+                "交易數":len(g),**m
+            })
+    return blocks,pd.DataFrame(rows),t,errors
 def validate_radar_architectures(cost: CostConfig):
     """
     V1.16.15 雷達架構驗證：
@@ -3980,8 +4166,10 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
-            if research_mode == "TOP50暖機修正驗證":
+                ["失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
+            if research_mode == "失效環境健診":
+                st.caption("專門檢查第1段共同失效：TOP200站上MA15/30/60比例、5日市場廣度、60m訊號擁擠度；只診斷、不先加Gate。")
+            elif research_mode == "TOP50暖機修正驗證":
                 st.caption("比較舊3mo直接計算 vs 6mo指標暖機後只評估最後3mo；同時修正訊號時間誤當UTC的問題。")
             elif research_mode == "TOP50訊號品質健診":
                 st.caption("固定真正Walk-Forward TOP50與核心策略；使用6mo暖機、只評估最後3mo，診斷K深度、量比20、MA30/60方向與台北時間60m時段。")
@@ -4008,7 +4196,7 @@ with st.sidebar:
                 "KD黃金交叉 + MA30向上","KD黃金交叉 + MA60向上","KD黃金交叉 + 量比>1.2",
                 "KD黃金交叉 + 量比>1.5","KD黃金交叉 + 站上VWAP","MA5>15 + KD + 站上VWAP"
             ]
-            if research_mode not in ["TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
+            if research_mode not in ["失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
                 selected_rules = st.multiselect("進場規則", all_rules, default=["KD黃金交叉 + K<30"])
                 selected_modes = st.multiselect("持有方式",
                     ["當沖","隔日","2日","3日","4日","5日","6日","7日"], default=["5日"])
@@ -4035,6 +4223,7 @@ with st.sidebar:
         _btn_label="🔄 更新今日雷達"
     else:
         _btn_label={
+            "失效環境健診":"🌦️ 執行第一段失效環境健診",
             "雷達架構驗證":"🛰️ 驗證正式雷達架構",
             "股票池分層驗證":"🧱 執行股票池分層驗證",
             "股票池覆蓋健診":"🌐 執行股票池覆蓋健診",
@@ -4098,6 +4287,42 @@ if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and 
     st.download_button("⬇️ 下載【TOP50暖機資料完整度】",_uc.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"{APP_VERSION}_TOP50暖機資料完整度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
     st.success("四份檔案可連續下載，不需重跑。")
+
+if simple_mode=="進階研究" and research_mode=="失效環境健診" and not run:
+    st.info("前面已排除暖機不足、股票池寬窄與量比/MA60本身。這次改查第1段是否是『整體市場廣度不利＋KD反彈訊號同時擁擠』造成。")
+
+if run and simple_mode=="進階研究" and research_mode=="失效環境健診":
+    st.subheader("🌦️ 第一段失效環境健診")
+    with st.spinner("建立歷史TOP200市場廣度並重建正式架構C交易…"):
+        _fe_blocks,_fe_diag,_fe_trades,_fe_errs=validate_failure_environment(cost)
+    st.session_state["st_v11618_failure_env"]={
+        "blocks":_fe_blocks,"diagnostics":_fe_diag,"trades":_fe_trades,"errors":_fe_errs
+    }
+
+_fe=st.session_state.get("st_v11618_failure_env")
+if simple_mode=="進階研究" and research_mode=="失效環境健診" and _fe:
+    _fb=_fe.get("blocks",pd.DataFrame()); _fd=_fe.get("diagnostics",pd.DataFrame())
+    _ft=_fe.get("trades",pd.DataFrame()); _ferr=_fe.get("errors",[])
+    st.subheader("🌦️ 第一段失效環境結果")
+    if _ferr:
+        st.warning("資料來源異常："+"；".join(_ferr))
+    st.info("這一版只做原因診斷；不會因某一環境分組績效漂亮就直接加進正式Gate。")
+    if not _fb.empty:
+        st.markdown("#### 四段市場環境 vs 策略績效")
+        st.dataframe(_fb.round(3),use_container_width=True,hide_index=True)
+    if not _fd.empty:
+        st.markdown("#### 固定環境分桶")
+        st.dataframe(_fd.round(3),use_container_width=True,hide_index=True)
+    with st.expander("查看逐筆交易與訊號當下市場環境"):
+        st.dataframe(_ft.round(3),use_container_width=True,hide_index=True)
+
+    st.download_button("⬇️ 下載【失效環境四段比較】",_fb.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_失效環境四段比較.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【失效環境因子分桶】",_fd.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_失效環境因子分桶.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【失效環境逐筆交易】",_ft.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_失效環境逐筆交易.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.success("三份檔案可連續下載，不需重跑。")
 
 if simple_mode=="進階研究" and research_mode=="雷達架構驗證" and not run:
     st.info("V1.16.14 顯示TOP51-100仍有穩定正向價值、TOP101-150品質較弱但S級仍強、TOP151-200整體已接近無優勢。這版直接驗證幾種可落地的正式雷達架構。")
@@ -4642,6 +4867,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 單股總�
 # V1.16.10：所有「上方已有獨立執行流程」的研究模式集中管理。
 # 後續新增研究模式時只要加入此集合，就不會再掉進舊版共用流程而引用未定義的 summary。
 INDEPENDENT_RESEARCH_MODES = {
+    "失效環境健診",
     "雷達架構驗證",
     "股票池分層驗證",
     "股票池覆蓋健診",
@@ -5281,6 +5507,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.17 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.18 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
