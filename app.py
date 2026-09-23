@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.12
+黑嚕嚕－短線交易雷達 ST V1.16.13
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.12"
+APP_VERSION = "ST V1.16.13"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.12"
-EXPORT_PREFIX = "ST_V1.16.12"
+APP_VERSION = "ST_V1.16.13"
+EXPORT_PREFIX = "ST_V1.16.13"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1545,6 +1545,85 @@ def validate_top50_warmup_correction(cost: CostConfig):
 
 
 
+
+
+def diagnose_stock_pool_coverage(cost: CostConfig):
+    """V1.16.13：檢查上市/上櫃母池、Yahoo覆蓋、動態TOP50/100/150/200與訊號涵蓋率。"""
+    official, official_errors = fetch_official_tw_stock_universe()
+    elig, _, wf_errors = build_fullmarket_walkforward_eligibility(lookback_months=6, top_n=100)
+    errors=list(official_errors or [])+list(wf_errors or [])
+    rows=[]
+
+    official_count=len(official) if isinstance(official,pd.DataFrame) else 0
+    listed=int((official["市場"]=="上市").sum()) if official_count and "市場" in official.columns else 0
+    otc=int((official["市場"]=="上櫃").sum()) if official_count and "市場" in official.columns else 0
+    diag=getattr(elig,"attrs",{}).get("wf_diag",{}) if isinstance(elig,pd.DataFrame) else {}
+    daily_ok=int(diag.get("日K下載成功股票數",0))
+    seq_ok=int(diag.get("建立歷史序列股票數",0))
+    rows += [
+        {"類別":"母池覆蓋","指標":"官方上市+上櫃公司數","數值":official_count},
+        {"類別":"母池覆蓋","指標":"上市公司數","數值":listed},
+        {"類別":"母池覆蓋","指標":"上櫃公司數","數值":otc},
+        {"類別":"資料覆蓋","指標":"Yahoo 6mo日K成功股票數","數值":daily_ok},
+        {"類別":"資料覆蓋","指標":"可建立歷史序列股票數","數值":seq_ok},
+        {"類別":"資料覆蓋","指標":"Yahoo日K覆蓋率%","數值":(daily_ok/official_count*100) if official_count else np.nan},
+    ]
+    if elig is None or elig.empty:
+        return pd.DataFrame(rows),pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    sizes=[50,100,150,200]
+    union_rows=[]
+    for n in sizes:
+        q=elig[elig["流動性排名"]<=n]
+        perday=q.groupby("基準完成日")["股票"].nunique()
+        union_rows.append({
+            "核心池規模":f"TOP{n}",
+            "歷史曾入選股票數":int(q["股票"].nunique()),
+            "平均每日股票數":float(perday.mean()) if len(perday) else np.nan,
+            "最少每日股票數":int(perday.min()) if len(perday) else 0,
+            "最多每日股票數":int(perday.max()) if len(perday) else 0,
+            "歷史交易日數":int(perday.size),
+        })
+
+    market_rows=[]
+    latest_date=max(elig["基準完成日"])
+    latest=elig[elig["基準完成日"]==latest_date].copy()
+    market_map=dict(zip(official["股票"],official["市場"])) if official_count and {"股票","市場"}.issubset(official.columns) else {}
+    for n in sizes:
+        q=latest[latest["流動性排名"]<=n].copy()
+        q["市場"]=q["股票"].map(market_map).fillna("未知")
+        total=len(q)
+        for market,count in q["市場"].value_counts().items():
+            market_rows.append({
+                "基準完成日":latest_date,"核心池規模":f"TOP{n}","市場":market,
+                "股票數":int(count),"占比%":float(count/total*100) if total else np.nan
+            })
+
+    capture_rows=[]
+    top200_union=sorted(elig.loc[elig["流動性排名"]<=200,"股票"].astype(str).unique().tolist())
+    if top200_union:
+        _,_,trades=run_oos_60m_5d(top200_union,cost,"6mo",allow_overlap=False,train_ratio=0.60,evaluation_months=3)
+        if trades is not None and not trades.empty:
+            t=trades.copy()
+            t["訊號日期"]=_as_taipei_series(t["訊號時間"]).dt.date
+            ranks=[]
+            for _,r in t.iterrows():
+                q=elig[(elig["股票"]==r["股票"])&(elig["基準完成日"]<r["訊號日期"])]
+                ranks.append(float(q.sort_values("基準完成日").iloc[-1]["流動性排名"]) if not q.empty else np.nan)
+            t["WF流動性排名"]=ranks
+            t=t[t["WF流動性排名"].notna() & (t["WF流動性排名"]<=200)]
+            total=len(t)
+            for n in sizes:
+                g=t[t["WF流動性排名"]<=n]
+                capture_rows.append({
+                    "核心池規模":f"TOP{n}","交易數":len(g),
+                    "TOP200交易涵蓋率%":float(len(g)/total*100) if total else np.nan,
+                    "股票數":int(g["股票"].nunique()) if len(g) else 0,
+                    "平均淨報酬%":float(pd.to_numeric(g["淨報酬%"],errors="coerce").mean()) if len(g) else np.nan,
+                })
+            rows.append({"類別":"訊號涵蓋","指標":"TOP200範圍核心策略交易總數","數值":total})
+
+    return pd.DataFrame(rows),pd.DataFrame(union_rows),pd.DataFrame(market_rows),pd.DataFrame(capture_rows),errors
 
 
 def validate_top50_signal_grades(cost: CostConfig):
@@ -3509,7 +3588,7 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
+                ["股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
             if research_mode == "TOP50暖機修正驗證":
                 st.caption("比較舊3mo直接計算 vs 6mo指標暖機後只評估最後3mo；同時修正訊號時間誤當UTC的問題。")
             elif research_mode == "TOP50訊號品質健診":
@@ -3564,6 +3643,7 @@ with st.sidebar:
         _btn_label="🔄 更新今日雷達"
     else:
         _btn_label={
+            "股票池覆蓋健診":"🌐 執行股票池覆蓋健診",
             "TOP50訊號等級驗證":"🏷️ 驗證TOP50訊號S/A/B等級",
             "TOP50Gate拆解驗證":"🧬 執行TOP50 Gate拆解",
             "TOP50候選Gate驗證":"🧪 執行TOP50候選Gate A/B",
@@ -3623,6 +3703,32 @@ if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and 
                        file_name=f"{APP_VERSION}_TOP50暖機修正逐筆交易.csv",mime="text/csv",use_container_width=True,on_click="ignore")
     st.download_button("⬇️ 下載【TOP50暖機資料完整度】",_uc.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"{APP_VERSION}_TOP50暖機資料完整度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.success("四份檔案可連續下載，不需重跑。")
+
+if simple_mode=="進階研究" and research_mode=="股票池覆蓋健診" and not run:
+    st.info("這個模式專門回答『股票池撈得夠不夠全面』：檢查母池、資料覆蓋、TOP50歷史輪動，以及TOP50相對TOP200能抓到多少核心策略交易。")
+
+if run and simple_mode=="進階研究" and research_mode=="股票池覆蓋健診":
+    st.subheader("🌐 股票池覆蓋健診")
+    with st.spinner("建立全市場6mo歷史資格並計算TOP50/100/150/200覆蓋…"):
+        _cv_sum,_cv_union,_cv_market,_cv_capture,_cv_errs=diagnose_stock_pool_coverage(cost)
+    st.session_state["st_v11613_pool_coverage"]={"summary":_cv_sum,"union":_cv_union,"market":_cv_market,"capture":_cv_capture,"errors":_cv_errs}
+
+_cv=st.session_state.get("st_v11613_pool_coverage")
+if simple_mode=="進階研究" and research_mode=="股票池覆蓋健診" and _cv:
+    _cs=_cv.get("summary",pd.DataFrame()); _cu=_cv.get("union",pd.DataFrame())
+    _cm=_cv.get("market",pd.DataFrame()); _cc=_cv.get("capture",pd.DataFrame()); _ce=_cv.get("errors",[])
+    st.subheader("🌐 股票池覆蓋健診結果")
+    if _ce: st.warning("資料來源異常："+"；".join(_ce))
+    st.info("目前母池涵蓋官方上市＋上櫃公司；興櫃不在母池。TOP50是每日動態核心池，不是固定50家公司。")
+    if not _cs.empty: st.dataframe(_cs.round(3),use_container_width=True,hide_index=True)
+    if not _cu.empty: st.dataframe(_cu.round(3),use_container_width=True,hide_index=True)
+    if not _cm.empty: st.dataframe(_cm.round(3),use_container_width=True,hide_index=True)
+    if not _cc.empty: st.dataframe(_cc.round(3),use_container_width=True,hide_index=True)
+    st.download_button("⬇️ 下載【股票池覆蓋健診摘要】",_cs.to_csv(index=False).encode("utf-8-sig"),file_name=f"{APP_VERSION}_股票池覆蓋健診摘要.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【股票池歷史輪動範圍】",_cu.to_csv(index=False).encode("utf-8-sig"),file_name=f"{APP_VERSION}_股票池歷史輪動範圍.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【股票池市場別分布】",_cm.to_csv(index=False).encode("utf-8-sig"),file_name=f"{APP_VERSION}_股票池市場別分布.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【股票池訊號涵蓋率】",_cc.to_csv(index=False).encode("utf-8-sig"),file_name=f"{APP_VERSION}_股票池訊號涵蓋率.csv",mime="text/csv",use_container_width=True,on_click="ignore")
     st.success("四份檔案可連續下載，不需重跑。")
 
 if simple_mode=="進階研究" and research_mode=="TOP50訊號等級驗證" and not run:
@@ -4063,6 +4169,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 單股總�
 # V1.16.10：所有「上方已有獨立執行流程」的研究模式集中管理。
 # 後續新增研究模式時只要加入此集合，就不會再掉進舊版共用流程而引用未定義的 summary。
 INDEPENDENT_RESEARCH_MODES = {
+    "股票池覆蓋健診",
     "TOP50訊號等級驗證",
     "TOP50Gate拆解驗證",
     "TOP50候選Gate驗證",
@@ -4626,6 +4733,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.12 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.13 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
