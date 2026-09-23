@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.18
+黑嚕嚕－短線交易雷達 ST V1.16.19
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.18"
+APP_VERSION = "ST V1.16.19"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.18"
-EXPORT_PREFIX = "ST_V1.16.18"
+APP_VERSION = "ST_V1.16.19"
+EXPORT_PREFIX = "ST_V1.16.19"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1765,6 +1765,87 @@ def build_top200_market_breadth_context():
     return pd.DataFrame(rows), elig, errors
 
 
+
+def validate_environment_gate_candidates(cost: CostConfig):
+    """
+    V1.16.19 環境Gate候選A/B：
+    直接沿用 V1.16.18 的 point-in-time 正式架構C逐筆資料，
+    不重定義股票池、不改進出場，只比較幾個事先鎖定的環境排除條件。
+
+    A 基準：不排除
+    B 排除長期高檔：市場站上MA60比例 >=65%
+    C 排除高檔轉弱：MA60>=65% 且 5日上漲家數比例 35~50%
+    D 排除高檔轉弱2：MA60>=65% 且 5日報酬中位數 -2~0%
+    E 排除中度訊號擁擠：同時60m訊號數 6~10
+
+    注意：
+    - 這些是研究候選，不會在此版直接寫進今日正式雷達。
+    - C/D 是根據「長期廣度仍高、短期已轉弱」的同一市場狀態做兩種觀測定義。
+    """
+    _,_,t,errors=validate_failure_environment(cost)
+    if t is None or t.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    ma60=pd.to_numeric(t.get("市場_站上MA60比例%"),errors="coerce")
+    up5=pd.to_numeric(t.get("市場_5日上漲家數比例%"),errors="coerce")
+    med5=pd.to_numeric(t.get("市場_5日報酬中位數%"),errors="coerce")
+    crowd=pd.to_numeric(t.get("同時60m訊號數"),errors="coerce")
+
+    trap_c=(ma60>=65)&(up5>=35)&(up5<50)
+    trap_d=(ma60>=65)&(med5>=-2)&(med5<0)
+    crowd_mid=(crowd>=6)&(crowd<=10)
+
+    gates=[
+        ("A_基準",pd.Series(True,index=t.index)),
+        ("B_排除MA60廣度>=65",~(ma60>=65)),
+        ("C_排除高檔轉弱_MA60>=65且5日上漲35-50",~trap_c),
+        ("D_排除高檔轉弱_MA60>=65且5日報酬-2~0",~trap_d),
+        ("E_排除同時60m訊號6-10",~crowd_mid),
+    ]
+
+    rows=[]
+    for sample in ["全部","樣本內60%","樣本外40%"]:
+        xs=t if sample=="全部" else t[t["樣本"]==sample]
+        for name,mask in gates:
+            g=xs[mask.reindex(xs.index,fill_value=False)]
+            m=aggregate_trade_metrics(g)
+            rows.append({
+                "樣本":sample,
+                "環境Gate":name,
+                "交易數":len(g),
+                "保留率%":float(len(g)/len(xs)*100) if len(xs) else np.nan,
+                "排除交易數":int(len(xs)-len(g)),
+                "股票數":int(g["股票"].nunique()) if len(g) else 0,
+                **m
+            })
+    summary=pd.DataFrame(rows)
+
+    blocks=[]
+    labels=["第1段","第2段","第3段","第4段"]
+    for block in labels:
+        q=t[t["時間段"]==block]
+        for name,mask in gates:
+            g=q[mask.reindex(q.index,fill_value=False)]
+            m=aggregate_trade_metrics(g)
+            blocks.append({
+                "時間段":block,
+                "環境Gate":name,
+                "交易數":len(g),
+                "保留率%":float(len(g)/len(q)*100) if len(q) else np.nan,
+                "排除交易數":int(len(q)-len(g)),
+                "股票數":int(g["股票"].nunique()) if len(g) else 0,
+                **m
+            })
+    block_df=pd.DataFrame(blocks)
+
+    # 逐筆標示每個候選是否會被排除，方便後續檢查。
+    detail=t.copy()
+    detail["GateB_排除"]=ma60>=65
+    detail["GateC_排除"]=trap_c
+    detail["GateD_排除"]=trap_d
+    detail["GateE_排除"]=crowd_mid
+
+    return summary,block_df,detail,errors
 def validate_failure_environment(cost: CostConfig):
     """
     V1.16.18 第一段失效環境健診：
@@ -4166,8 +4247,10 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
-            if research_mode == "失效環境健診":
+                ["環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
+            if research_mode == "環境Gate驗證":
+                st.caption("固定正式架構C，比較幾個事先鎖定的環境排除條件；重點看第1段改善、樣本外與後3段代價。")
+            elif research_mode == "失效環境健診":
                 st.caption("專門檢查第1段共同失效：TOP200站上MA15/30/60比例、5日市場廣度、60m訊號擁擠度；只診斷、不先加Gate。")
             elif research_mode == "TOP50暖機修正驗證":
                 st.caption("比較舊3mo直接計算 vs 6mo指標暖機後只評估最後3mo；同時修正訊號時間誤當UTC的問題。")
@@ -4196,7 +4279,7 @@ with st.sidebar:
                 "KD黃金交叉 + MA30向上","KD黃金交叉 + MA60向上","KD黃金交叉 + 量比>1.2",
                 "KD黃金交叉 + 量比>1.5","KD黃金交叉 + 站上VWAP","MA5>15 + KD + 站上VWAP"
             ]
-            if research_mode not in ["失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
+            if research_mode not in ["環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
                 selected_rules = st.multiselect("進場規則", all_rules, default=["KD黃金交叉 + K<30"])
                 selected_modes = st.multiselect("持有方式",
                     ["當沖","隔日","2日","3日","4日","5日","6日","7日"], default=["5日"])
@@ -4223,6 +4306,7 @@ with st.sidebar:
         _btn_label="🔄 更新今日雷達"
     else:
         _btn_label={
+            "環境Gate驗證":"🧪 執行環境Gate A/B",
             "失效環境健診":"🌦️ 執行第一段失效環境健診",
             "雷達架構驗證":"🛰️ 驗證正式雷達架構",
             "股票池分層驗證":"🧱 執行股票池分層驗證",
@@ -4287,6 +4371,42 @@ if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and 
     st.download_button("⬇️ 下載【TOP50暖機資料完整度】",_uc.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"{APP_VERSION}_TOP50暖機資料完整度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
     st.success("四份檔案可連續下載，不需重跑。")
+
+if simple_mode=="進階研究" and research_mode=="環境Gate驗證" and not run:
+    st.info("V1.16.18 顯示第1段不是單純弱勢市場：最明顯的是『MA60長期廣度仍高，但短期5日已轉弱』，以及6~10檔同時KD反彈的中度擁擠區。這版只做候選A/B，不直接改今日雷達。")
+
+if run and simple_mode=="進階研究" and research_mode=="環境Gate驗證":
+    st.subheader("🧪 環境Gate候選A/B")
+    with st.spinner("沿用V1.16.18 point-in-time資料，驗證環境排除條件…"):
+        _eg_sum,_eg_blocks,_eg_detail,_eg_errs=validate_environment_gate_candidates(cost)
+    st.session_state["st_v11619_env_gate"]={
+        "summary":_eg_sum,"blocks":_eg_blocks,"detail":_eg_detail,"errors":_eg_errs
+    }
+
+_eg=st.session_state.get("st_v11619_env_gate")
+if simple_mode=="進階研究" and research_mode=="環境Gate驗證" and _eg:
+    _es=_eg.get("summary",pd.DataFrame()); _eb=_eg.get("blocks",pd.DataFrame())
+    _ed=_eg.get("detail",pd.DataFrame()); _ee=_eg.get("errors",[])
+    st.subheader("🧪 環境Gate驗證結果")
+    if _ee:
+        st.warning("資料來源異常："+"；".join(_ee))
+    st.info("評估重點：第1段是否改善、後3段是否被錯殺、樣本外是否仍保有優勢。單一最高PF不等於可直接採用。")
+    if not _es.empty:
+        st.markdown("#### 全部 / 樣本內 / 樣本外")
+        st.dataframe(_es.round(3),use_container_width=True,hide_index=True)
+    if not _eb.empty:
+        st.markdown("#### 四段時間穩定度")
+        st.dataframe(_eb.round(3),use_container_width=True,hide_index=True)
+    with st.expander("查看逐筆交易與各Gate排除標記"):
+        st.dataframe(_ed.round(3),use_container_width=True,hide_index=True)
+
+    st.download_button("⬇️ 下載【環境Gate驗證摘要】",_es.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_環境Gate驗證摘要.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【環境Gate四段穩定度】",_eb.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_環境Gate四段穩定度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【環境Gate逐筆明細】",_ed.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_環境Gate逐筆明細.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.success("三份檔案可連續下載，不需重跑。")
 
 if simple_mode=="進階研究" and research_mode=="失效環境健診" and not run:
     st.info("前面已排除暖機不足、股票池寬窄與量比/MA60本身。這次改查第1段是否是『整體市場廣度不利＋KD反彈訊號同時擁擠』造成。")
@@ -4867,6 +4987,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 單股總�
 # V1.16.10：所有「上方已有獨立執行流程」的研究模式集中管理。
 # 後續新增研究模式時只要加入此集合，就不會再掉進舊版共用流程而引用未定義的 summary。
 INDEPENDENT_RESEARCH_MODES = {
+    "環境Gate驗證",
     "失效環境健診",
     "雷達架構驗證",
     "股票池分層驗證",
@@ -5507,6 +5628,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.18 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.19 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
