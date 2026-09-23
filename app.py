@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.22
+黑嚕嚕－短線交易雷達 ST V1.16.23
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.22"
+APP_VERSION = "ST V1.16.23"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.22"
-EXPORT_PREFIX = "ST_V1.16.22"
+APP_VERSION = "ST_V1.16.23"
+EXPORT_PREFIX = "ST_V1.16.23"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1872,6 +1872,158 @@ def build_top200_market_breadth_context():
 
 
 
+
+def validate_breadth_transition(cost: CostConfig):
+    """
+    V1.16.23 市場廣度轉折健診：
+    不再只看「MA60廣度高不高」，改看廣度是正在擴散還是收斂。
+
+    固定正式架構C：
+      TOP1-100全部 + TOP101-150僅S
+      60m KD黃金交叉 + K<30 + 持有5日
+      6mo暖機 / 最後3mo評估
+
+    市場轉折狀態：
+      高檔擴散：MA60廣度>=65 且 MA15廣度5日變化>=0
+      高檔收斂：MA60廣度>=65 且 MA15廣度5日變化<0
+      非高檔擴散：MA60廣度<65 且 MA15廣度5日變化>=0
+      非高檔收斂：MA60廣度<65 且 MA15廣度5日變化<0
+
+    另外固定檢查 MA15/30/60 廣度 5日變化分桶。
+    這版只診斷，不直接改今日雷達Gate。
+    """
+    breadth, elig, errors = build_top200_market_breadth_context()
+    if breadth is None or breadth.empty or elig is None or elig.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    b=breadth.sort_values("基準完成日").copy()
+    for col in ["站上MA15比例%","站上MA30比例%","站上MA60比例%","5日上漲家數比例%"]:
+        x=pd.to_numeric(b[col],errors="coerce")
+        b[col+"_3日變化"]=x.diff(3)
+        b[col+"_5日變化"]=x.diff(5)
+
+    union=sorted(
+        elig.loc[elig["流動性排名"]<=200,"股票"].dropna().astype(str).unique().tolist()
+    )
+    _,_,trades=run_oos_60m_5d(
+        union,cost,"6mo",allow_overlap=False,train_ratio=0.60,evaluation_months=3
+    )
+    if trades is None or trades.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    t=trades.copy()
+    sig=_as_taipei_series(t["訊號時間"])
+    t["訊號時間_台北"]=sig
+    t["訊號日期"]=sig.dt.date
+
+    # 歷史流動性排名：只用訊號日前完成日。
+    ranks=[]
+    for _,r in t.iterrows():
+        q=elig[(elig["股票"]==r["股票"])&(elig["基準完成日"]<r["訊號日期"])]
+        ranks.append(float(q.sort_values("基準完成日").iloc[-1]["流動性排名"]) if not q.empty else np.nan)
+    t["WF流動性排名"]=ranks
+    t=t[t["WF流動性排名"].notna() & (t["WF流動性排名"]<=200)].copy()
+
+    vr=pd.to_numeric(t.get("量比20"),errors="coerce")
+    ma60s=pd.to_numeric(t.get("MA60斜率3"),errors="coerce")
+    t["S級"]=(vr>=1.5)&(ma60s<=0)
+    rnk=pd.to_numeric(t["WF流動性排名"],errors="coerce")
+    t=t[(rnk<=100)|((rnk>100)&(rnk<=150)&t["S級"])].copy()
+
+    # 合併訊號日前一個完成日的市場廣度與變化值。
+    merge_cols=[
+        "基準完成日","站上MA15比例%","站上MA30比例%","站上MA60比例%",
+        "5日上漲家數比例%","5日報酬中位數%",
+        "站上MA15比例%_3日變化","站上MA15比例%_5日變化",
+        "站上MA30比例%_3日變化","站上MA30比例%_5日變化",
+        "站上MA60比例%_3日變化","站上MA60比例%_5日變化",
+        "5日上漲家數比例%_3日變化","5日上漲家數比例%_5日變化",
+    ]
+    mrows=[]
+    for _,r in t.iterrows():
+        q=b[b["基準完成日"]<r["訊號日期"]]
+        mrows.append(q.iloc[-1][merge_cols].to_dict() if not q.empty else {})
+    mx=pd.DataFrame(mrows,index=t.index)
+    for c in merge_cols:
+        if c in mx.columns:
+            t["市場_"+c]=mx[c]
+
+    ma60_level=pd.to_numeric(t.get("市場_站上MA60比例%"),errors="coerce")
+    ma15_d5=pd.to_numeric(t.get("市場_站上MA15比例%_5日變化"),errors="coerce")
+
+    def _state(level,delta):
+        if pd.isna(level) or pd.isna(delta):
+            return "資料不足"
+        if level>=65 and delta>=0:
+            return "高檔擴散"
+        if level>=65 and delta<0:
+            return "高檔收斂"
+        if level<65 and delta>=0:
+            return "非高檔擴散"
+        return "非高檔收斂"
+
+    t["市場廣度轉折狀態"]=[_state(a,d) for a,d in zip(ma60_level,ma15_d5)]
+
+    # 固定四段，與前面研究一致。
+    ts=t["訊號時間_台北"]
+    edges=pd.date_range(ts.min(),ts.max(),periods=5)
+    labels=["第1段","第2段","第3段","第4段"]
+    t["時間段"]=pd.cut(ts,bins=edges,labels=labels,include_lowest=True,right=True)
+
+    states=["高檔擴散","高檔收斂","非高檔擴散","非高檔收斂","資料不足"]
+    rows=[]
+    for sample in ["全部","樣本內60%","樣本外40%"]:
+        xs=t if sample=="全部" else t[t["樣本"]==sample]
+        for state in states:
+            g=xs[xs["市場廣度轉折狀態"]==state]
+            m=aggregate_trade_metrics(g)
+            rows.append({
+                "樣本":sample,"市場廣度轉折狀態":state,
+                "交易數":len(g),
+                "股票數":int(g["股票"].nunique()) if len(g) else 0,
+                "占比%":float(len(g)/len(xs)*100) if len(xs) else np.nan,
+                **m
+            })
+    summary=pd.DataFrame(rows)
+
+    # 固定變化分桶，不依績效調切點。
+    bucket_rows=[]
+    specs=[
+        ("市場_站上MA15比例%_5日變化",[-np.inf,-15,-5,5,15,np.inf],["<=-15","-15~-5","-5~5","5~15",">15"]),
+        ("市場_站上MA30比例%_5日變化",[-np.inf,-15,-5,5,15,np.inf],["<=-15","-15~-5","-5~5","5~15",">15"]),
+        ("市場_站上MA60比例%_5日變化",[-np.inf,-10,-3,3,10,np.inf],["<=-10","-10~-3","-3~3","3~10",">10"]),
+        ("市場_5日上漲家數比例%_5日變化",[-np.inf,-20,-5,5,20,np.inf],["<=-20","-20~-5","-5~5","5~20",">20"]),
+    ]
+    for col,bins,names in specs:
+        x=pd.to_numeric(t.get(col),errors="coerce")
+        bucket=pd.cut(x,bins=bins,labels=names,include_lowest=True,right=True)
+        for name in names:
+            g=t[bucket==name]
+            m=aggregate_trade_metrics(g)
+            bucket_rows.append({
+                "轉折因子":col,"分組":name,
+                "交易數":len(g),
+                "股票數":int(g["股票"].nunique()) if len(g) else 0,
+                **m
+            })
+    buckets=pd.DataFrame(bucket_rows)
+
+    # 四段 × 轉折狀態
+    blocks=[]
+    for block in labels:
+        xb=t[t["時間段"]==block]
+        for state in states:
+            g=xb[xb["市場廣度轉折狀態"]==state]
+            m=aggregate_trade_metrics(g)
+            blocks.append({
+                "時間段":block,"市場廣度轉折狀態":state,
+                "交易數":len(g),
+                "股票數":int(g["股票"].nunique()) if len(g) else 0,
+                **m
+            })
+    block_df=pd.DataFrame(blocks)
+
+    return summary,buckets,block_df,t,errors
 def validate_environment_signal_interaction(cost: CostConfig):
     """
     V1.16.20 市場環境 × 訊號等級交互驗證：
@@ -4460,8 +4612,10 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
-            if research_mode == "環境×訊號交互驗證":
+                ["市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
+            if research_mode == "市場廣度轉折健診":
+                st.caption("不只看MA60廣度高低，進一步檢查MA15/30/60市場廣度5日變化，區分高檔擴散與高檔收斂。")
+            elif research_mode == "環境×訊號交互驗證":
                 st.caption("先用1y日K完整暖機TOP200市場MA60廣度，再檢查高檔風險下S/A/B差異；避免早期MA60缺值被誤判為正常環境。")
             elif research_mode == "環境Gate驗證":
                 st.caption("固定正式架構C，比較幾個事先鎖定的環境排除條件；重點看第1段改善、樣本外與後3段代價。")
@@ -4494,7 +4648,7 @@ with st.sidebar:
                 "KD黃金交叉 + MA30向上","KD黃金交叉 + MA60向上","KD黃金交叉 + 量比>1.2",
                 "KD黃金交叉 + 量比>1.5","KD黃金交叉 + 站上VWAP","MA5>15 + KD + 站上VWAP"
             ]
-            if research_mode not in ["環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
+            if research_mode not in ["市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
                 selected_rules = st.multiselect("進場規則", all_rules, default=["KD黃金交叉 + K<30"])
                 selected_modes = st.multiselect("持有方式",
                     ["當沖","隔日","2日","3日","4日","5日","6日","7日"], default=["5日"])
@@ -4521,6 +4675,7 @@ with st.sidebar:
         _btn_label="🔄 更新今日雷達"
     else:
         _btn_label={
+            "市場廣度轉折健診":"📉 執行市場廣度轉折健診",
             "環境×訊號交互驗證":"🧩 執行環境×訊號交互驗證",
             "環境Gate驗證":"🧪 執行環境Gate A/B",
             "失效環境健診":"🌦️ 執行第一段失效環境健診",
@@ -4586,6 +4741,49 @@ if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and 
                        file_name=f"{APP_VERSION}_TOP50暖機修正逐筆交易.csv",mime="text/csv",use_container_width=True,on_click="ignore")
     st.download_button("⬇️ 下載【TOP50暖機資料完整度】",_uc.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"{APP_VERSION}_TOP50暖機資料完整度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.success("四份檔案可連續下載，不需重跑。")
+
+if simple_mode=="進階研究" and research_mode=="市場廣度轉折健診" and not run:
+    st.info("今天的MA60廣度77%被標成高檔風險，但同時5日上漲家數89%、5日報酬中位數+5.14%，其實是強勢擴散而不是明顯轉弱。這版改檢查『廣度方向』，避免只靠MA60高低把強勢市場和高檔轉弱混在一起。")
+
+if run and simple_mode=="進階研究" and research_mode=="市場廣度轉折健診":
+    st.subheader("📉 市場廣度轉折健診")
+    with st.spinner("重建TOP200市場廣度時間序列並計算3/5日變化…"):
+        _bt_sum,_bt_buckets,_bt_blocks,_bt_detail,_bt_errs=validate_breadth_transition(cost)
+    st.session_state["st_v11623_breadth_transition"]={
+        "summary":_bt_sum,"buckets":_bt_buckets,"blocks":_bt_blocks,
+        "detail":_bt_detail,"errors":_bt_errs
+    }
+
+_bt=st.session_state.get("st_v11623_breadth_transition")
+if simple_mode=="進階研究" and research_mode=="市場廣度轉折健診" and _bt:
+    _bs=_bt.get("summary",pd.DataFrame()); _bb=_bt.get("buckets",pd.DataFrame())
+    _bk=_bt.get("blocks",pd.DataFrame()); _bd=_bt.get("detail",pd.DataFrame())
+    _be=_bt.get("errors",[])
+    st.subheader("📉 市場廣度轉折健診結果")
+    if _be:
+        st.warning("資料來源異常："+"；".join(_be))
+    st.info("四種狀態：高檔擴散／高檔收斂／非高檔擴散／非高檔收斂。此版只診斷，不直接修改今日雷達。")
+    if not _bs.empty:
+        st.markdown("#### 轉折狀態｜全部 / 樣本內 / 樣本外")
+        st.dataframe(_bs.round(3),use_container_width=True,hide_index=True)
+    if not _bb.empty:
+        st.markdown("#### MA15/30/60與5日上漲家數｜5日變化固定分桶")
+        st.dataframe(_bb.round(3),use_container_width=True,hide_index=True)
+    if not _bk.empty:
+        st.markdown("#### 四段時間 × 轉折狀態")
+        st.dataframe(_bk.round(3),use_container_width=True,hide_index=True)
+    with st.expander("查看逐筆交易＋市場廣度轉折"):
+        st.dataframe(_bd.round(3),use_container_width=True,hide_index=True)
+
+    st.download_button("⬇️ 下載【市場廣度轉折摘要】",_bs.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_市場廣度轉折摘要.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【市場廣度變化分桶】",_bb.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_市場廣度變化分桶.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【市場廣度轉折四段】",_bk.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_市場廣度轉折四段.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【市場廣度轉折逐筆】",_bd.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_市場廣度轉折逐筆.csv",mime="text/csv",use_container_width=True,on_click="ignore")
     st.success("四份檔案可連續下載，不需重跑。")
 
 if simple_mode=="進階研究" and research_mode=="環境×訊號交互驗證" and not run:
@@ -5252,6 +5450,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 單股總�
 # V1.16.10：所有「上方已有獨立執行流程」的研究模式集中管理。
 # 後續新增研究模式時只要加入此集合，就不會再掉進舊版共用流程而引用未定義的 summary。
 INDEPENDENT_RESEARCH_MODES = {
+    "市場廣度轉折健診",
     "環境×訊號交互驗證",
     "環境Gate驗證",
     "失效環境健診",
@@ -5915,6 +6114,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.22 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.23 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
