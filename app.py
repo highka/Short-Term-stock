@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.9
+黑嚕嚕－短線交易雷達 ST V1.16.10
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.9"
+APP_VERSION = "ST V1.16.10"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.9"
-EXPORT_PREFIX = "ST_V1.16.9"
+APP_VERSION = "ST_V1.16.10"
+EXPORT_PREFIX = "ST_V1.16.10"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -3451,17 +3451,17 @@ if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and 
     st.success("四份檔案可連續下載，不需重跑。")
 
 if simple_mode=="進階研究" and research_mode=="TOP50候選Gate驗證" and not run:
-    st.info("V1.16.8 已確認暖機完整度三項缺值率皆為0%。本版不再加新指標，只把先前鎖定的量比>=1.5與MA60未向上做正式A/B；11:00時段等事後現象不納入。")
+    st.info("V1.16.10 修正獨立研究模式與舊版共用流程的衝突：TOP50候選Gate驗證不再掉進舊流程引用未定義的 summary。Gate邏輯本身不變，仍只比較基準、量比>=1.5、MA60未向上與兩者組合。")
 
 if run and simple_mode=="進階研究" and research_mode=="TOP50候選Gate驗證":
     st.subheader("🧪 TOP50候選Gate A/B")
     with st.spinner("重建6mo暖機、末3mo評估的TOP50 Walk-Forward交易，驗證候選Gate…"):
         _ga_sum,_ga_blocks,_ga_trades,_ga_errs=validate_top50_candidate_gates(cost)
-    st.session_state["st_v1169_gate"]={
+    st.session_state["st_v11610_gate"]={
         "summary":_ga_sum,"blocks":_ga_blocks,"trades":_ga_trades,"errors":_ga_errs
     }
 
-_ga=st.session_state.get("st_v1169_gate")
+_ga=st.session_state.get("st_v11610_gate")
 if simple_mode=="進階研究" and research_mode=="TOP50候選Gate驗證" and _ga:
     _gs=_ga.get("summary",pd.DataFrame()); _gb=_ga.get("blocks",pd.DataFrame())
     _gt=_ga.get("trades",pd.DataFrame()); _ge=_ga.get("errors",[])
@@ -3815,15 +3815,36 @@ if simple_mode=="進階研究" and research_mode=="股票池健診" and _pool_st
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 單股總表", "🌐 跨股穩定度", "🔥 動態短線池", "🏭 族群比較", "🧬 狀態分類", "📈 K線/KD", "🔬 KD分區", "📦 量價/斜率", "🧾 交易明細"])
 
+# V1.16.10：所有「上方已有獨立執行流程」的研究模式集中管理。
+# 後續新增研究模式時只要加入此集合，就不會再掉進舊版共用流程而引用未定義的 summary。
+INDEPENDENT_RESEARCH_MODES = {
+    "TOP50候選Gate驗證",
+    "TOP50訊號品質健診",
+    "TOP50暖機修正驗證",
+    "市場環境健診_TOP50",
+    "核心池規模WalkForward",
+    "全市場WalkForward驗證",
+    "全市場股票池研究",
+    "全市場候選策略驗證",
+    "股票池2.0研究",
+    "股票池2.0歷史驗證",
+    "股票池健診",
+}
+
 if run:
-    if research_mode not in ["股票池2.0研究","股票池2.0歷史驗證","股票池健診","多週期當沖/隔日驗證","60m五日OOS驗證"] and (not selected_intervals or not selected_rules or not selected_modes):
+    # 舊版共用區一律先初始化，避免任何獨立研究模式觸發 NameError。
+    summary, data_map, trade_map = pd.DataFrame(), {}, {}
+    if "symbol" not in locals():
+        symbol = ""
+
+    _legacy_modes_without_rule_check = INDEPENDENT_RESEARCH_MODES | {"多週期當沖/隔日驗證","60m五日OOS驗證"}
+    if research_mode not in _legacy_modes_without_rule_check and (not selected_intervals or not selected_rules or not selected_modes):
         st.error("請至少選擇一個K棒週期、進場規則與持有方式。")
         st.stop()
 
-    if research_mode in ["TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
-        # 股票池研究已在上方獨立完成。：股票池健診已在上方獨立完成。
-        # 初始化舊版共用變數，避免後續 session 儲存引用未定義的 summary。
-        summary, data_map, trade_map = pd.DataFrame(), {}, {}
+    if research_mode in INDEPENDENT_RESEARCH_MODES:
+        # 獨立研究模式已在上方完成；此處不再進入舊版策略流程。
+        pass
     elif research_mode == "60m五日OOS驗證":
         # V1.4.1：OOS 執行移到按下「開始策略健診」之後；
         # 此時交易成本 cost 已完成建立，避免 V1.4.0 的 NameError。
@@ -3946,9 +3967,9 @@ if run:
 
     st.session_state["st_v120"] = {
         "symbol": symbol,
-        "summary": summary,
-        "data_map": data_map,
-        "trade_map": trade_map,
+        "summary": summary if isinstance(summary,pd.DataFrame) else pd.DataFrame(),
+        "data_map": data_map if isinstance(data_map,dict) else {},
+        "trade_map": trade_map if isinstance(trade_map,dict) else {},
     }
 
 oos_state = st.session_state.get("st_v1120_oos")
@@ -4358,6 +4379,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.9 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.10 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
