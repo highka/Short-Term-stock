@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.24
+黑嚕嚕－短線交易雷達 ST V1.16.25
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.24"
+APP_VERSION = "ST V1.16.25"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.24"
-EXPORT_PREFIX = "ST_V1.16.24"
+APP_VERSION = "ST_V1.16.25"
+EXPORT_PREFIX = "ST_V1.16.25"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1874,6 +1874,141 @@ def build_top200_market_breadth_context():
 
 
 
+
+def validate_holding_period_candidates(cost: CostConfig):
+    """
+    V1.16.25 持有天數A/B：
+    沿用V1.16.24已確認的正式架構C交易母體，固定「同一批進場」，
+    只改出場持有天數，避免短持有因提早空倉而多出新訊號造成比較偏誤。
+
+    比較：
+      2日 / 3日 / 4日 / 5日基準
+
+    重要：
+      - 進場時間、股票、訊號完全相同。
+      - 只重新計算不同持有天數的出場價、淨報酬、MFE、MAE。
+      - 不加入停利停損，不改股票池，不改S/A/B。
+    """
+    _,_,_,base,errors=validate_breadth_transition(cost)
+    if base is None or base.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    # 只需要實際出現在正式架構C交易母體中的股票，降低下載量。
+    symbols=sorted(base["股票"].dropna().astype(str).unique().tolist())
+    raw=download_intraday_batch(symbols,"60m","6mo")
+
+    # 建立每檔60m資料與台北時間索引對照。
+    data_map={}
+    idx_map={}
+    for s in symbols:
+        d=raw.get(s)
+        if d is None or d.empty:
+            continue
+        try:
+            x=d.copy().sort_index()
+            tw=_as_taipei_series(pd.Series(x.index))
+            data_map[s]=x
+            idx_map[s]={pd.Timestamp(t):i for i,t in enumerate(tw) if pd.notna(t)}
+        except Exception:
+            continue
+
+    modes=["2日","3日","4日","5日"]
+    repriced=[]
+
+    for _,r in base.iterrows():
+        s=str(r["股票"])
+        d=data_map.get(s)
+        mp=idx_map.get(s)
+        if d is None or mp is None:
+            continue
+
+        et=_as_taipei_series(pd.Series([r["進場時間"]])).iloc[0]
+        if pd.isna(et):
+            continue
+        entry_i=mp.get(pd.Timestamp(et))
+        if entry_i is None or entry_i>=len(d):
+            continue
+
+        entry=float(d["Open"].iloc[entry_i])
+        if not np.isfinite(entry) or entry<=0:
+            continue
+
+        for mode in modes:
+            exit_i=find_exit_index(d,entry_i,mode,"60m")
+            if exit_i is None or exit_i<=entry_i:
+                continue
+            exitp=float(d["Close"].iloc[exit_i])
+            if not np.isfinite(exitp):
+                continue
+
+            gross=(exitp/entry-1)*100
+            cost_pct=cost.roundtrip_cost_pct(daytrade=False)
+            net=gross-cost_pct
+            path=d.iloc[entry_i:exit_i+1]
+            mfe=(float(path["High"].max())/entry-1)*100
+            mae=(float(path["Low"].min())/entry-1)*100
+
+            z=r.to_dict()
+            z["比較持有"]=mode
+            z["比較出場時間"]=d.index[exit_i]
+            z["比較出場價"]=exitp
+            z["比較毛報酬%"]=gross
+            z["比較成本%"]=cost_pct
+            z["比較淨報酬%"]=net
+            z["比較MFE%"]=mfe
+            z["比較MAE%"]=mae
+            repriced.append(z)
+
+    detail=pd.DataFrame(repriced)
+    if detail.empty:
+        return pd.DataFrame(),pd.DataFrame(),detail,errors
+
+    # 只有四種模式都能重算的共同交易才納入比較，確保完全同母體。
+    key_cols=["股票","訊號時間_台北","進場時間"]
+    counts=detail.groupby(key_cols)["比較持有"].nunique().reset_index(name="_mode_n")
+    common=counts[counts["_mode_n"]==len(modes)][key_cols]
+    detail=detail.merge(common,on=key_cols,how="inner")
+
+    rows=[]
+    for sample in ["全部","樣本內60%","樣本外40%"]:
+        xs=detail if sample=="全部" else detail[detail["樣本"]==sample]
+        for mode in modes:
+            g=xs[xs["比較持有"]==mode].copy()
+            # aggregate_trade_metrics 預期欄名為淨報酬%
+            gm=g.rename(columns={"比較淨報酬%":"淨報酬%_AB"})
+            tmp=g.copy()
+            tmp["淨報酬%"]=pd.to_numeric(g["比較淨報酬%"],errors="coerce")
+            m=aggregate_trade_metrics(tmp)
+            rows.append({
+                "樣本":sample,"持有方案":mode,
+                "交易數":len(g),
+                "股票數":int(g["股票"].nunique()) if len(g) else 0,
+                **m,
+                "MFE中位數%":float(pd.to_numeric(g["比較MFE%"],errors="coerce").median()) if len(g) else np.nan,
+                "MAE中位數%":float(pd.to_numeric(g["比較MAE%"],errors="coerce").median()) if len(g) else np.nan,
+            })
+    summary=pd.DataFrame(rows)
+
+    # 四段時間穩定度，仍沿用原本訊號時間四段，不因出場模式重切。
+    block_rows=[]
+    for block in ["第1段","第2段","第3段","第4段"]:
+        xb=detail[detail["時間段"]==block]
+        for mode in modes:
+            g=xb[xb["比較持有"]==mode].copy()
+            tmp=g.copy()
+            tmp["淨報酬%"]=pd.to_numeric(g["比較淨報酬%"],errors="coerce")
+            m=aggregate_trade_metrics(tmp)
+            block_rows.append({
+                "時間段":block,"持有方案":mode,
+                "交易數":len(g),
+                "股票數":int(g["股票"].nunique()) if len(g) else 0,
+                **m,
+                "MFE中位數%":float(pd.to_numeric(g["比較MFE%"],errors="coerce").median()) if len(g) else np.nan,
+                "MAE中位數%":float(pd.to_numeric(g["比較MAE%"],errors="coerce").median()) if len(g) else np.nan,
+            })
+    blocks=pd.DataFrame(block_rows)
+
+    return summary,blocks,detail,errors
 def validate_holding_path_diagnostics(cost: CostConfig):
     """
     V1.16.24 持有路徑健診：
@@ -4712,8 +4847,10 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
-            if research_mode == "持有路徑健診":
+                ["持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
+            if research_mode == "持有天數驗證":
+                st.caption("固定同一批正式架構C進場，只比較2/3/4/5日出場，避免短持有因多出新訊號造成不公平比較。")
+            elif research_mode == "持有路徑健診":
                 st.caption("固定5日持有規則，檢查MFE/MAE與回吐型態，判斷第1段問題較像進場失效還是持有過久。")
             elif research_mode == "市場廣度轉折健診":
                 st.caption("不只看MA60廣度高低，進一步檢查MA15/30/60市場廣度5日變化，區分高檔擴散與高檔收斂。")
@@ -4750,7 +4887,7 @@ with st.sidebar:
                 "KD黃金交叉 + MA30向上","KD黃金交叉 + MA60向上","KD黃金交叉 + 量比>1.2",
                 "KD黃金交叉 + 量比>1.5","KD黃金交叉 + 站上VWAP","MA5>15 + KD + 站上VWAP"
             ]
-            if research_mode not in ["持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
+            if research_mode not in ["持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
                 selected_rules = st.multiselect("進場規則", all_rules, default=["KD黃金交叉 + K<30"])
                 selected_modes = st.multiselect("持有方式",
                     ["當沖","隔日","2日","3日","4日","5日","6日","7日"], default=["5日"])
@@ -4777,6 +4914,7 @@ with st.sidebar:
         _btn_label="🔄 更新今日雷達"
     else:
         _btn_label={
+            "持有天數驗證":"⏱️ 執行2/3/4/5日持有A/B",
             "持有路徑健診":"🧭 執行持有路徑健診",
             "市場廣度轉折健診":"📉 執行市場廣度轉折健診",
             "環境×訊號交互驗證":"🧩 執行環境×訊號交互驗證",
@@ -4845,6 +4983,42 @@ if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and 
     st.download_button("⬇️ 下載【TOP50暖機資料完整度】",_uc.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"{APP_VERSION}_TOP50暖機資料完整度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
     st.success("四份檔案可連續下載，不需重跑。")
+
+if simple_mode=="進階研究" and research_mode=="持有天數驗證" and not run:
+    st.info("V1.16.24 顯示第1段有兩種問題同時存在：48.3%一路偏弱/未達+5%，但也有20.8%曾到+5%最後變虧。這版先做最乾淨的持有天數A/B：同一批進場只改成2/3/4/5日出場。")
+
+if run and simple_mode=="進階研究" and research_mode=="持有天數驗證":
+    st.subheader("⏱️ 2/3/4/5日持有A/B")
+    with st.spinner("固定同一批正式架構C進場，重新計算不同持有天數出場…"):
+        _hd_sum,_hd_blocks,_hd_detail,_hd_errs=validate_holding_period_candidates(cost)
+    st.session_state["st_v11625_holding_days"]={
+        "summary":_hd_sum,"blocks":_hd_blocks,"detail":_hd_detail,"errors":_hd_errs
+    }
+
+_hd=st.session_state.get("st_v11625_holding_days")
+if simple_mode=="進階研究" and research_mode=="持有天數驗證" and _hd:
+    _ds=_hd.get("summary",pd.DataFrame()); _db=_hd.get("blocks",pd.DataFrame())
+    _dd=_hd.get("detail",pd.DataFrame()); _de=_hd.get("errors",[])
+    st.subheader("⏱️ 持有天數驗證結果")
+    if _de:
+        st.warning("資料來源異常："+"；".join(_de))
+    st.info("四個方案使用完全相同的股票、訊號與進場時間，只改出場天數。這比直接各自重跑短持有策略更能回答『5日是不是太久』。")
+    if not _ds.empty:
+        st.markdown("#### 全部 / 樣本內 / 樣本外")
+        st.dataframe(_ds.round(3),use_container_width=True,hide_index=True)
+    if not _db.empty:
+        st.markdown("#### 四段時間穩定度")
+        st.dataframe(_db.round(3),use_container_width=True,hide_index=True)
+    with st.expander("查看同一批交易的2/3/4/5日重算明細"):
+        st.dataframe(_dd.round(3),use_container_width=True,hide_index=True)
+
+    st.download_button("⬇️ 下載【持有天數驗證摘要】",_ds.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_持有天數驗證摘要.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【持有天數四段穩定度】",_db.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_持有天數四段穩定度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【持有天數逐筆比較】",_dd.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_持有天數逐筆比較.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.success("三份檔案可連續下載，不需重跑。")
 
 if simple_mode=="進階研究" and research_mode=="持有路徑健診" and not run:
     st.info("V1.16.23 顯示『高檔收斂』雖然持續偏弱，但第1段其實不論高檔擴散/收斂都差，代表單靠市場狀態仍無法解決。這版轉而檢查5日持有路徑：訊號有沒有先反彈再把獲利吐回去。")
@@ -5589,6 +5763,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 單股總�
 # V1.16.10：所有「上方已有獨立執行流程」的研究模式集中管理。
 # 後續新增研究模式時只要加入此集合，就不會再掉進舊版共用流程而引用未定義的 summary。
 INDEPENDENT_RESEARCH_MODES = {
+    "持有天數驗證",
     "持有路徑健診",
     "市場廣度轉折健診",
     "環境×訊號交互驗證",
@@ -6254,6 +6429,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.24 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.25 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
