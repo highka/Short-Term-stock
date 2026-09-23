@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.13
+黑嚕嚕－短線交易雷達 ST V1.16.14
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.13"
+APP_VERSION = "ST V1.16.14"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.13"
-EXPORT_PREFIX = "ST_V1.16.13"
+APP_VERSION = "ST_V1.16.14"
+EXPORT_PREFIX = "ST_V1.16.14"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1547,6 +1547,125 @@ def validate_top50_warmup_correction(cost: CostConfig):
 
 
 
+
+def validate_pool_band_layers(cost: CostConfig):
+    """
+    V1.16.14 股票池分層驗證：
+    固定真正Walk-Forward + 6mo暖機/末3mo評估 + 核心策略，
+    將歷史流動性排名拆成互斥四層：
+      核心層 TOP1-50
+      觀察層 TOP51-100
+      擴充層 TOP101-150
+      外圍層 TOP151-200
+    目的：在不犧牲全面性的前提下，判斷哪些層值得進正式雷達。
+    """
+    elig, _, errors = build_fullmarket_walkforward_eligibility(lookback_months=6, top_n=100)
+    if elig is None or elig.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    union=sorted(
+        elig.loc[elig["流動性排名"]<=200,"股票"].dropna().astype(str).unique().tolist()
+    )
+    if not union:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    _,_,trades=run_oos_60m_5d(
+        union,cost,"6mo",allow_overlap=False,train_ratio=0.60,evaluation_months=3
+    )
+    if trades is None or trades.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    t=trades.copy()
+    t["訊號日期"]=_as_taipei_series(t["訊號時間"]).dt.date
+
+    ranks=[]; basedates=[]
+    for _,r in t.iterrows():
+        q=elig[(elig["股票"]==r["股票"])&(elig["基準完成日"]<r["訊號日期"])]
+        if q.empty:
+            ranks.append(np.nan); basedates.append(None)
+        else:
+            z=q.sort_values("基準完成日").iloc[-1]
+            ranks.append(float(z["流動性排名"]))
+            basedates.append(z["基準完成日"])
+    t["WF流動性排名"]=ranks
+    t["WF股票池基準日"]=basedates
+    t=t[t["WF流動性排名"].notna() & (t["WF流動性排名"]<=200)].copy()
+
+    def _band(rank):
+        if pd.isna(rank): return "資料不足"
+        if rank<=50: return "核心層_TOP1-50"
+        if rank<=100: return "觀察層_TOP51-100"
+        if rank<=150: return "擴充層_TOP101-150"
+        return "外圍層_TOP151-200"
+    t["股票池層級"]=t["WF流動性排名"].map(_band)
+
+    # 同步標示目前已驗證過的訊號等級，方便後續決定是否保留次核心層。
+    vr=pd.to_numeric(t.get("量比20"),errors="coerce")
+    ma60=pd.to_numeric(t.get("MA60斜率3"),errors="coerce")
+    t["量比Gate"]=vr>=1.5
+    t["MA60Gate"]=ma60<=0
+    t["訊號等級"]=np.where(
+        t["量比Gate"] & t["MA60Gate"],"S級",
+        np.where(t["量比Gate"] | t["MA60Gate"],"A級","B級")
+    )
+    t["訊號時間_台北"]=_as_taipei_series(t["訊號時間"]).astype(str)
+
+    bands=["核心層_TOP1-50","觀察層_TOP51-100","擴充層_TOP101-150","外圍層_TOP151-200"]
+    rows=[]
+    for sample in ["全部","樣本內60%","樣本外40%"]:
+        xs=t if sample=="全部" else t[t["樣本"]==sample]
+        for band in bands:
+            g=xs[xs["股票池層級"]==band]
+            m=aggregate_trade_metrics(g)
+            rows.append({
+                "樣本":sample,"股票池層級":band,
+                "股票數":int(g["股票"].nunique()) if len(g) else 0,
+                "交易數":len(g),
+                "交易占TOP200比例%":float(len(g)/len(xs)*100) if len(xs) else np.nan,
+                **m
+            })
+    summary=pd.DataFrame(rows)
+
+    # 每一層的 S/A/B 結構
+    grade_rows=[]
+    for band in bands:
+        q=t[t["股票池層級"]==band]
+        for grade in ["S級","A級","B級"]:
+            g=q[q["訊號等級"]==grade]
+            m=aggregate_trade_metrics(g)
+            grade_rows.append({
+                "股票池層級":band,"訊號等級":grade,
+                "股票數":int(g["股票"].nunique()) if len(g) else 0,
+                "交易數":len(g),
+                "該層訊號占比%":float(len(g)/len(q)*100) if len(q) else np.nan,
+                **m
+            })
+    grades=pd.DataFrame(grade_rows)
+
+    # 四段時間穩定度
+    blocks=[]
+    ts=_as_taipei_series(t["訊號時間"])
+    ok=ts.notna()
+    z=t.loc[ok].copy(); ts=ts.loc[ok]
+    if len(z):
+        edges=pd.date_range(ts.min(),ts.max(),periods=5)
+        labels=["第1段","第2段","第3段","第4段"]
+        z["時間段"]=pd.cut(ts,bins=edges,labels=labels,include_lowest=True,right=True)
+        for block in labels:
+            q=z[z["時間段"]==block]
+            for band in bands:
+                g=q[q["股票池層級"]==band]
+                m=aggregate_trade_metrics(g)
+                blocks.append({
+                    "時間段":block,
+                    "起始":str(edges[labels.index(block)]),
+                    "結束":str(edges[labels.index(block)+1]),
+                    "股票池層級":band,
+                    "股票數":int(g["股票"].nunique()) if len(g) else 0,
+                    "交易數":len(g),**m
+                })
+
+    return summary,pd.DataFrame(blocks),grades,t,errors
 def diagnose_stock_pool_coverage(cost: CostConfig):
     """V1.16.13：檢查上市/上櫃母池、Yahoo覆蓋、動態TOP50/100/150/200與訊號涵蓋率。"""
     official, official_errors = fetch_official_tw_stock_universe()
@@ -3588,7 +3707,7 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
+                ["股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
             if research_mode == "TOP50暖機修正驗證":
                 st.caption("比較舊3mo直接計算 vs 6mo指標暖機後只評估最後3mo；同時修正訊號時間誤當UTC的問題。")
             elif research_mode == "TOP50訊號品質健診":
@@ -3643,6 +3762,7 @@ with st.sidebar:
         _btn_label="🔄 更新今日雷達"
     else:
         _btn_label={
+            "股票池分層驗證":"🧱 執行股票池分層驗證",
             "股票池覆蓋健診":"🌐 執行股票池覆蓋健診",
             "TOP50訊號等級驗證":"🏷️ 驗證TOP50訊號S/A/B等級",
             "TOP50Gate拆解驗證":"🧬 執行TOP50 Gate拆解",
@@ -3703,6 +3823,49 @@ if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and 
                        file_name=f"{APP_VERSION}_TOP50暖機修正逐筆交易.csv",mime="text/csv",use_container_width=True,on_click="ignore")
     st.download_button("⬇️ 下載【TOP50暖機資料完整度】",_uc.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"{APP_VERSION}_TOP50暖機資料完整度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.success("四份檔案可連續下載，不需重跑。")
+
+if simple_mode=="進階研究" and research_mode=="股票池分層驗證" and not run:
+    st.info("V1.16.13 已確認母池夠廣，但TOP50只涵蓋約四分之一的TOP200核心策略交易。這一版不直接把池擴大，而是把TOP200拆成四個互斥層級，確認哪些層值得進正式雷達。")
+
+if run and simple_mode=="進階研究" and research_mode=="股票池分層驗證":
+    st.subheader("🧱 股票池分層驗證")
+    with st.spinner("重建TOP200 Walk-Forward交易並拆解四層股票池品質…"):
+        _ly_sum,_ly_blocks,_ly_grades,_ly_trades,_ly_errs=validate_pool_band_layers(cost)
+    st.session_state["st_v11614_layers"]={
+        "summary":_ly_sum,"blocks":_ly_blocks,"grades":_ly_grades,
+        "trades":_ly_trades,"errors":_ly_errs
+    }
+
+_ly=st.session_state.get("st_v11614_layers")
+if simple_mode=="進階研究" and research_mode=="股票池分層驗證" and _ly:
+    _ls=_ly.get("summary",pd.DataFrame()); _lb=_ly.get("blocks",pd.DataFrame())
+    _lg=_ly.get("grades",pd.DataFrame()); _lt=_ly.get("trades",pd.DataFrame())
+    _le=_ly.get("errors",[])
+    st.subheader("🧱 股票池分層驗證結果")
+    if _le:
+        st.warning("資料來源異常："+"；".join(_le))
+    st.info("四層互斥比較：TOP1-50核心、51-100觀察、101-150擴充、151-200外圍。目標是同時兼顧訊號品質與市場涵蓋，不會只看哪一層平均報酬最高。")
+    if not _ls.empty:
+        st.markdown("#### 各層｜全部 / 樣本內 / 樣本外")
+        st.dataframe(_ls.round(3),use_container_width=True,hide_index=True)
+    if not _lg.empty:
+        st.markdown("#### 各層 S/A/B 訊號結構")
+        st.dataframe(_lg.round(3),use_container_width=True,hide_index=True)
+    if not _lb.empty:
+        st.markdown("#### 四段時間穩定度")
+        st.dataframe(_lb.round(3),use_container_width=True,hide_index=True)
+    with st.expander("查看分層逐筆交易"):
+        st.dataframe(_lt.round(3),use_container_width=True,hide_index=True)
+
+    st.download_button("⬇️ 下載【股票池分層驗證摘要】",_ls.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_股票池分層驗證摘要.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【股票池分層四段穩定度】",_lb.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_股票池分層四段穩定度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【股票池分層訊號等級】",_lg.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_股票池分層訊號等級.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【股票池分層逐筆交易】",_lt.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_股票池分層逐筆交易.csv",mime="text/csv",use_container_width=True,on_click="ignore")
     st.success("四份檔案可連續下載，不需重跑。")
 
 if simple_mode=="進階研究" and research_mode=="股票池覆蓋健診" and not run:
@@ -4169,6 +4332,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 單股總�
 # V1.16.10：所有「上方已有獨立執行流程」的研究模式集中管理。
 # 後續新增研究模式時只要加入此集合，就不會再掉進舊版共用流程而引用未定義的 summary。
 INDEPENDENT_RESEARCH_MODES = {
+    "股票池分層驗證",
     "股票池覆蓋健診",
     "TOP50訊號等級驗證",
     "TOP50Gate拆解驗證",
@@ -4733,6 +4897,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.13 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.14 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
