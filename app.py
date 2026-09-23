@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.20
+黑嚕嚕－短線交易雷達 ST V1.16.21
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.20"
+APP_VERSION = "ST V1.16.21"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.20"
-EXPORT_PREFIX = "ST_V1.16.20"
+APP_VERSION = "ST_V1.16.21"
+EXPORT_PREFIX = "ST_V1.16.21"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1709,7 +1709,10 @@ def build_top200_market_breadth_context():
     if not union:
         return pd.DataFrame(), elig, errors
 
-    dmap=download_daily_batches(union,period="6mo",batch_size=25)
+    # V1.16.21：市場廣度指標需要MA60暖機。
+    # 先前6mo在評估區最前端仍會有少量MA60缺值，因此改抓1y；
+    # 正式交易評估區仍維持6mo暖機/最後3mo，不改策略樣本。
+    dmap=download_daily_batches(union,period="1y",batch_size=25)
     per_symbol={}
     for s in union:
         d=dmap.get(s)
@@ -1793,13 +1796,17 @@ def validate_environment_signal_interaction(cost: CostConfig):
     vr=pd.to_numeric(t.get("量比20"),errors="coerce")
     ma60s=pd.to_numeric(t.get("MA60斜率3"),errors="coerce")
 
-    t["市場風險狀態"]=np.where(market_ma60>=65,"高檔風險_MA60廣度>=65","正常_MA60廣度<65")
+    t["市場風險狀態"]=np.select(
+        [market_ma60.isna(), market_ma60>=65, market_ma60<65],
+        ["資料不足","高檔風險_MA60廣度>=65","正常_MA60廣度<65"],
+        default="資料不足"
+    )
     t["訊號等級"]=np.where(
         (vr>=1.5)&(ma60s<=0),"S級",
         np.where((vr>=1.5)|(ma60s<=0),"A級","B級")
     )
 
-    envs=["高檔風險_MA60廣度>=65","正常_MA60廣度<65"]
+    envs=["高檔風險_MA60廣度>=65","正常_MA60廣度<65","資料不足"]
     grades=["S級","A級","B級"]
 
     rows=[]
@@ -1843,15 +1850,17 @@ def validate_environment_signal_interaction(cost: CostConfig):
 
     # 模擬三種可落地政策，但此版仍只研究、不改正式雷達：
     # P0 全收；P1 高檔風險全部排除；P2 高檔風險只保留S級。
+    valid_env=t["市場風險狀態"]!="資料不足"
     policies=[
-        ("P0_全部保留",pd.Series(True,index=t.index)),
-        ("P1_高檔風險全部排除",t["市場風險狀態"]!="高檔風險_MA60廣度>=65"),
+        ("P0_全部保留",valid_env),
+        ("P1_高檔風險全部排除",valid_env & (t["市場風險狀態"]!="高檔風險_MA60廣度>=65")),
         ("P2_高檔風險只保留S級",
-         (t["市場風險狀態"]!="高檔風險_MA60廣度>=65")|(t["訊號等級"]=="S級")),
+         valid_env & ((t["市場風險狀態"]!="高檔風險_MA60廣度>=65")|(t["訊號等級"]=="S級"))),
     ]
     policy_rows=[]
     for sample in ["全部","樣本內60%","樣本外40%"]:
         xs=t if sample=="全部" else t[t["樣本"]==sample]
+        valid_xs=xs[xs["市場風險狀態"]!="資料不足"]
         for name,mask in policies:
             g=xs[mask.reindex(xs.index,fill_value=False)]
             m=aggregate_trade_metrics(g)
@@ -1859,7 +1868,9 @@ def validate_environment_signal_interaction(cost: CostConfig):
                 "樣本":sample,
                 "政策":name,
                 "交易數":len(g),
-                "保留率%":float(len(g)/len(xs)*100) if len(xs) else np.nan,
+                "有效環境樣本數":len(valid_xs),
+                "市場廣度缺值筆數":int((xs["市場風險狀態"]=="資料不足").sum()),
+                "保留率%":float(len(g)/len(valid_xs)*100) if len(valid_xs) else np.nan,
                 "股票數":int(g["股票"].nunique()) if len(g) else 0,
                 **m
             })
@@ -4349,7 +4360,7 @@ with st.sidebar:
             research_mode = st.radio("研究模式",
                 ["環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
             if research_mode == "環境×訊號交互驗證":
-                st.caption("檢查MA60高檔風險環境下，S/A/B訊號是否仍有差異；決定該全封鎖還是只保留高品質訊號。")
+                st.caption("先用1y日K完整暖機TOP200市場MA60廣度，再檢查高檔風險下S/A/B差異；避免早期MA60缺值被誤判為正常環境。")
             elif research_mode == "環境Gate驗證":
                 st.caption("固定正式架構C，比較幾個事先鎖定的環境排除條件；重點看第1段改善、樣本外與後3段代價。")
             elif research_mode == "失效環境健診":
@@ -4476,7 +4487,7 @@ if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and 
     st.success("四份檔案可連續下載，不需重跑。")
 
 if simple_mode=="進階研究" and research_mode=="環境×訊號交互驗證" and not run:
-    st.info("V1.16.19 顯示MA60廣度>=65%是目前最有辨識力的風險狀態，但硬排除會砍掉約3成交易。這一版檢查高檔風險中S/A/B是否還有可保留的高品質訊號。")
+    st.info("V1.16.20 發現評估最前端仍有少量市場MA60廣度缺值，且舊邏輯會把缺值誤歸類成正常環境。V1.16.21 改用1y日K暖機市場廣度，並將缺值明確標成資料不足後再重跑交互驗證。")
 
 if run and simple_mode=="進階研究" and research_mode=="環境×訊號交互驗證":
     st.subheader("🧩 環境 × 訊號等級交互驗證")
@@ -4502,6 +4513,12 @@ if simple_mode=="進階研究" and research_mode=="環境×訊號交互驗證" a
     if not _ip.empty:
         st.markdown("#### 三種可落地政策比較")
         st.dataframe(_ip.round(3),use_container_width=True,hide_index=True)
+        if "市場廣度缺值筆數" in _ip.columns:
+            _miss=int(pd.to_numeric(_ip["市場廣度缺值筆數"],errors="coerce").fillna(0).max())
+            if _miss==0:
+                st.success("✅ 市場MA60廣度缺值：0筆")
+            else:
+                st.warning(f"⚠️ 市場MA60廣度仍有缺值：{_miss}筆；這些交易不納入政策比較。")
     if not _ib.empty:
         st.markdown("#### 四段時間穩定度")
         st.dataframe(_ib.round(3),use_container_width=True,hide_index=True)
@@ -5775,6 +5792,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.20 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.21 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
