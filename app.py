@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.16
+黑嚕嚕－短線交易雷達 ST V1.16.17
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.16"
+APP_VERSION = "ST V1.16.17"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.16"
-EXPORT_PREFIX = "ST_V1.16.16"
+APP_VERSION = "ST_V1.16.17"
+EXPORT_PREFIX = "ST_V1.16.17"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1365,9 +1365,14 @@ def build_formal_daily_radar(cost: CostConfig):
     radar["正式雷達納入"]=np.where(formal,"是","否")
     radar=radar[formal].copy()
 
+    # V1.16.17：正式「今日雷達」只保留仍在5交易日觀察窗內的訊號。
+    # 已逾期訊號不再混進今日雷達下載檔，避免104筆看起來像104個當前訊號。
+    active=radar["目前狀態"].isin(["🟢 新訊號","🟡 觀察中"])
+    radar=radar[active].copy()
+
     layer_order={"核心_TOP1-50":0,"觀察_TOP51-100":1,"擴充_TOP101-150":2}
     grade_order={"S級":0,"A級":1,"B級":2}
-    status_order={"🟢 新訊號":0,"🟡 觀察中":1,"⚪ 已逾期":2}
+    status_order={"🟢 新訊號":0,"🟡 觀察中":1}
     radar["_s"]=radar["目前狀態"].map(status_order).fillna(9)
     radar["_g"]=radar["訊號等級"].map(grade_order).fillna(9)
     radar["_l"]=radar["股票池層級"].map(layer_order).fillna(9)
@@ -4808,7 +4813,7 @@ if run:
 _daily=st.session_state.get("st_v11616_daily")
 if simple_mode=="今日雷達":
     st.markdown("## 📡 今日60m正式雷達")
-    st.caption("正式架構：TOP1-100保留全部核心KD訊號；TOP101-150只有S級訊號進雷達。股票池每天依前20個已完成交易日成交金額重新排名。")
+    st.caption("正式架構：TOP1-100保留全部核心KD訊號；TOP101-150只有S級進雷達。今日雷達只顯示「新訊號＋仍在5交易日觀察窗內」；已逾期訊號不再列入。")
     if _daily:
         _dr=_daily.get("radar",pd.DataFrame())
         _dd=_daily.get("scan_diag",pd.DataFrame())
@@ -4826,16 +4831,26 @@ if simple_mode=="今日雷達":
             c4.metric("正式訊號",len(_dr))
             st.caption(f"日K排名基準完成日：{d0.get('最新排名基準日','')}｜掃描範圍：核心50＋觀察50＋擴充50")
         if _dr.empty:
-            st.info("本次TOP150最新60m掃描沒有符合正式雷達架構的近期訊號。可查看診斷確認150檔是否正常完成掃描。")
+            st.info("本次TOP150最新60m掃描沒有仍在5交易日觀察窗內、且符合正式架構的訊號。可查看診斷確認150檔是否正常完成掃描。")
         else:
-            _active=_dr[_dr["目前狀態"].isin(["🟢 新訊號","🟡 觀察中"])]
-            _show=_active if not _active.empty else _dr.head(30)
+            _new=int((_dr["目前狀態"]=="🟢 新訊號").sum())
+            _watch=int((_dr["目前狀態"]=="🟡 觀察中").sum())
+            _s=int((_dr["訊號等級"]=="S級").sum())
+            _a=int((_dr["訊號等級"]=="A級").sum())
+            _b=int((_dr["訊號等級"]=="B級").sum())
+            x1,x2,x3,x4,x5=st.columns(5)
+            x1.metric("今日新訊號",_new)
+            x2.metric("觀察中",_watch)
+            x3.metric("S級",_s)
+            x4.metric("A級",_a)
+            x5.metric("B級",_b)
+
             _cols=[c for c in [
                 "股票","公司","市場","流動性排名","股票池層級","訊號等級",
                 "目前狀態","訊號時間","訊號K","量比20","MA60斜率3",
                 "目前K","目前D","預計觀察至"
-            ] if c in _show.columns]
-            st.dataframe(_show[_cols],use_container_width=True,hide_index=True)
+            ] if c in _dr.columns]
+            st.dataframe(_dr[_cols],use_container_width=True,hide_index=True)
             st.download_button("⬇️ 下載【今日60m正式雷達】",
                                _dr.to_csv(index=False).encode("utf-8-sig"),
                                file_name=f"{APP_VERSION}_今日60m正式雷達.csv",
@@ -5266,6 +5281,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.16 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.17 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
