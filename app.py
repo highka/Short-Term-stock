@@ -28,6 +28,7 @@ from typing import Dict, List, Tuple, Optional
 # 在 numpy/pandas 載入前限制底層執行緒，避免記憶體/Thread耗盡。
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
