@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.26
+黑嚕嚕－短線交易雷達 ST V1.16.27
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.26"
+APP_VERSION = "ST V1.16.27"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.26"
-EXPORT_PREFIX = "ST_V1.16.26"
+APP_VERSION = "ST_V1.16.27"
+EXPORT_PREFIX = "ST_V1.16.27"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1876,6 +1876,185 @@ def build_top200_market_breadth_context():
 
 
 
+
+def validate_profit_protection_sensitivity(cost: CostConfig):
+    """
+    V1.16.27 獲利保護敏感度驗證：
+    固定正式架構C、固定同一批進場，只測附近參數是否穩健，
+    不以單一最高PF選點。
+
+    觸發門檻：+4 / +5 / +6
+    保護位置：+1 / +2 / +3
+    另保留5日基準作對照。
+
+    執行假設同V1.16.26：
+      - 某根已完成60m K的 High 首次 >= 觸發價，視為啟動。
+      - 保護從下一根60m K才生效。
+      - 若下一根開盤已跌破保護價，用開盤價出場。
+      - 否則若 Low <= 保護價，用保護價出場。
+      - 未觸發則第5日最後收盤出場。
+    """
+    _,_,_,base,errors=validate_breadth_transition(cost)
+    if base is None or base.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    symbols=sorted(base["股票"].dropna().astype(str).unique().tolist())
+    raw=download_intraday_batch(symbols,"60m","6mo")
+
+    data_map={}
+    idx_map={}
+    tw_index_map={}
+    for s in symbols:
+        d=raw.get(s)
+        if d is None or d.empty:
+            continue
+        try:
+            x=d.copy().sort_index()
+            tw=_as_taipei_series(pd.Series(x.index))
+            data_map[s]=x
+            idx_map[s]={pd.Timestamp(t):i for i,t in enumerate(tw) if pd.notna(t)}
+            tw_index_map[s]=list(tw)
+        except Exception:
+            continue
+
+    configs=[("A_5日基準",None,None)]
+    for trigger in [0.04,0.05,0.06]:
+        for protect in [0.01,0.02,0.03]:
+            configs.append((f"T{int(trigger*100)}_P{int(protect*100)}",trigger,protect))
+
+    rows=[]
+    for _,r in base.iterrows():
+        s=str(r["股票"])
+        d=data_map.get(s)
+        mp=idx_map.get(s)
+        twidx=tw_index_map.get(s)
+        if d is None or mp is None or twidx is None:
+            continue
+
+        et=_as_taipei_series(pd.Series([r["進場時間"]])).iloc[0]
+        if pd.isna(et):
+            continue
+        entry_i=mp.get(pd.Timestamp(et))
+        if entry_i is None or entry_i>=len(d):
+            continue
+
+        entry=float(d["Open"].iloc[entry_i])
+        if not np.isfinite(entry) or entry<=0:
+            continue
+
+        exit5=find_exit_index(d,entry_i,"5日","60m")
+        if exit5 is None:
+            continue
+
+        for name,trigger,protect in configs:
+            activated=False
+            activation_i=None
+            exit_i=None
+            exit_price=None
+            exit_reason=""
+
+            if name=="A_5日基準":
+                exit_i=exit5
+                exit_price=float(d["Close"].iloc[exit_i])
+                exit_reason="5日到期"
+            else:
+                trigger_price=entry*(1.0+float(trigger))
+                stop_price=entry*(1.0+float(protect))
+
+                for j in range(entry_i,exit5+1):
+                    if activated and j>activation_i:
+                        op=float(d["Open"].iloc[j])
+                        lo=float(d["Low"].iloc[j])
+                        if np.isfinite(op) and op<=stop_price:
+                            exit_i=j
+                            exit_price=op
+                            exit_reason=f"gap保護_T{int(trigger*100)}_P{int(protect*100)}"
+                            break
+                        if np.isfinite(lo) and lo<=stop_price:
+                            exit_i=j
+                            exit_price=stop_price
+                            exit_reason=f"保護_T{int(trigger*100)}_P{int(protect*100)}"
+                            break
+
+                    hi=float(d["High"].iloc[j])
+                    if (not activated) and np.isfinite(hi) and hi>=trigger_price:
+                        activated=True
+                        activation_i=j
+
+                if exit_i is None:
+                    exit_i=exit5
+                    exit_price=float(d["Close"].iloc[exit_i])
+                    exit_reason="5日到期"
+
+            if exit_i is None or not np.isfinite(exit_price):
+                continue
+
+            gross=(exit_price/entry-1)*100
+            cost_pct=cost.roundtrip_cost_pct(daytrade=False)
+            net=gross-cost_pct
+            path=d.iloc[entry_i:exit_i+1]
+
+            z=r.to_dict()
+            z["參數組合"]=name
+            z["觸發門檻%"]=np.nan if trigger is None else trigger*100
+            z["保護位置%"]=np.nan if protect is None else protect*100
+            z["比較出場時間"]=twidx[exit_i] if exit_i<len(twidx) else d.index[exit_i]
+            z["比較出場價"]=exit_price
+            z["比較淨報酬%"]=net
+            z["比較MFE%"]=(float(path["High"].max())/entry-1)*100
+            z["比較MAE%"]=(float(path["Low"].min())/entry-1)*100
+            z["保護曾啟動"]="是" if activated else "否"
+            z["比較出場原因"]=exit_reason
+            z["持有60m棒數"]=int(exit_i-entry_i+1)
+            rows.append(z)
+
+    detail=pd.DataFrame(rows)
+    if detail.empty:
+        return pd.DataFrame(),pd.DataFrame(),detail,errors
+
+    # 僅保留10個方案都存在的共同母體。
+    key_cols=["股票","訊號時間_台北","進場時間"]
+    counts=detail.groupby(key_cols)["參數組合"].nunique().reset_index(name="_n")
+    common=counts[counts["_n"]==len(configs)][key_cols]
+    detail=detail.merge(common,on=key_cols,how="inner")
+
+    def _metrics(g,sample,name):
+        tmp=g.copy()
+        tmp["淨報酬%"]=pd.to_numeric(tmp["比較淨報酬%"],errors="coerce")
+        m=aggregate_trade_metrics(tmp)
+        activated=(tmp["保護曾啟動"]=="是") if "保護曾啟動" in tmp.columns else pd.Series(False,index=tmp.index)
+        protective=tmp["比較出場原因"].astype(str).str.contains("保護_") if "比較出場原因" in tmp.columns else pd.Series(False,index=tmp.index)
+        return {
+            "樣本":sample,"參數組合":name,
+            "交易數":len(tmp),
+            "股票數":int(tmp["股票"].nunique()) if len(tmp) else 0,
+            **m,
+            "MFE中位數%":float(pd.to_numeric(tmp["比較MFE%"],errors="coerce").median()) if len(tmp) else np.nan,
+            "MAE中位數%":float(pd.to_numeric(tmp["比較MAE%"],errors="coerce").median()) if len(tmp) else np.nan,
+            "平均持有60m棒數":float(pd.to_numeric(tmp["持有60m棒數"],errors="coerce").mean()) if len(tmp) else np.nan,
+            "保護啟動率%":float(activated.mean()*100) if len(tmp) else np.nan,
+            "保護出場率%":float(protective.mean()*100) if len(tmp) else np.nan,
+        }
+
+    names=[x[0] for x in configs]
+    summary_rows=[]
+    for sample in ["全部","樣本內60%","樣本外40%"]:
+        xs=detail if sample=="全部" else detail[detail["樣本"]==sample]
+        for name in names:
+            summary_rows.append(_metrics(xs[xs["參數組合"]==name],sample,name))
+    summary=pd.DataFrame(summary_rows)
+
+    block_rows=[]
+    for block in ["第1段","第2段","第3段","第4段"]:
+        xb=detail[detail["時間段"]==block]
+        for name in names:
+            row=_metrics(xb[xb["參數組合"]==name],block,name)
+            row["時間段"]=block
+            row.pop("樣本",None)
+            block_rows.append(row)
+    blocks=pd.DataFrame(block_rows)
+
+    return summary,blocks,detail,errors
 def validate_profit_protection_candidates(cost: CostConfig):
     """
     V1.16.26 獲利保護A/B：
@@ -5037,8 +5216,10 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["獲利保護驗證","持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
-            if research_mode == "獲利保護驗證":
+                ["獲利保護敏感度","獲利保護驗證","持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
+            if research_mode == "獲利保護敏感度":
+                st.caption("不追單一最佳值；用同一批進場比較觸發+4/+5/+6 × 保護+1/+2/+3，檢查獲利保護是否具鄰近參數穩健性。")
+            elif research_mode == "獲利保護驗證":
                 st.caption("固定同一批正式架構C進場，比較5日基準、4日固定出場，以及曾達+5%後的保本/+2/+3獲利保護。")
             elif research_mode == "持有天數驗證":
                 st.caption("固定同一批正式架構C進場，只比較2/3/4/5日出場，避免短持有因多出新訊號造成不公平比較。")
@@ -5079,7 +5260,7 @@ with st.sidebar:
                 "KD黃金交叉 + MA30向上","KD黃金交叉 + MA60向上","KD黃金交叉 + 量比>1.2",
                 "KD黃金交叉 + 量比>1.5","KD黃金交叉 + 站上VWAP","MA5>15 + KD + 站上VWAP"
             ]
-            if research_mode not in ["獲利保護驗證","持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
+            if research_mode not in ["獲利保護敏感度","獲利保護驗證","持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward驗證","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
                 selected_rules = st.multiselect("進場規則", all_rules, default=["KD黃金交叉 + K<30"])
                 selected_modes = st.multiselect("持有方式",
                     ["當沖","隔日","2日","3日","4日","5日","6日","7日"], default=["5日"])
@@ -5106,6 +5287,7 @@ with st.sidebar:
         _btn_label="🔄 更新今日雷達"
     else:
         _btn_label={
+            "獲利保護敏感度":"🧪 執行獲利保護敏感度",
             "獲利保護驗證":"🛡️ 執行獲利保護A/B",
             "持有天數驗證":"⏱️ 執行2/3/4/5日持有A/B",
             "持有路徑健診":"🧭 執行持有路徑健診",
@@ -5176,6 +5358,42 @@ if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and 
     st.download_button("⬇️ 下載【TOP50暖機資料完整度】",_uc.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"{APP_VERSION}_TOP50暖機資料完整度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
     st.success("四份檔案可連續下載，不需重跑。")
+
+if simple_mode=="進階研究" and research_mode=="獲利保護敏感度" and not run:
+    st.info("V1.16.26 顯示+5%後保+2/+3都比5日基準穩健，且樣本外以保+2稍佳。這版不直接定案，而是檢查附近參數：觸發+4/+5/+6 × 保護+1/+2/+3，確認優勢是不是一整片而不是單點。")
+
+if run and simple_mode=="進階研究" and research_mode=="獲利保護敏感度":
+    st.subheader("🧪 獲利保護敏感度")
+    with st.spinner("固定同一批正式架構C進場，計算9組附近參數＋5日基準…"):
+        _ps_sum,_ps_blocks,_ps_detail,_ps_errs=validate_profit_protection_sensitivity(cost)
+    st.session_state["st_v11627_profit_sensitivity"]={
+        "summary":_ps_sum,"blocks":_ps_blocks,"detail":_ps_detail,"errors":_ps_errs
+    }
+
+_ps=st.session_state.get("st_v11627_profit_sensitivity")
+if simple_mode=="進階研究" and research_mode=="獲利保護敏感度" and _ps:
+    _ss=_ps.get("summary",pd.DataFrame()); _sb=_ps.get("blocks",pd.DataFrame())
+    _sd=_ps.get("detail",pd.DataFrame()); _se=_ps.get("errors",[])
+    st.subheader("🧪 獲利保護敏感度結果")
+    if _se:
+        st.warning("資料來源異常："+"；".join(_se))
+    st.info("這版看『鄰近參數是否一起有效』，不是挑最高PF。若只有單一格漂亮、周邊不穩，就視為可能過度擬合。")
+    if not _ss.empty:
+        st.markdown("#### 全部 / 樣本內 / 樣本外")
+        st.dataframe(_ss.round(3),use_container_width=True,hide_index=True)
+    if not _sb.empty:
+        st.markdown("#### 四段時間穩定度")
+        st.dataframe(_sb.round(3),use_container_width=True,hide_index=True)
+    with st.expander("查看逐筆9組參數比較"):
+        st.dataframe(_sd.round(3),use_container_width=True,hide_index=True)
+
+    st.download_button("⬇️ 下載【獲利保護敏感度摘要】",_ss.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_獲利保護敏感度摘要.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【獲利保護敏感度四段】",_sb.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_獲利保護敏感度四段.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【獲利保護敏感度逐筆】",_sd.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_獲利保護敏感度逐筆.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.success("三份檔案可連續下載，不需重跑。")
 
 if simple_mode=="進階研究" and research_mode=="獲利保護驗證" and not run:
     st.info("V1.16.25 顯示4日整體略優於5日、且第1段明顯改善，但樣本外仍是5日最好，因此不直接把持有期縮成4日。這版測試『5日保留趨勢空間＋曾達+5%後才啟動獲利保護』。")
@@ -5992,6 +6210,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 單股總�
 # V1.16.10：所有「上方已有獨立執行流程」的研究模式集中管理。
 # 後續新增研究模式時只要加入此集合，就不會再掉進舊版共用流程而引用未定義的 summary。
 INDEPENDENT_RESEARCH_MODES = {
+    "獲利保護敏感度",
     "獲利保護驗證",
     "持有天數驗證",
     "持有路徑健診",
@@ -6659,6 +6878,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.26 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.27 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
