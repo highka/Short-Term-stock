@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.27
+黑嚕嚕－短線交易雷達 ST V1.16.28
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.27"
+APP_VERSION = "ST V1.16.28"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.27"
-EXPORT_PREFIX = "ST_V1.16.27"
+APP_VERSION = "ST_V1.16.28"
+EXPORT_PREFIX = "ST_V1.16.28"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1877,6 +1877,112 @@ def build_top200_market_breadth_context():
 
 
 
+
+def validate_profit_protection_risk_benefit(cost: CostConfig):
+    """
+    V1.16.28 獲利保護風險效益健診：
+    沿用V1.16.27同一批進場與9組敏感度結果，
+    不再找最高PF，而是檢查每筆交易相對5日基準的改善/犧牲分布。
+    """
+    summary,blocks,detail,errors=validate_profit_protection_sensitivity(cost)
+    if detail is None or detail.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    key_cols=["股票","訊號時間_台北","進場時間"]
+    keep_cols=key_cols+["樣本","時間段","參數組合","比較淨報酬%","比較出場原因","保護曾啟動"]
+    d=detail[keep_cols].copy()
+    ret=d.pivot_table(index=key_cols,columns="參數組合",values="比較淨報酬%",aggfunc="first")
+    meta=d.drop_duplicates(key_cols)[key_cols+["樣本","時間段"]].set_index(key_cols)
+
+    base_col="A_5日基準"
+    if base_col not in ret.columns:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors+["找不到5日基準欄位"]
+
+    candidates=[c for c in ret.columns if c!=base_col]
+
+    def _tail_metrics(x):
+        x=pd.to_numeric(x,errors="coerce").dropna()
+        if x.empty:
+            return {"報酬P5%":np.nan,"報酬P10%":np.nan,"CVaR10%":np.nan,
+                    "最差單筆%":np.nan,"虧損中位數%":np.nan}
+        p10=float(x.quantile(0.10))
+        worst10=x[x<=p10]
+        losses=x[x<0]
+        return {
+            "報酬P5%":float(x.quantile(0.05)),
+            "報酬P10%":p10,
+            "CVaR10%":float(worst10.mean()) if len(worst10) else np.nan,
+            "最差單筆%":float(x.min()),
+            "虧損中位數%":float(losses.median()) if len(losses) else np.nan,
+        }
+
+    rows=[]
+    for sample in ["全部","樣本內60%","樣本外40%"]:
+        idx=ret.index if sample=="全部" else meta[meta["樣本"]==sample].index
+        rsub=ret.loc[ret.index.intersection(idx)]
+        for cand in [base_col]+candidates:
+            x=pd.to_numeric(rsub[cand],errors="coerce")
+            delta=pd.Series(0.0,index=x.index) if cand==base_col else x-pd.to_numeric(rsub[base_col],errors="coerce")
+            rows.append({
+                "樣本":sample,
+                "參數組合":cand,
+                "交易數":int(x.notna().sum()),
+                "平均淨報酬%":float(x.mean()) if x.notna().any() else np.nan,
+                "平均Δvs5日%":float(delta.mean()) if delta.notna().any() else np.nan,
+                "中位數Δvs5日%":float(delta.median()) if delta.notna().any() else np.nan,
+                "改善率%":float((delta>0).mean()*100) if cand!=base_col else 0.0,
+                "惡化率%":float((delta<0).mean()*100) if cand!=base_col else 0.0,
+                "不變率%":float((delta==0).mean()*100),
+                "ΔP10%":float(delta.quantile(0.10)) if delta.notna().any() else np.nan,
+                "ΔP90%":float(delta.quantile(0.90)) if delta.notna().any() else np.nan,
+                "單筆改善>=5%占比":float((delta>=5).mean()*100) if cand!=base_col else 0.0,
+                "單筆惡化<=-5%占比":float((delta<=-5).mean()*100) if cand!=base_col else 0.0,
+                **_tail_metrics(x)
+            })
+    risk_summary=pd.DataFrame(rows)
+
+    block_rows=[]
+    for block in ["第1段","第2段","第3段","第4段"]:
+        idx=meta[meta["時間段"]==block].index
+        rsub=ret.loc[ret.index.intersection(idx)]
+        for cand in candidates:
+            x=pd.to_numeric(rsub[cand],errors="coerce")
+            b=pd.to_numeric(rsub[base_col],errors="coerce")
+            delta=x-b
+            block_rows.append({
+                "時間段":block,
+                "參數組合":cand,
+                "交易數":int(delta.notna().sum()),
+                "平均Δvs5日%":float(delta.mean()) if delta.notna().any() else np.nan,
+                "中位數Δvs5日%":float(delta.median()) if delta.notna().any() else np.nan,
+                "改善率%":float((delta>0).mean()*100) if delta.notna().any() else np.nan,
+                "惡化率%":float((delta<0).mean()*100) if delta.notna().any() else np.nan,
+                "ΔP10%":float(delta.quantile(0.10)) if delta.notna().any() else np.nan,
+                "ΔP90%":float(delta.quantile(0.90)) if delta.notna().any() else np.nan,
+                "單筆改善>=5%占比":float((delta>=5).mean()*100) if delta.notna().any() else np.nan,
+                "單筆惡化<=-5%占比":float((delta<=-5).mean()*100) if delta.notna().any() else np.nan,
+            })
+    block_pair=pd.DataFrame(block_rows)
+
+    focus=["T4_P2","T5_P1","T5_P2","T5_P3","T6_P2"]
+    compare_rows=[]
+    for cand in focus:
+        if cand not in ret.columns:
+            continue
+        delta=pd.to_numeric(ret[cand],errors="coerce")-pd.to_numeric(ret[base_col],errors="coerce")
+        compare_rows.append({
+            "參數組合":cand,
+            "全體平均Δ%":float(delta.mean()),
+            "全體改善率%":float((delta>0).mean()*100),
+            "全體惡化率%":float((delta<0).mean()*100),
+            "全體不變率%":float((delta==0).mean()*100),
+            "全體ΔP10%":float(delta.quantile(0.10)),
+            "全體ΔP90%":float(delta.quantile(0.90)),
+            "全體改善>=5%占比":float((delta>=5).mean()*100),
+            "全體惡化<=-5%占比":float((delta<=-5).mean()*100),
+        })
+    focus_df=pd.DataFrame(compare_rows)
+    return risk_summary,block_pair,focus_df,errors
 def validate_profit_protection_sensitivity(cost: CostConfig):
     """
     V1.16.27 獲利保護敏感度驗證：
@@ -5216,8 +5322,10 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["獲利保護敏感度","獲利保護驗證","持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
-            if research_mode == "獲利保護敏感度":
+                ["獲利保護風險效益","獲利保護敏感度","獲利保護驗證","持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
+            if research_mode == "獲利保護風險效益":
+                st.caption("用逐筆paired比較檢查獲利保護降低多少左尾風險、又犧牲多少大波段；不再只看PF。")
+            elif research_mode == "獲利保護敏感度":
                 st.caption("不追單一最佳值；用同一批進場比較觸發+4/+5/+6 × 保護+1/+2/+3，檢查獲利保護是否具鄰近參數穩健性。")
             elif research_mode == "獲利保護驗證":
                 st.caption("固定同一批正式架構C進場，比較5日基準、4日固定出場，以及曾達+5%後的保本/+2/+3獲利保護。")
@@ -5260,7 +5368,7 @@ with st.sidebar:
                 "KD黃金交叉 + MA30向上","KD黃金交叉 + MA60向上","KD黃金交叉 + 量比>1.2",
                 "KD黃金交叉 + 量比>1.5","KD黃金交叉 + 站上VWAP","MA5>15 + KD + 站上VWAP"
             ]
-            if research_mode not in ["獲利保護敏感度","獲利保護驗證","持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward驗證","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
+            if research_mode not in ["獲利保護風險效益","獲利保護敏感度","獲利保護驗證","持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward驗證","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
                 selected_rules = st.multiselect("進場規則", all_rules, default=["KD黃金交叉 + K<30"])
                 selected_modes = st.multiselect("持有方式",
                     ["當沖","隔日","2日","3日","4日","5日","6日","7日"], default=["5日"])
@@ -5287,6 +5395,7 @@ with st.sidebar:
         _btn_label="🔄 更新今日雷達"
     else:
         _btn_label={
+            "獲利保護風險效益":"⚖️ 執行獲利保護風險效益",
             "獲利保護敏感度":"🧪 執行獲利保護敏感度",
             "獲利保護驗證":"🛡️ 執行獲利保護A/B",
             "持有天數驗證":"⏱️ 執行2/3/4/5日持有A/B",
@@ -5358,6 +5467,43 @@ if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and 
     st.download_button("⬇️ 下載【TOP50暖機資料完整度】",_uc.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"{APP_VERSION}_TOP50暖機資料完整度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
     st.success("四份檔案可連續下載，不需重跑。")
+
+if simple_mode=="進階研究" and research_mode=="獲利保護風險效益" and not run:
+    st.info("V1.16.27 顯示9組附近參數幾乎都能提高PF與勝率，但樣本外平均報酬多數略低於5日基準。這代表獲利保護更像『降低左尾、犧牲部分大波段』，這版用逐筆paired差異與尾端風險正式量化。")
+
+if run and simple_mode=="進階研究" and research_mode=="獲利保護風險效益":
+    st.subheader("⚖️ 獲利保護風險效益")
+    with st.spinner("重建同一批敏感度結果，計算逐筆Δ報酬與左尾風險…"):
+        _rb_sum,_rb_blocks,_rb_focus,_rb_errs=validate_profit_protection_risk_benefit(cost)
+    st.session_state["st_v11628_risk_benefit"]={
+        "summary":_rb_sum,"blocks":_rb_blocks,"focus":_rb_focus,"errors":_rb_errs
+    }
+
+_rb=st.session_state.get("st_v11628_risk_benefit")
+if simple_mode=="進階研究" and research_mode=="獲利保護風險效益" and _rb:
+    _rs=_rb.get("summary",pd.DataFrame()); _rblk=_rb.get("blocks",pd.DataFrame())
+    _rf=_rb.get("focus",pd.DataFrame()); _re=_rb.get("errors",[])
+    st.subheader("⚖️ 獲利保護風險效益結果")
+    if _re:
+        st.warning("資料來源異常："+"；".join(_re))
+    st.info("這版不以最高PF定參數；重點看paired平均Δ、左尾P5/P10/CVaR10、單筆大幅改善與大幅惡化比例。")
+    if not _rf.empty:
+        st.markdown("#### 五個代表候選｜逐筆相對5日基準")
+        st.dataframe(_rf.round(3),use_container_width=True,hide_index=True)
+    if not _rs.empty:
+        st.markdown("#### 全部 / 樣本內 / 樣本外｜風險效益")
+        st.dataframe(_rs.round(3),use_container_width=True,hide_index=True)
+    if not _rblk.empty:
+        st.markdown("#### 四段paired穩定度")
+        st.dataframe(_rblk.round(3),use_container_width=True,hide_index=True)
+
+    st.download_button("⬇️ 下載【獲利保護風險效益摘要】",_rs.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_獲利保護風險效益摘要.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【獲利保護風險效益四段】",_rblk.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_獲利保護風險效益四段.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【獲利保護代表候選比較】",_rf.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_獲利保護代表候選比較.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.success("三份檔案可連續下載，不需重跑。")
 
 if simple_mode=="進階研究" and research_mode=="獲利保護敏感度" and not run:
     st.info("V1.16.26 顯示+5%後保+2/+3都比5日基準穩健，且樣本外以保+2稍佳。這版不直接定案，而是檢查附近參數：觸發+4/+5/+6 × 保護+1/+2/+3，確認優勢是不是一整片而不是單點。")
@@ -6210,6 +6356,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 單股總�
 # V1.16.10：所有「上方已有獨立執行流程」的研究模式集中管理。
 # 後續新增研究模式時只要加入此集合，就不會再掉進舊版共用流程而引用未定義的 summary。
 INDEPENDENT_RESEARCH_MODES = {
+    "獲利保護風險效益",
     "獲利保護敏感度",
     "獲利保護驗證",
     "持有天數驗證",
@@ -6878,6 +7025,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.27 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.28 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
