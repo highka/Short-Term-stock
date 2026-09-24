@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.32
+黑嚕嚕－短線交易雷達 ST V1.16.33
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.32"
+APP_VERSION = "ST V1.16.33"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.32"
-EXPORT_PREFIX = "ST_V1.16.32"
+APP_VERSION = "ST_V1.16.33"
+EXPORT_PREFIX = "ST_V1.16.33"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1914,6 +1914,126 @@ def build_top200_market_breadth_context():
 
 
 
+
+def validate_long_horizon_concentration(cost: CostConfig):
+    """
+    V1.16.33 長期報酬分布 / 集中度健診：
+    沿用V1.16.32完全相同的1y資料、最後9mo評估、正式架構C與5日持有。
+    不新增任何策略條件，只檢查長期正期望是否被少數月份 / 少數股票 / 極端大賺單支撐。
+
+    輸出：
+      1) 月度穩定度
+      2) 股票貢獻集中度
+      3) 移除Top5 / Top10 / Top20正貢獻股票後，核心績效是否仍為正
+      4) Mean / Median / 5% trimmed mean / P10 / P90
+    """
+    _,_,t,errors=validate_long_horizon_robustness(cost)
+    if t is None or t.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    x=t.copy()
+    x["淨報酬%"]=pd.to_numeric(x["淨報酬%"],errors="coerce")
+    x=x[x["淨報酬%"].notna()].copy()
+    x["訊號月份"]=pd.to_datetime(x["訊號時間_台北"],errors="coerce").dt.strftime("%Y-%m")
+
+    # ---------------- 月度 ----------------
+    month_rows=[]
+    for month,g in x.groupby("訊號月份",sort=True):
+        arr=pd.to_numeric(g["淨報酬%"],errors="coerce").dropna().sort_values()
+        n=len(arr)
+        trim_n=int(np.floor(n*0.05))
+        trimmed=arr.iloc[trim_n:n-trim_n] if n>2*trim_n and trim_n>0 else arr
+        m=aggregate_trade_metrics(g)
+        month_rows.append({
+            "月份":month,
+            "交易數":len(g),
+            "股票數":int(g["股票"].nunique()),
+            "平均淨報酬%":float(arr.mean()) if n else np.nan,
+            "中位數淨報酬%":float(arr.median()) if n else np.nan,
+            "5%TrimmedMean%":float(trimmed.mean()) if len(trimmed) else np.nan,
+            "P10%":float(arr.quantile(0.10)) if n else np.nan,
+            "P90%":float(arr.quantile(0.90)) if n else np.nan,
+            "勝率%":m.get("整體交易勝率",np.nan),
+            "PF":m.get("整體PF",np.nan),
+        })
+    monthly=pd.DataFrame(month_rows)
+
+    # ---------------- 股票貢獻 ----------------
+    stock_rows=[]
+    for stock,g in x.groupby("股票"):
+        arr=pd.to_numeric(g["淨報酬%"],errors="coerce").dropna()
+        stock_rows.append({
+            "股票":stock,
+            "交易數":len(g),
+            "總淨報酬貢獻":float(arr.sum()),
+            "平均淨報酬%":float(arr.mean()) if len(arr) else np.nan,
+            "中位數淨報酬%":float(arr.median()) if len(arr) else np.nan,
+            "勝率%":float((arr>0).mean()*100) if len(arr) else np.nan,
+        })
+    stocks=pd.DataFrame(stock_rows).sort_values(
+        ["總淨報酬貢獻","交易數"],ascending=[False,False]
+    ).reset_index(drop=True)
+
+    total_sum=float(x["淨報酬%"].sum())
+    stocks["累積總淨報酬貢獻"]=stocks["總淨報酬貢獻"].cumsum()
+    stocks["累積貢獻占總淨報酬%"]=(
+        stocks["累積總淨報酬貢獻"]/total_sum*100 if total_sum!=0 else np.nan
+    )
+
+    # ---------------- 影響力移除 ----------------
+    positive_rank=stocks[stocks["總淨報酬貢獻"]>0]["股票"].tolist()
+    influence_rows=[]
+
+    def _dist_metrics(g):
+        arr=pd.to_numeric(g["淨報酬%"],errors="coerce").dropna().sort_values()
+        n=len(arr)
+        trim_n=int(np.floor(n*0.05))
+        trimmed=arr.iloc[trim_n:n-trim_n] if n>2*trim_n and trim_n>0 else arr
+        m=aggregate_trade_metrics(g)
+        return {
+            "交易數":len(g),
+            "股票數":int(g["股票"].nunique()) if len(g) else 0,
+            "平均淨報酬%":float(arr.mean()) if n else np.nan,
+            "中位數淨報酬%":float(arr.median()) if n else np.nan,
+            "5%TrimmedMean%":float(trimmed.mean()) if len(trimmed) else np.nan,
+            "勝率%":m.get("整體交易勝率",np.nan),
+            "PF":m.get("整體PF",np.nan),
+        }
+
+    influence_rows.append({"情境":"基準_全部",**_dist_metrics(x)})
+    for k in [5,10,20]:
+        remove=set(positive_rank[:k])
+        g=x[~x["股票"].isin(remove)].copy()
+        influence_rows.append({
+            "情境":f"移除Top{k}正貢獻股票",
+            **_dist_metrics(g)
+        })
+    influence=pd.DataFrame(influence_rows)
+
+    # ---------------- 全體分布摘要 ----------------
+    arr=x["淨報酬%"].dropna().sort_values()
+    n=len(arr)
+    trim_n=int(np.floor(n*0.05))
+    trimmed=arr.iloc[trim_n:n-trim_n] if n>2*trim_n and trim_n>0 else arr
+
+    stock_avg=stocks["平均淨報酬%"].dropna()
+    distribution=pd.DataFrame([{
+        "交易數":len(x),
+        "股票數":int(x["股票"].nunique()),
+        "平均淨報酬%":float(arr.mean()) if n else np.nan,
+        "中位數淨報酬%":float(arr.median()) if n else np.nan,
+        "5%TrimmedMean%":float(trimmed.mean()) if len(trimmed) else np.nan,
+        "P10%":float(arr.quantile(0.10)) if n else np.nan,
+        "P90%":float(arr.quantile(0.90)) if n else np.nan,
+        "股票平均報酬為正占比%":float((stock_avg>0).mean()*100) if len(stock_avg) else np.nan,
+        "Top5股票貢獻占總淨報酬%":float(stocks.head(5)["總淨報酬貢獻"].sum()/total_sum*100) if total_sum!=0 else np.nan,
+        "Top10股票貢獻占總淨報酬%":float(stocks.head(10)["總淨報酬貢獻"].sum()/total_sum*100) if total_sum!=0 else np.nan,
+        "Top20股票貢獻占總淨報酬%":float(stocks.head(20)["總淨報酬貢獻"].sum()/total_sum*100) if total_sum!=0 else np.nan,
+        "正平均月份數":int((monthly["平均淨報酬%"]>0).sum()) if not monthly.empty else 0,
+        "總月份數":len(monthly),
+    }])
+
+    return monthly,stocks,influence,distribution,errors
 def validate_long_horizon_robustness(cost: CostConfig):
     """
     V1.16.32 長期穩健度驗證：
@@ -5980,8 +6100,10 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["長期穩健度驗證","延遲TimeStop驗證","早期路徑健診","固定停損驗證","獲利保護風險效益","獲利保護敏感度","獲利保護驗證","持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
-            if research_mode == "長期穩健度驗證":
+                ["長期集中度健診","長期穩健度驗證","延遲TimeStop驗證","早期路徑健診","固定停損驗證","獲利保護風險效益","獲利保護敏感度","獲利保護驗證","持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
+            if research_mode == "長期集中度健診":
+                st.caption("沿用1年長期樣本，檢查正期望是否被少數月份、少數股票或極端大賺單支撐；不改任何策略規則。")
+            elif research_mode == "長期穩健度驗證":
                 st.caption("停止微調出場參數；用1y 60m＋12mo歷史流動性，正式檢查核心5日策略在最後9mo是否跨時間穩健。")
             elif research_mode == "延遲TimeStop驗證":
                 st.caption("固定同一批進場，比較第2/3日收盤弱勢才提早出場；避免盤中固定停損把會反彈的交易洗掉。")
@@ -6034,7 +6156,7 @@ with st.sidebar:
                 "KD黃金交叉 + MA30向上","KD黃金交叉 + MA60向上","KD黃金交叉 + 量比>1.2",
                 "KD黃金交叉 + 量比>1.5","KD黃金交叉 + 站上VWAP","MA5>15 + KD + 站上VWAP"
             ]
-            if research_mode not in ["長期穩健度驗證","延遲TimeStop驗證","早期路徑健診","固定停損驗證","獲利保護風險效益","獲利保護敏感度","獲利保護驗證","持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward驗證","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
+            if research_mode not in ["長期集中度健診","長期穩健度驗證","延遲TimeStop驗證","早期路徑健診","固定停損驗證","獲利保護風險效益","獲利保護敏感度","獲利保護驗證","持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward驗證","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
                 selected_rules = st.multiselect("進場規則", all_rules, default=["KD黃金交叉 + K<30"])
                 selected_modes = st.multiselect("持有方式",
                     ["當沖","隔日","2日","3日","4日","5日","6日","7日"], default=["5日"])
@@ -6061,6 +6183,7 @@ with st.sidebar:
         _btn_label="🔄 更新今日雷達"
     else:
         _btn_label={
+            "長期集中度健診":"🧮 執行長期集中度健診",
             "長期穩健度驗證":"🧱 執行1年長期穩健度驗證",
             "延遲TimeStop驗證":"⏳ 執行延遲Time-Stop A/B",
             "早期路徑健診":"🩺 執行早期路徑健診",
@@ -6136,6 +6259,49 @@ if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and 
                        file_name=f"{APP_VERSION}_TOP50暖機修正逐筆交易.csv",mime="text/csv",use_container_width=True,on_click="ignore")
     st.download_button("⬇️ 下載【TOP50暖機資料完整度】",_uc.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"{APP_VERSION}_TOP50暖機資料完整度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.success("四份檔案可連續下載，不需重跑。")
+
+if simple_mode=="進階研究" and research_mode=="長期集中度健診" and not run:
+    st.info("V1.16.32 的9個月正式架構C共有1510筆交易，樣本內/外都維持約+2%平均報酬，6個時間區塊也全部為正。這版進一步檢查報酬是不是其實集中在少數月份或少數股票。")
+
+if run and simple_mode=="進階研究" and research_mode=="長期集中度健診":
+    st.subheader("🧮 長期報酬分布 / 集中度健診")
+    with st.spinner("沿用1y長期正式架構C，計算月度穩定度、股票貢獻與Top貢獻移除測試…"):
+        _lc_month,_lc_stock,_lc_infl,_lc_dist,_lc_errs=validate_long_horizon_concentration(cost)
+    st.session_state["st_v11633_long_concentration"]={
+        "monthly":_lc_month,"stocks":_lc_stock,"influence":_lc_infl,
+        "distribution":_lc_dist,"errors":_lc_errs
+    }
+
+_lc=st.session_state.get("st_v11633_long_concentration")
+if simple_mode=="進階研究" and research_mode=="長期集中度健診" and _lc:
+    _lm=_lc.get("monthly",pd.DataFrame()); _ls=_lc.get("stocks",pd.DataFrame())
+    _li=_lc.get("influence",pd.DataFrame()); _ld=_lc.get("distribution",pd.DataFrame())
+    _le=_lc.get("errors",[])
+    st.subheader("🧮 長期集中度結果")
+    if _le:
+        st.warning("資料來源異常："+"；".join(_le))
+    st.info("這版不找新參數；重點是確認長期+2%平均報酬是否具有廣度，而不是被少數大賺股票或少數月份拉高。")
+    if not _ld.empty:
+        st.markdown("#### 全體分布摘要")
+        st.dataframe(_ld.round(3),use_container_width=True,hide_index=True)
+    if not _li.empty:
+        st.markdown("#### 移除Top正貢獻股票後")
+        st.dataframe(_li.round(3),use_container_width=True,hide_index=True)
+    if not _lm.empty:
+        st.markdown("#### 月度穩定度")
+        st.dataframe(_lm.round(3),use_container_width=True,hide_index=True)
+    with st.expander("查看各股票長期貢獻"):
+        st.dataframe(_ls.round(3),use_container_width=True,hide_index=True)
+
+    st.download_button("⬇️ 下載【長期分布摘要】",_ld.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_長期分布摘要.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【長期月度穩定度】",_lm.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_長期月度穩定度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【長期股票貢獻】",_ls.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_長期股票貢獻.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【長期Top貢獻移除測試】",_li.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_長期Top貢獻移除測試.csv",mime="text/csv",use_container_width=True,on_click="ignore")
     st.success("四份檔案可連續下載，不需重跑。")
 
 if simple_mode=="進階研究" and research_mode=="長期穩健度驗證" and not run:
@@ -7185,6 +7351,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 單股總�
 # V1.16.10：所有「上方已有獨立執行流程」的研究模式集中管理。
 # 後續新增研究模式時只要加入此集合，就不會再掉進舊版共用流程而引用未定義的 summary。
 INDEPENDENT_RESEARCH_MODES = {
+    "長期集中度健診",
     "長期穩健度驗證",
     "延遲TimeStop驗證",
     "早期路徑健診",
@@ -7858,6 +8025,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.32 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.33 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
