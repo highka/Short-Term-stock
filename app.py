@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.33
+黑嚕嚕－短線交易雷達 ST V1.16.34
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.33"
+APP_VERSION = "ST V1.16.34"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.33"
-EXPORT_PREFIX = "ST_V1.16.33"
+APP_VERSION = "ST_V1.16.34"
+EXPORT_PREFIX = "ST_V1.16.34"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1378,6 +1378,51 @@ def build_current_formal_radar_pool(max_rank: int = 150):
 
 
 @st.cache_data(ttl=1800, max_entries=2, show_spinner=False)
+
+def get_frozen_strategy_config():
+    """
+    V1.16.34 正式核心策略凍結設定。
+    此函式作為未來 Shioaji 即時引擎與 Streamlit 雷達共用的單一規格來源。
+    """
+    return {
+        "strategy_status":"FROZEN_BASELINE",
+        "strategy_version":"ST V1.16.34",
+        "universe_source":"官方TWSE+TPEx普通股母池",
+        "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
+        "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
+        "scan_pool_size":150,
+        "market_breadth_pool_size":200,
+        "signal_timeframe":"60m",
+        "signal_rule":"KD黃金交叉 + K<30",
+        "kd_rule":"KD(9,3,3)，RSV9，K/D遞迴2/3前值+1/3當值，初始50",
+        "entry_rule":"完成訊號後下一根60m K Open",
+        "holding_rule":"持有5個交易日",
+        "overlap_rule":"non-overlap",
+        "grade_S":"量比20>=1.5 且 MA60斜率3<=0",
+        "grade_A":"量比20>=1.5 或 MA60斜率3<=0，僅符合一項",
+        "grade_B":"兩項皆不符合",
+        "market_risk_display":"TOP200 MA15/30/60廣度；目前僅警示，不作硬Gate",
+        "profit_protection":"研究保留，不納入正式基準",
+        "fixed_stoploss":"不採用",
+        "delayed_timestop":"不採用",
+        "realtime_plan":"Shioaji常駐行情引擎；Streamlit只顯示/研究",
+    }
+
+
+def get_shioaji_realtime_spec():
+    """
+    V1.16.34 即時串接規格（不需要安裝shioaji即可顯示）。
+    真正連線/下單將放在本機或VPS常駐worker，不放Streamlit Cloud。
+    """
+    return pd.DataFrame([
+        {"階段":"08:30~08:59","模組":"盤前建池","動作":"用前一完成日K重建官方全市場流動性排名，取TOP200；正式掃描TOP150"},
+        {"階段":"09:00~13:30","模組":"即時行情","動作":"Shioaji訂閱TOP150股票即時行情/即時KBar"},
+        {"階段":"盤中","模組":"K棒聚合","動作":"維護60m K；未完成K只標預備訊號，不當正式訊號"},
+        {"階段":"60m完成","模組":"正式訊號","動作":"依凍結規則計算KD黃金交叉、K<30、量比20、MA60斜率3與S/A/B"},
+        {"階段":"訊號成立","模組":"狀態儲存","動作":"寫入SQLite/PostgreSQL或JSON狀態檔，供Streamlit讀取"},
+        {"階段":"通知","模組":"Telegram","動作":"新訊號/異常/收盤摘要通知；先不自動下單"},
+        {"階段":"交易層","模組":"Shioaji Order","動作":"第二階段再加入模擬單→人工確認→自動下單"},
+    ])
 def build_current_market_breadth(top200_pool: pd.DataFrame):
     """
     V1.16.22 今日市場環境：
@@ -6100,8 +6145,10 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["長期集中度健診","長期穩健度驗證","延遲TimeStop驗證","早期路徑健診","固定停損驗證","獲利保護風險效益","獲利保護敏感度","獲利保護驗證","持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
-            if research_mode == "長期集中度健診":
+                ["策略凍結與即時規格","長期集中度健診","長期穩健度驗證","延遲TimeStop驗證","早期路徑健診","固定停損驗證","獲利保護風險效益","獲利保護敏感度","獲利保護驗證","持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
+            if research_mode == "策略凍結與即時規格":
+                st.caption("正式凍結核心策略參數，輸出未來Shioaji即時引擎共用規格；這個模式不再調參。")
+            elif research_mode == "長期集中度健診":
                 st.caption("沿用1年長期樣本，檢查正期望是否被少數月份、少數股票或極端大賺單支撐；不改任何策略規則。")
             elif research_mode == "長期穩健度驗證":
                 st.caption("停止微調出場參數；用1y 60m＋12mo歷史流動性，正式檢查核心5日策略在最後9mo是否跨時間穩健。")
@@ -6156,7 +6203,7 @@ with st.sidebar:
                 "KD黃金交叉 + MA30向上","KD黃金交叉 + MA60向上","KD黃金交叉 + 量比>1.2",
                 "KD黃金交叉 + 量比>1.5","KD黃金交叉 + 站上VWAP","MA5>15 + KD + 站上VWAP"
             ]
-            if research_mode not in ["長期集中度健診","長期穩健度驗證","延遲TimeStop驗證","早期路徑健診","固定停損驗證","獲利保護風險效益","獲利保護敏感度","獲利保護驗證","持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward驗證","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
+            if research_mode not in ["策略凍結與即時規格","長期集中度健診","長期穩健度驗證","延遲TimeStop驗證","早期路徑健診","固定停損驗證","獲利保護風險效益","獲利保護敏感度","獲利保護驗證","持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward驗證","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
                 selected_rules = st.multiselect("進場規則", all_rules, default=["KD黃金交叉 + K<30"])
                 selected_modes = st.multiselect("持有方式",
                     ["當沖","隔日","2日","3日","4日","5日","6日","7日"], default=["5日"])
@@ -6183,6 +6230,7 @@ with st.sidebar:
         _btn_label="🔄 更新今日雷達"
     else:
         _btn_label={
+            "策略凍結與即時規格":"🔒 顯示正式凍結規格",
             "長期集中度健診":"🧮 執行長期集中度健診",
             "長期穩健度驗證":"🧱 執行1年長期穩健度驗證",
             "延遲TimeStop驗證":"⏳ 執行延遲Time-Stop A/B",
@@ -6260,6 +6308,34 @@ if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and 
     st.download_button("⬇️ 下載【TOP50暖機資料完整度】",_uc.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"{APP_VERSION}_TOP50暖機資料完整度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
     st.success("四份檔案可連續下載，不需重跑。")
+
+if simple_mode=="進階研究" and research_mode=="策略凍結與即時規格" and not run:
+    st.info("V1.16.33 長期集中度已通過：移除Top20正貢獻股票後，平均仍+1.16%、PF仍1.36，且10個月份有8個正平均。核心策略正式凍結，不再用這批資料繼續調參。")
+
+if run and simple_mode=="進階研究" and research_mode=="策略凍結與即時規格":
+    st.subheader("🔒 正式核心策略凍結")
+    _cfg=get_frozen_strategy_config()
+    _cfg_df=pd.DataFrame([{"項目":k,"設定":v} for k,v in _cfg.items()])
+    st.dataframe(_cfg_df,use_container_width=True,hide_index=True)
+
+    st.markdown("### 🔌 Shioaji 即時串接規格")
+    _rt=get_shioaji_realtime_spec()
+    st.dataframe(_rt,use_container_width=True,hide_index=True)
+
+    st.success("目前只凍結『訊號研究基準』。Shioaji第一階段只做即時行情＋雷達＋通知，不自動下單。")
+
+    st.download_button(
+        "⬇️ 下載【正式策略凍結設定】",
+        _cfg_df.to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"{APP_VERSION}_正式策略凍結設定.csv",
+        mime="text/csv",use_container_width=True,on_click="ignore"
+    )
+    st.download_button(
+        "⬇️ 下載【Shioaji即時串接規格】",
+        _rt.to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"{APP_VERSION}_Shioaji即時串接規格.csv",
+        mime="text/csv",use_container_width=True,on_click="ignore"
+    )
 
 if simple_mode=="進階研究" and research_mode=="長期集中度健診" and not run:
     st.info("V1.16.32 的9個月正式架構C共有1510筆交易，樣本內/外都維持約+2%平均報酬，6個時間區塊也全部為正。這版進一步檢查報酬是不是其實集中在少數月份或少數股票。")
@@ -7351,6 +7427,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 單股總�
 # V1.16.10：所有「上方已有獨立執行流程」的研究模式集中管理。
 # 後續新增研究模式時只要加入此集合，就不會再掉進舊版共用流程而引用未定義的 summary。
 INDEPENDENT_RESEARCH_MODES = {
+    "策略凍結與即時規格",
     "長期集中度健診",
     "長期穩健度驗證",
     "延遲TimeStop驗證",
@@ -8025,6 +8102,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.33 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.34 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
