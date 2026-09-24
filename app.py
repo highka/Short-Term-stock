@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.29
+黑嚕嚕－短線交易雷達 ST V1.16.30
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -28,7 +28,6 @@ from typing import Dict, List, Tuple, Optional
 # 在 numpy/pandas 載入前限制底層執行緒，避免記憶體/Thread耗盡。
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
@@ -51,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.29"
+APP_VERSION = "ST V1.16.30"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.29"
-EXPORT_PREFIX = "ST_V1.16.29"
+APP_VERSION = "ST_V1.16.30"
+EXPORT_PREFIX = "ST_V1.16.30"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1880,6 +1879,153 @@ def build_top200_market_breadth_context():
 
 
 
+
+def validate_early_path_diagnostics(cost: CostConfig):
+    """
+    V1.16.30 早期路徑健診：
+    固定正式架構C與5日基準，不新增停損規則。
+    目的：找出「最後會輸」的交易，在第1/2/3日收盤時是否已有可辨識特徵。
+
+    觀察：
+      - 第1 / 2 / 3日收盤相對進場報酬
+      - 最終5日報酬
+      - 固定分桶：<=-5、-5~-3、-3~0、0~3、>3
+      - 各分桶後續5日平均、PF、勝率、最後翻正率
+      - 特別比較第1段 vs 後三段
+
+    這版只診斷，不直接新增 time-stop。
+    """
+    _,_,_,base,errors=validate_breadth_transition(cost)
+    if base is None or base.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    symbols=sorted(base["股票"].dropna().astype(str).unique().tolist())
+    raw=download_intraday_batch(symbols,"60m","6mo")
+
+    data_map={}
+    idx_map={}
+    for s in symbols:
+        d=raw.get(s)
+        if d is None or d.empty:
+            continue
+        try:
+            x=d.copy().sort_index()
+            tw=_as_taipei_series(pd.Series(x.index))
+            data_map[s]=x
+            idx_map[s]={pd.Timestamp(t):i for i,t in enumerate(tw) if pd.notna(t)}
+        except Exception:
+            continue
+
+    rows=[]
+    for _,r in base.iterrows():
+        s=str(r["股票"])
+        d=data_map.get(s)
+        mp=idx_map.get(s)
+        if d is None or mp is None:
+            continue
+
+        et=_as_taipei_series(pd.Series([r["進場時間"]])).iloc[0]
+        if pd.isna(et):
+            continue
+        entry_i=mp.get(pd.Timestamp(et))
+        if entry_i is None or entry_i>=len(d):
+            continue
+
+        entry=float(d["Open"].iloc[entry_i])
+        if not np.isfinite(entry) or entry<=0:
+            continue
+
+        z=r.to_dict()
+        ok=True
+        for day in [1,2,3,5]:
+            ei=find_exit_index(d,entry_i,f"{day}日","60m")
+            if ei is None or ei<=entry_i or ei>=len(d):
+                ok=False
+                break
+            px=float(d["Close"].iloc[ei])
+            if not np.isfinite(px):
+                ok=False
+                break
+            gross=(px/entry-1)*100
+            net=gross-cost.roundtrip_cost_pct(daytrade=False)
+            z[f"第{day}日淨報酬%"]=net
+        if not ok:
+            continue
+
+        z["最終5日結果"]="獲利" if z["第5日淨報酬%"]>0 else "虧損"
+        rows.append(z)
+
+    detail=pd.DataFrame(rows)
+    if detail.empty:
+        return pd.DataFrame(),pd.DataFrame(),detail,errors
+
+    bins=[-np.inf,-5,-3,0,3,np.inf]
+    names=["<=-5%","-5~-3%","-3~0%","0~3%",">3%"]
+
+    bucket_rows=[]
+    for day in [1,2,3]:
+        col=f"第{day}日淨報酬%"
+        bucket=pd.cut(pd.to_numeric(detail[col],errors="coerce"),
+                      bins=bins,labels=names,include_lowest=True,right=True)
+        for name in names:
+            g=detail[bucket==name].copy()
+            if g.empty:
+                bucket_rows.append({
+                    "觀察日":f"第{day}日","早期報酬分桶":name,
+                    "交易數":0,"占比%":np.nan,"最終翻正率%":np.nan,
+                    "最終5日平均%":np.nan,"最終5日勝率%":np.nan,"最終5日PF":np.nan
+                })
+                continue
+            tmp=g.copy()
+            tmp["淨報酬%"]=pd.to_numeric(g["第5日淨報酬%"],errors="coerce")
+            m=aggregate_trade_metrics(tmp)
+            bucket_rows.append({
+                "觀察日":f"第{day}日",
+                "早期報酬分桶":name,
+                "交易數":len(g),
+                "占比%":float(len(g)/len(detail)*100),
+                "最終翻正率%":float((pd.to_numeric(g["第5日淨報酬%"],errors="coerce")>0).mean()*100),
+                "最終5日平均%":float(pd.to_numeric(g["第5日淨報酬%"],errors="coerce").mean()),
+                "最終5日勝率%":m.get("整體交易勝率",np.nan),
+                "最終5日PF":m.get("整體PF",np.nan),
+            })
+    buckets=pd.DataFrame(bucket_rows)
+
+    # 第1段 vs 後三段：看早期負報酬是否在失效段更具預測性。
+    compare_rows=[]
+    groups=[
+        ("第1段",detail[detail["時間段"]=="第1段"]),
+        ("第2~4段",detail[detail["時間段"].isin(["第2段","第3段","第4段"])]),
+        ("全部",detail),
+    ]
+    for gname,g0 in groups:
+        for day in [1,2,3]:
+            x=pd.to_numeric(g0[f"第{day}日淨報酬%"],errors="coerce")
+            for threshold in [-3,-5]:
+                g=g0[x<=threshold].copy()
+                if g.empty:
+                    compare_rows.append({
+                        "區段":gname,"觀察日":f"第{day}日","條件":f"<={threshold}%",
+                        "交易數":0,"占區段比例%":np.nan,"最終翻正率%":np.nan,
+                        "最終5日平均%":np.nan,"最終5日PF":np.nan
+                    })
+                    continue
+                tmp=g.copy()
+                tmp["淨報酬%"]=pd.to_numeric(g["第5日淨報酬%"],errors="coerce")
+                m=aggregate_trade_metrics(tmp)
+                compare_rows.append({
+                    "區段":gname,
+                    "觀察日":f"第{day}日",
+                    "條件":f"<={threshold}%",
+                    "交易數":len(g),
+                    "占區段比例%":float(len(g)/len(g0)*100) if len(g0) else np.nan,
+                    "最終翻正率%":float((pd.to_numeric(g["第5日淨報酬%"],errors="coerce")>0).mean()*100),
+                    "最終5日平均%":float(pd.to_numeric(g["第5日淨報酬%"],errors="coerce").mean()),
+                    "最終5日PF":m.get("整體PF",np.nan),
+                })
+    compare=pd.DataFrame(compare_rows)
+
+    return buckets,compare,detail,errors
 def validate_stoploss_candidates(cost: CostConfig):
     """
     V1.16.29 固定停損A/B：
@@ -5547,8 +5693,10 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["固定停損驗證","獲利保護風險效益","獲利保護敏感度","獲利保護驗證","持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
-            if research_mode == "固定停損驗證":
+                ["早期路徑健診","固定停損驗證","獲利保護風險效益","獲利保護敏感度","獲利保護驗證","持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
+            if research_mode == "早期路徑健診":
+                st.caption("固定5日基準，檢查第1/2/3日收盤的早期報酬是否能辨識最後會失敗的交易；只診斷、不直接加time-stop。")
+            elif research_mode == "固定停損驗證":
                 st.caption("獲利保護無法處理從未反彈的虧損單；固定同一批進場比較-5/-7.5/-10%停損，直接檢查左尾風險。")
             elif research_mode == "獲利保護風險效益":
                 st.caption("用逐筆paired比較檢查獲利保護降低多少左尾風險、又犧牲多少大波段；不再只看PF。")
@@ -5595,7 +5743,7 @@ with st.sidebar:
                 "KD黃金交叉 + MA30向上","KD黃金交叉 + MA60向上","KD黃金交叉 + 量比>1.2",
                 "KD黃金交叉 + 量比>1.5","KD黃金交叉 + 站上VWAP","MA5>15 + KD + 站上VWAP"
             ]
-            if research_mode not in ["固定停損驗證","獲利保護風險效益","獲利保護敏感度","獲利保護驗證","持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward驗證","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
+            if research_mode not in ["早期路徑健診","固定停損驗證","獲利保護風險效益","獲利保護敏感度","獲利保護驗證","持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward驗證","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
                 selected_rules = st.multiselect("進場規則", all_rules, default=["KD黃金交叉 + K<30"])
                 selected_modes = st.multiselect("持有方式",
                     ["當沖","隔日","2日","3日","4日","5日","6日","7日"], default=["5日"])
@@ -5622,6 +5770,7 @@ with st.sidebar:
         _btn_label="🔄 更新今日雷達"
     else:
         _btn_label={
+            "早期路徑健診":"🩺 執行早期路徑健診",
             "固定停損驗證":"🧯 執行固定停損A/B",
             "獲利保護風險效益":"⚖️ 執行獲利保護風險效益",
             "獲利保護敏感度":"🧪 執行獲利保護敏感度",
@@ -5695,6 +5844,42 @@ if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and 
     st.download_button("⬇️ 下載【TOP50暖機資料完整度】",_uc.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"{APP_VERSION}_TOP50暖機資料完整度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
     st.success("四份檔案可連續下載，不需重跑。")
+
+if simple_mode=="進階研究" and research_mode=="早期路徑健診" and not run:
+    st.info("V1.16.29 顯示固定停損雖能大幅壓低P5/P10/CVaR，但會砍掉太多後來能反彈的交易：-5%停損觸發約55%，整體平均從+2.12%降到+0.11%。這版先找『幾天後仍弱』是否比盤中直接停損更有辨識力。")
+
+if run and simple_mode=="進階研究" and research_mode=="早期路徑健診":
+    st.subheader("🩺 早期路徑健診")
+    with st.spinner("固定同一批正式架構C進場，計算第1/2/3日收盤與最終5日結果…"):
+        _ep_bucket,_ep_compare,_ep_detail,_ep_errs=validate_early_path_diagnostics(cost)
+    st.session_state["st_v11630_early_path"]={
+        "bucket":_ep_bucket,"compare":_ep_compare,"detail":_ep_detail,"errors":_ep_errs
+    }
+
+_ep=st.session_state.get("st_v11630_early_path")
+if simple_mode=="進階研究" and research_mode=="早期路徑健診" and _ep:
+    _eb=_ep.get("bucket",pd.DataFrame()); _ec=_ep.get("compare",pd.DataFrame())
+    _ed=_ep.get("detail",pd.DataFrame()); _ee=_ep.get("errors",[])
+    st.subheader("🩺 早期路徑健診結果")
+    if _ee:
+        st.warning("資料來源異常："+"；".join(_ee))
+    st.info("這版只診斷：若第2或第3日仍明顯低於進場價，最後翻正率是否已經很低。確認後下一版才會測延遲time-stop。")
+    if not _eb.empty:
+        st.markdown("#### 第1/2/3日收盤分桶 → 最終5日結果")
+        st.dataframe(_eb.round(3),use_container_width=True,hide_index=True)
+    if not _ec.empty:
+        st.markdown("#### 第1段 vs 第2~4段｜早期弱勢條件")
+        st.dataframe(_ec.round(3),use_container_width=True,hide_index=True)
+    with st.expander("查看逐筆第1/2/3/5日報酬"):
+        st.dataframe(_ed.round(3),use_container_width=True,hide_index=True)
+
+    st.download_button("⬇️ 下載【早期路徑分桶】",_eb.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_早期路徑分桶.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【早期弱勢區段比較】",_ec.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_早期弱勢區段比較.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【早期路徑逐筆明細】",_ed.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_早期路徑逐筆明細.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.success("三份檔案可連續下載，不需重跑。")
 
 if simple_mode=="進階研究" and research_mode=="固定停損驗證" and not run:
     st.info("V1.16.28 確認獲利保護主要作用在『曾經先漲』的交易，P5/P10/CVaR雖有改善，但最差單筆完全沒變；真正一路偏弱的交易根本不會啟動獲利保護。這版改直接測-5/-7.5/-10%固定停損。")
@@ -6627,6 +6812,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 單股總�
 # V1.16.10：所有「上方已有獨立執行流程」的研究模式集中管理。
 # 後續新增研究模式時只要加入此集合，就不會再掉進舊版共用流程而引用未定義的 summary。
 INDEPENDENT_RESEARCH_MODES = {
+    "早期路徑健診",
     "固定停損驗證",
     "獲利保護風險效益",
     "獲利保護敏感度",
@@ -7297,6 +7483,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.29 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.30 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
