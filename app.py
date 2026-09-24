@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.25
+黑嚕嚕－短線交易雷達 ST V1.16.26
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.25"
+APP_VERSION = "ST V1.16.26"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.25"
-EXPORT_PREFIX = "ST_V1.16.25"
+APP_VERSION = "ST_V1.16.26"
+EXPORT_PREFIX = "ST_V1.16.26"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1875,6 +1875,196 @@ def build_top200_market_breadth_context():
 
 
 
+
+def validate_profit_protection_candidates(cost: CostConfig):
+    """
+    V1.16.26 獲利保護A/B：
+    固定正式架構C、固定同一批進場，不增加新訊號。
+
+    比較：
+      A_5日基準
+      B_4日固定出場
+      C_5日_曾達+5後保本
+      D_5日_曾達+5後保+2
+      E_5日_曾達+5後保+3
+
+    執行假設（避免60m OHLC同K先後順序偏誤）：
+      - 某根已完成60m K的 High 首次 >= 進場價*1.05，視為「+5%曾達」。
+      - 保護停損從「下一根60m K」才開始生效。
+      - 若下一根開盤已低於保護價，用開盤價出場（gap conservative）。
+      - 否則若該K Low <= 保護價，使用保護價出場。
+      - 若始終未觸發保護，仍於第5個交易日最後一根收盤出場。
+    """
+    _,_,_,base,errors=validate_breadth_transition(cost)
+    if base is None or base.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    symbols=sorted(base["股票"].dropna().astype(str).unique().tolist())
+    raw=download_intraday_batch(symbols,"60m","6mo")
+
+    data_map={}
+    idx_map={}
+    tw_index_map={}
+    for s in symbols:
+        d=raw.get(s)
+        if d is None or d.empty:
+            continue
+        try:
+            x=d.copy().sort_index()
+            tw=_as_taipei_series(pd.Series(x.index))
+            data_map[s]=x
+            idx_map[s]={pd.Timestamp(t):i for i,t in enumerate(tw) if pd.notna(t)}
+            tw_index_map[s]=list(tw)
+        except Exception:
+            continue
+
+    policies=[
+        ("A_5日基準",None),
+        ("B_4日固定出場","4d"),
+        ("C_5日_曾達+5後保本",0.00),
+        ("D_5日_曾達+5後保+2",0.02),
+        ("E_5日_曾達+5後保+3",0.03),
+    ]
+    rows=[]
+
+    for _,r in base.iterrows():
+        s=str(r["股票"])
+        d=data_map.get(s)
+        mp=idx_map.get(s)
+        twidx=tw_index_map.get(s)
+        if d is None or mp is None or twidx is None:
+            continue
+
+        et=_as_taipei_series(pd.Series([r["進場時間"]])).iloc[0]
+        if pd.isna(et):
+            continue
+        entry_i=mp.get(pd.Timestamp(et))
+        if entry_i is None or entry_i>=len(d):
+            continue
+
+        entry=float(d["Open"].iloc[entry_i])
+        if not np.isfinite(entry) or entry<=0:
+            continue
+
+        exit5=find_exit_index(d,entry_i,"5日","60m")
+        exit4=find_exit_index(d,entry_i,"4日","60m")
+        if exit5 is None or exit4 is None:
+            continue
+
+        for name,protect in policies:
+            exit_i=None
+            exit_price=None
+            exit_reason=""
+            activated=False
+            activation_i=None
+
+            if name=="A_5日基準":
+                exit_i=exit5
+                exit_price=float(d["Close"].iloc[exit_i])
+                exit_reason="5日到期"
+            elif name=="B_4日固定出場":
+                exit_i=exit4
+                exit_price=float(d["Close"].iloc[exit_i])
+                exit_reason="4日到期"
+            else:
+                stop_price=entry*(1.0+float(protect))
+                # 使用完成K的High判斷曾達+5%，保護從下一根才生效。
+                for j in range(entry_i,exit5+1):
+                    if activated and j>activation_i:
+                        op=float(d["Open"].iloc[j])
+                        lo=float(d["Low"].iloc[j])
+                        if np.isfinite(op) and op<=stop_price:
+                            exit_i=j
+                            exit_price=op
+                            exit_reason=f"保護觸發_gap_{int(protect*100)}%"
+                            break
+                        if np.isfinite(lo) and lo<=stop_price:
+                            exit_i=j
+                            exit_price=stop_price
+                            exit_reason=f"保護觸發_{int(protect*100)}%"
+                            break
+
+                    hi=float(d["High"].iloc[j])
+                    if (not activated) and np.isfinite(hi) and hi>=entry*1.05:
+                        activated=True
+                        activation_i=j
+
+                if exit_i is None:
+                    exit_i=exit5
+                    exit_price=float(d["Close"].iloc[exit_i])
+                    exit_reason="5日到期"
+
+            if exit_i is None or not np.isfinite(exit_price):
+                continue
+
+            gross=(exit_price/entry-1)*100
+            cost_pct=cost.roundtrip_cost_pct(daytrade=False)
+            net=gross-cost_pct
+            path=d.iloc[entry_i:exit_i+1]
+            mfe=(float(path["High"].max())/entry-1)*100
+            mae=(float(path["Low"].min())/entry-1)*100
+
+            z=r.to_dict()
+            z["出場政策"]=name
+            z["比較出場時間"]=twidx[exit_i] if exit_i<len(twidx) else d.index[exit_i]
+            z["比較出場價"]=exit_price
+            z["比較淨報酬%"]=net
+            z["比較MFE%"]=mfe
+            z["比較MAE%"]=mae
+            z["保護曾啟動"]="是" if activated else "否"
+            z["比較出場原因"]=exit_reason
+            z["持有60m棒數"]=int(exit_i-entry_i+1)
+            rows.append(z)
+
+    detail=pd.DataFrame(rows)
+    if detail.empty:
+        return pd.DataFrame(),pd.DataFrame(),detail,errors
+
+    # 僅保留所有政策都有結果的共同進場母體。
+    key_cols=["股票","訊號時間_台北","進場時間"]
+    counts=detail.groupby(key_cols)["出場政策"].nunique().reset_index(name="_n")
+    common=counts[counts["_n"]==len(policies)][key_cols]
+    detail=detail.merge(common,on=key_cols,how="inner")
+
+    def _summary_row(g,sample,name):
+        tmp=g.copy()
+        tmp["淨報酬%"]=pd.to_numeric(tmp["比較淨報酬%"],errors="coerce")
+        m=aggregate_trade_metrics(tmp)
+        activated=(tmp["保護曾啟動"]=="是") if "保護曾啟動" in tmp.columns else pd.Series(False,index=tmp.index)
+        protective=tmp["比較出場原因"].astype(str).str.startswith("保護觸發") if "比較出場原因" in tmp.columns else pd.Series(False,index=tmp.index)
+        return {
+            "樣本":sample,"出場政策":name,
+            "交易數":len(tmp),
+            "股票數":int(tmp["股票"].nunique()) if len(tmp) else 0,
+            **m,
+            "MFE中位數%":float(pd.to_numeric(tmp["比較MFE%"],errors="coerce").median()) if len(tmp) else np.nan,
+            "MAE中位數%":float(pd.to_numeric(tmp["比較MAE%"],errors="coerce").median()) if len(tmp) else np.nan,
+            "平均持有60m棒數":float(pd.to_numeric(tmp["持有60m棒數"],errors="coerce").mean()) if len(tmp) else np.nan,
+            "保護啟動率%":float(activated.mean()*100) if len(tmp) else np.nan,
+            "保護實際出場率%":float(protective.mean()*100) if len(tmp) else np.nan,
+        }
+
+    summary_rows=[]
+    policy_names=[p[0] for p in policies]
+    for sample in ["全部","樣本內60%","樣本外40%"]:
+        xs=detail if sample=="全部" else detail[detail["樣本"]==sample]
+        for name in policy_names:
+            g=xs[xs["出場政策"]==name]
+            summary_rows.append(_summary_row(g,sample,name))
+    summary=pd.DataFrame(summary_rows)
+
+    block_rows=[]
+    for block in ["第1段","第2段","第3段","第4段"]:
+        xb=detail[detail["時間段"]==block]
+        for name in policy_names:
+            g=xb[xb["出場政策"]==name]
+            row=_summary_row(g,block,name)
+            row["時間段"]=block
+            row.pop("樣本",None)
+            block_rows.append(row)
+    blocks=pd.DataFrame(block_rows)
+
+    return summary,blocks,detail,errors
 def validate_holding_period_candidates(cost: CostConfig):
     """
     V1.16.25 持有天數A/B：
@@ -4847,8 +5037,10 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
-            if research_mode == "持有天數驗證":
+                ["獲利保護驗證","持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
+            if research_mode == "獲利保護驗證":
+                st.caption("固定同一批正式架構C進場，比較5日基準、4日固定出場，以及曾達+5%後的保本/+2/+3獲利保護。")
+            elif research_mode == "持有天數驗證":
                 st.caption("固定同一批正式架構C進場，只比較2/3/4/5日出場，避免短持有因多出新訊號造成不公平比較。")
             elif research_mode == "持有路徑健診":
                 st.caption("固定5日持有規則，檢查MFE/MAE與回吐型態，判斷第1段問題較像進場失效還是持有過久。")
@@ -4887,7 +5079,7 @@ with st.sidebar:
                 "KD黃金交叉 + MA30向上","KD黃金交叉 + MA60向上","KD黃金交叉 + 量比>1.2",
                 "KD黃金交叉 + 量比>1.5","KD黃金交叉 + 站上VWAP","MA5>15 + KD + 站上VWAP"
             ]
-            if research_mode not in ["持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
+            if research_mode not in ["獲利保護驗證","持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
                 selected_rules = st.multiselect("進場規則", all_rules, default=["KD黃金交叉 + K<30"])
                 selected_modes = st.multiselect("持有方式",
                     ["當沖","隔日","2日","3日","4日","5日","6日","7日"], default=["5日"])
@@ -4914,6 +5106,7 @@ with st.sidebar:
         _btn_label="🔄 更新今日雷達"
     else:
         _btn_label={
+            "獲利保護驗證":"🛡️ 執行獲利保護A/B",
             "持有天數驗證":"⏱️ 執行2/3/4/5日持有A/B",
             "持有路徑健診":"🧭 執行持有路徑健診",
             "市場廣度轉折健診":"📉 執行市場廣度轉折健診",
@@ -4983,6 +5176,42 @@ if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and 
     st.download_button("⬇️ 下載【TOP50暖機資料完整度】",_uc.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"{APP_VERSION}_TOP50暖機資料完整度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
     st.success("四份檔案可連續下載，不需重跑。")
+
+if simple_mode=="進階研究" and research_mode=="獲利保護驗證" and not run:
+    st.info("V1.16.25 顯示4日整體略優於5日、且第1段明顯改善，但樣本外仍是5日最好，因此不直接把持有期縮成4日。這版測試『5日保留趨勢空間＋曾達+5%後才啟動獲利保護』。")
+
+if run and simple_mode=="進階研究" and research_mode=="獲利保護驗證":
+    st.subheader("🛡️ 獲利保護A/B")
+    with st.spinner("固定同一批正式架構C進場，重算5日基準、4日與+5%後獲利保護…"):
+        _pp_sum,_pp_blocks,_pp_detail,_pp_errs=validate_profit_protection_candidates(cost)
+    st.session_state["st_v11626_profit_protect"]={
+        "summary":_pp_sum,"blocks":_pp_blocks,"detail":_pp_detail,"errors":_pp_errs
+    }
+
+_pp=st.session_state.get("st_v11626_profit_protect")
+if simple_mode=="進階研究" and research_mode=="獲利保護驗證" and _pp:
+    _ps=_pp.get("summary",pd.DataFrame()); _pb=_pp.get("blocks",pd.DataFrame())
+    _pd2=_pp.get("detail",pd.DataFrame()); _pe2=_pp.get("errors",[])
+    st.subheader("🛡️ 獲利保護驗證結果")
+    if _pe2:
+        st.warning("資料來源異常："+"；".join(_pe2))
+    st.info("保護規則採保守執行：某根完成60m K曾碰到+5%，保護從下一根K才啟動；若跳空跌破保護價，以實際開盤價出場。")
+    if not _ps.empty:
+        st.markdown("#### 全部 / 樣本內 / 樣本外")
+        st.dataframe(_ps.round(3),use_container_width=True,hide_index=True)
+    if not _pb.empty:
+        st.markdown("#### 四段時間穩定度")
+        st.dataframe(_pb.round(3),use_container_width=True,hide_index=True)
+    with st.expander("查看逐筆獲利保護模擬"):
+        st.dataframe(_pd2.round(3),use_container_width=True,hide_index=True)
+
+    st.download_button("⬇️ 下載【獲利保護驗證摘要】",_ps.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_獲利保護驗證摘要.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【獲利保護四段穩定度】",_pb.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_獲利保護四段穩定度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【獲利保護逐筆比較】",_pd2.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_獲利保護逐筆比較.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.success("三份檔案可連續下載，不需重跑。")
 
 if simple_mode=="進階研究" and research_mode=="持有天數驗證" and not run:
     st.info("V1.16.24 顯示第1段有兩種問題同時存在：48.3%一路偏弱/未達+5%，但也有20.8%曾到+5%最後變虧。這版先做最乾淨的持有天數A/B：同一批進場只改成2/3/4/5日出場。")
@@ -5763,6 +5992,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 單股總�
 # V1.16.10：所有「上方已有獨立執行流程」的研究模式集中管理。
 # 後續新增研究模式時只要加入此集合，就不會再掉進舊版共用流程而引用未定義的 summary。
 INDEPENDENT_RESEARCH_MODES = {
+    "獲利保護驗證",
     "持有天數驗證",
     "持有路徑健診",
     "市場廣度轉折健診",
@@ -6429,6 +6659,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.25 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.26 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
