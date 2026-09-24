@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-黑嚕嚕－短線交易雷達 ST V1.16.31
+黑嚕嚕－短線交易雷達 ST V1.16.32
 獨立短線研究版：V1.2.2 擴充研究宇宙與AI細產業健診；不沿用原黑嚕嚕 V3.x 策略/分數/帳本。
 
 研究目的
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.31"
+APP_VERSION = "ST V1.16.32"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.31"
-EXPORT_PREFIX = "ST_V1.16.31"
+APP_VERSION = "ST_V1.16.32"
+EXPORT_PREFIX = "ST_V1.16.32"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -1158,9 +1158,10 @@ def scan_latest_60m_radar(symbols: List[str], ranked_pool: pd.DataFrame, period:
 
 def fetch_official_tw_stock_universe():
     """
-    V1.13.0：官方上市/上櫃公司基本資料。
+    V1.16.32：
+    官方上市/上櫃公司基本資料，加入3次重試與漸進等待。
     只保留4位數字公司代號；上市加.TW、上櫃加.TWO。
-    官方來源失敗時回傳空表，由UI明確提示，不靜默冒充全市場。
+    官方來源多次失敗時仍明確回報，不靜默冒充全市場。
     """
     endpoints=[
         ("上市","https://openapi.twse.com.tw/v1/opendata/t187ap03_L",".TW"),
@@ -1168,20 +1169,51 @@ def fetch_official_tw_stock_universe():
     ]
     rows=[]
     errors=[]
+
     for market,url,suffix in endpoints:
-        try:
-            req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0"})
-            with urllib.request.urlopen(req,timeout=20) as resp:
-                data=json.loads(resp.read().decode("utf-8"))
-            for item in data:
-                code=str(item.get("公司代號",item.get("SecuritiesCompanyCode",""))).strip()
-                name=str(item.get("公司簡稱",item.get("CompanyName",""))).strip()
-                industry=str(item.get("產業別",item.get("SecuritiesIndustryCode",""))).strip()
-                if len(code)==4 and code.isdigit():
-                    rows.append({"股票":code+suffix,"代號":code,"公司":name,
-                                 "市場":market,"官方產業別":industry,"官方來源":url})
-        except Exception as e:
-            errors.append(f"{market}: {e}")
+        data=None
+        last_error=None
+
+        for attempt in range(1,4):
+            try:
+                req=urllib.request.Request(
+                    url,
+                    headers={
+                        "User-Agent":"Mozilla/5.0",
+                        "Accept":"application/json,text/plain,*/*",
+                        "Connection":"close",
+                    }
+                )
+                with urllib.request.urlopen(req,timeout=25) as resp:
+                    raw=resp.read().decode("utf-8")
+                data=json.loads(raw)
+                if isinstance(data,list) and len(data)>0:
+                    break
+                last_error=RuntimeError("官方API回傳空資料")
+            except Exception as e:
+                last_error=e
+
+            if attempt<3:
+                time.sleep(1.2*attempt)
+
+        if data is None or not isinstance(data,list) or len(data)==0:
+            errors.append(f"{market}: 重試3次仍失敗｜{last_error}")
+            continue
+
+        for item in data:
+            code=str(item.get("公司代號",item.get("SecuritiesCompanyCode",""))).strip()
+            name=str(item.get("公司簡稱",item.get("CompanyName",""))).strip()
+            industry=str(item.get("產業別",item.get("SecuritiesIndustryCode",""))).strip()
+            if len(code)==4 and code.isdigit():
+                rows.append({
+                    "股票":code+suffix,
+                    "代號":code,
+                    "公司":name,
+                    "市場":market,
+                    "官方產業別":industry,
+                    "官方來源":url
+                })
+
     df=pd.DataFrame(rows).drop_duplicates("股票") if rows else pd.DataFrame()
     return df,errors
 
@@ -1881,6 +1913,128 @@ def build_top200_market_breadth_context():
 
 
 
+
+def validate_long_horizon_robustness(cost: CostConfig):
+    """
+    V1.16.32 長期穩健度驗證：
+    停止繼續微調出場參數，回頭驗證正式核心策略本身在更長時間是否成立。
+
+    固定：
+      - 官方全市場母池
+      - 歷史Point-in-Time流動性排名
+      - 正式架構C：TOP1-100全部 + TOP101-150僅S級
+      - 60m KD黃金交叉 + K<30
+      - non-overlap
+      - 持有5日
+      - 交易成本不變
+
+    資料：
+      - 日K資格：12mo
+      - 60m資料：1y
+      - 前3mo作暖機，正式評估最後9mo
+      - 同一時間切割：前60% / 後40%
+      - 再切6個等長時間區塊看穩定度
+
+    注意：
+      這版不比較新Gate、不比較新停損，只回答「核心策略長期是否穩健」。
+    """
+    elig,_,errors=build_fullmarket_walkforward_eligibility(
+        lookback_months=12, top_n=100
+    )
+    if elig is None or elig.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors
+
+    union=sorted(
+        elig.loc[elig["流動性排名"]<=200,"股票"]
+        .dropna().astype(str).unique().tolist()
+    )
+    if not union:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors+["長期TOP200聯集為空"]
+
+    _,_,trades=run_oos_60m_5d(
+        union,cost,"1y",
+        allow_overlap=False,
+        train_ratio=0.60,
+        evaluation_months=9
+    )
+    if trades is None or trades.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),errors+["1y 60m交易資料為空"]
+
+    t=trades.copy()
+    sig=_as_taipei_series(t["訊號時間"])
+    t["訊號時間_台北"]=sig
+    t["訊號日期"]=sig.dt.date
+
+    # Point-in-time 流動性排名：只能使用訊號日前已完成日K。
+    ranks=[]
+    base_dates=[]
+    for _,r in t.iterrows():
+        q=elig[
+            (elig["股票"]==r["股票"]) &
+            (elig["基準完成日"]<r["訊號日期"])
+        ]
+        if q.empty:
+            ranks.append(np.nan)
+            base_dates.append(None)
+        else:
+            z=q.sort_values("基準完成日").iloc[-1]
+            ranks.append(float(z["流動性排名"]))
+            base_dates.append(z["基準完成日"])
+
+    t["WF流動性排名"]=ranks
+    t["WF股票池基準日"]=base_dates
+    t=t[t["WF流動性排名"].notna()].copy()
+
+    # 正式S級定義不變。
+    vr=pd.to_numeric(t.get("量比20"),errors="coerce")
+    ma60s=pd.to_numeric(t.get("MA60斜率3"),errors="coerce")
+    t["S級"]=(vr>=1.5)&(ma60s<=0)
+
+    rnk=pd.to_numeric(t["WF流動性排名"],errors="coerce")
+    formal=(rnk<=100)|((rnk>100)&(rnk<=150)&t["S級"])
+    t=t[formal].copy().sort_values("訊號時間_台北").reset_index(drop=True)
+
+    if t.empty:
+        return pd.DataFrame(),pd.DataFrame(),t,errors+["正式架構C長期交易為空"]
+
+    # 全部 / 樣本內 / 樣本外
+    summary_rows=[]
+    for sample in ["全部","樣本內60%","樣本外40%"]:
+        g=t if sample=="全部" else t[t["樣本"]==sample]
+        m=aggregate_trade_metrics(g)
+        summary_rows.append({
+            "樣本":sample,
+            "交易數":len(g),
+            "股票數":int(g["股票"].nunique()) if len(g) else 0,
+            "起始訊號":str(g["訊號時間_台北"].min()) if len(g) else "",
+            "結束訊號":str(g["訊號時間_台北"].max()) if len(g) else "",
+            **m
+        })
+    summary=pd.DataFrame(summary_rows)
+
+    # 6個等長時間區塊：避免只看單一OOS平均。
+    ts=t["訊號時間_台北"]
+    edges=pd.date_range(ts.min(),ts.max(),periods=7)
+    labels=[f"區塊{i}" for i in range(1,7)]
+    t["長期時間區塊"]=pd.cut(
+        ts,bins=edges,labels=labels,include_lowest=True,right=True
+    )
+
+    block_rows=[]
+    for i,block in enumerate(labels):
+        g=t[t["長期時間區塊"]==block]
+        m=aggregate_trade_metrics(g)
+        block_rows.append({
+            "時間區塊":block,
+            "起始":str(edges[i]),
+            "結束":str(edges[i+1]),
+            "交易數":len(g),
+            "股票數":int(g["股票"].nunique()) if len(g) else 0,
+            **m
+        })
+    blocks=pd.DataFrame(block_rows)
+
+    return summary,blocks,t,errors
 def validate_delayed_timestop_candidates(cost: CostConfig):
     """
     V1.16.31 延遲Time-Stop A/B：
@@ -5826,8 +5980,10 @@ with st.sidebar:
     with st.expander("⚙️ 進階研究設定", expanded=(simple_mode=="進階研究")):
         if simple_mode == "進階研究":
             research_mode = st.radio("研究模式",
-                ["延遲TimeStop驗證","早期路徑健診","固定停損驗證","獲利保護風險效益","獲利保護敏感度","獲利保護驗證","持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
-            if research_mode == "延遲TimeStop驗證":
+                ["長期穩健度驗證","延遲TimeStop驗證","早期路徑健診","固定停損驗證","獲利保護風險效益","獲利保護敏感度","獲利保護驗證","持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50訊號品質健診","TOP50暖機修正驗證","市場環境健診_TOP50","核心池規模WalkForward","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診","單一股票","跨股票批次","多週期當沖/隔日驗證","60m五日OOS驗證"], index=0)
+            if research_mode == "長期穩健度驗證":
+                st.caption("停止微調出場參數；用1y 60m＋12mo歷史流動性，正式檢查核心5日策略在最後9mo是否跨時間穩健。")
+            elif research_mode == "延遲TimeStop驗證":
                 st.caption("固定同一批進場，比較第2/3日收盤弱勢才提早出場；避免盤中固定停損把會反彈的交易洗掉。")
             elif research_mode == "早期路徑健診":
                 st.caption("固定5日基準，檢查第1/2/3日收盤的早期報酬是否能辨識最後會失敗的交易；只診斷、不直接加time-stop。")
@@ -5878,7 +6034,7 @@ with st.sidebar:
                 "KD黃金交叉 + MA30向上","KD黃金交叉 + MA60向上","KD黃金交叉 + 量比>1.2",
                 "KD黃金交叉 + 量比>1.5","KD黃金交叉 + 站上VWAP","MA5>15 + KD + 站上VWAP"
             ]
-            if research_mode not in ["延遲TimeStop驗證","早期路徑健診","固定停損驗證","獲利保護風險效益","獲利保護敏感度","獲利保護驗證","持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward驗證","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
+            if research_mode not in ["長期穩健度驗證","延遲TimeStop驗證","早期路徑健診","固定停損驗證","獲利保護風險效益","獲利保護敏感度","獲利保護驗證","持有天數驗證","持有路徑健診","市場廣度轉折健診","環境×訊號交互驗證","環境Gate驗證","失效環境健診","雷達架構驗證","股票池分層驗證","股票池覆蓋健診","TOP50訊號等級驗證","TOP50Gate拆解驗證","TOP50候選Gate驗證","TOP50暖機修正驗證","TOP50訊號品質健診","市場環境健診_TOP50","核心池規模WalkForward驗證","全市場WalkForward驗證","全市場股票池研究","全市場候選策略驗證","股票池2.0研究","股票池2.0歷史驗證","股票池健診"]:
                 selected_rules = st.multiselect("進場規則", all_rules, default=["KD黃金交叉 + K<30"])
                 selected_modes = st.multiselect("持有方式",
                     ["當沖","隔日","2日","3日","4日","5日","6日","7日"], default=["5日"])
@@ -5905,6 +6061,7 @@ with st.sidebar:
         _btn_label="🔄 更新今日雷達"
     else:
         _btn_label={
+            "長期穩健度驗證":"🧱 執行1年長期穩健度驗證",
             "延遲TimeStop驗證":"⏳ 執行延遲Time-Stop A/B",
             "早期路徑健診":"🩺 執行早期路徑健診",
             "固定停損驗證":"🧯 執行固定停損A/B",
@@ -5980,6 +6137,43 @@ if simple_mode=="進階研究" and research_mode=="TOP50暖機修正驗證" and 
     st.download_button("⬇️ 下載【TOP50暖機資料完整度】",_uc.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"{APP_VERSION}_TOP50暖機資料完整度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
     st.success("四份檔案可連續下載，不需重跑。")
+
+if simple_mode=="進階研究" and research_mode=="長期穩健度驗證" and not run:
+    st.info("V1.16.31 顯示延遲Time-Stop仍沒有真正解決第1段，而且大多數方案整體報酬與PF都低於原5日基準。繼續微調-3/-5或第2/3日容易過度擬合，因此這版先停止出場調參，改用更長歷史重新驗證核心策略。")
+
+if run and simple_mode=="進階研究" and research_mode=="長期穩健度驗證":
+    st.subheader("🧱 1年長期穩健度驗證")
+    st.warning("這個模式會下載較多1y 60m資料，第一次執行可能比前面研究久；建議不要同時開多個分頁重跑。")
+    with st.spinner("建立12mo歷史流動性資格＋下載1y 60m，評估最後9mo正式架構C…"):
+        _lr_sum,_lr_blocks,_lr_detail,_lr_errs=validate_long_horizon_robustness(cost)
+    st.session_state["st_v11632_long_robust"]={
+        "summary":_lr_sum,"blocks":_lr_blocks,"detail":_lr_detail,"errors":_lr_errs
+    }
+
+_lr=st.session_state.get("st_v11632_long_robust")
+if simple_mode=="進階研究" and research_mode=="長期穩健度驗證" and _lr:
+    _ls=_lr.get("summary",pd.DataFrame()); _lb=_lr.get("blocks",pd.DataFrame())
+    _ld=_lr.get("detail",pd.DataFrame()); _le=_lr.get("errors",[])
+    st.subheader("🧱 長期穩健度結果")
+    if _le:
+        st.warning("資料來源異常："+"；".join(_le))
+    st.info("這一版不比較新Gate與新停損，只驗證固定正式架構C＋5日持有在更長時間是否仍成立。")
+    if not _ls.empty:
+        st.markdown("#### 全部 / 樣本內 / 樣本外")
+        st.dataframe(_ls.round(3),use_container_width=True,hide_index=True)
+    if not _lb.empty:
+        st.markdown("#### 9個月評估區｜6段時間穩定度")
+        st.dataframe(_lb.round(3),use_container_width=True,hide_index=True)
+    with st.expander("查看長期逐筆交易"):
+        st.dataframe(_ld.round(3),use_container_width=True,hide_index=True)
+
+    st.download_button("⬇️ 下載【長期穩健度摘要】",_ls.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_長期穩健度摘要.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【長期六段穩定度】",_lb.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_長期六段穩定度.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.download_button("⬇️ 下載【長期逐筆交易】",_ld.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{APP_VERSION}_長期逐筆交易.csv",mime="text/csv",use_container_width=True,on_click="ignore")
+    st.success("三份檔案可連續下載，不需重跑。")
 
 if simple_mode=="進階研究" and research_mode=="延遲TimeStop驗證" and not run:
     st.info("V1.16.30 顯示第2日<=-3%後最終翻正率僅23.6%，第3日<=-3%更降到14.7%；第1段更差。這版直接驗證『等到第2/3日收盤仍弱才退出』是否比盤中固定停損更有效。")
@@ -6991,6 +7185,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 單股總�
 # V1.16.10：所有「上方已有獨立執行流程」的研究模式集中管理。
 # 後續新增研究模式時只要加入此集合，就不會再掉進舊版共用流程而引用未定義的 summary。
 INDEPENDENT_RESEARCH_MODES = {
+    "長期穩健度驗證",
     "延遲TimeStop驗證",
     "早期路徑健診",
     "固定停損驗證",
@@ -7663,6 +7858,6 @@ else:
 
 st.divider()
 st.caption(
-    "ST V1.16.31 僅供策略研究與程式驗證，不送出證券委託。"
+    "ST V1.16.32 僅供策略研究與程式驗證，不送出證券委託。"
     "下一階段將根據實際回測結果，再判斷是否增加 VWAP、成交量/量比、MACD、ATR 或其他參數。"
 )
