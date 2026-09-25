@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.16.35
+黑嚕嚕－短線交易雷達 ST V1.16.40
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -12,7 +12,7 @@
 本版清理：
 - 移除已否決或只用於過往探索的研究策略與舊進階頁面
 - 進階研究僅保留：正式凍結規格、長期穩健度、長期集中度
-- Shioaji 尚未直接連線；requirements.txt 不變
+- 新增 Shioaji Stage 1 本機即時行情 Worker：登入測試 + 單股 Tick 訂閱 + 狀態輸出；不下單
 """
 
 
@@ -21,6 +21,7 @@ import warnings
 import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
 # V1.16.6：Streamlit Cloud 資源保護。
@@ -49,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.35"
+APP_VERSION = "ST V1.16.40"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.35"
-EXPORT_PREFIX = "ST_V1.16.35"
+APP_VERSION = "ST_V1.16.40"
+EXPORT_PREFIX = "ST_V1.16.40"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -676,7 +677,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.16.35",
+        "strategy_version":"ST V1.16.40",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -713,89 +714,74 @@ def get_shioaji_realtime_spec():
         {"階段":"通知","模組":"Telegram","動作":"新訊號/異常/收盤摘要通知；先不自動下單"},
         {"階段":"交易層","模組":"Shioaji Order","動作":"第二階段再加入模擬單→人工確認→自動下單"},
     ])
-def build_current_market_breadth(top200_pool: pd.DataFrame):
+
+def get_shioaji_stage1_checklist():
+    """V1.16.40：Shioaji Stage 3.1，每日TOP150自動更新。"""
+    return pd.DataFrame([
+        {"順序":1,"項目":"自動判斷基準日","內容":"Worker啟動先確認最近完成交易日；盤中永遠排除今天未完成日K"},
+        {"順序":2,"項目":"本機自動建池","內容":"官方TWSE+TPEx公司母池 → Yahoo 2mo日K → 最近20完成交易日成交金額中位數排名"},
+        {"順序":3,"項目":"每日只重建一次","內容":"若 top150_latest.csv 已是最新完成交易日就直接使用，不重抓全市場"},
+        {"順序":4,"項目":"失敗保護","內容":"自動更新失敗時沿用最近一次有效TOP150；沒有快取才退回2330單股"},
+        {"順序":5,"項目":"TOP150訂閱","內容":"只訂Tick、不訂BidAsk；安全上限180/官方200；每筆約0.05秒"},
+        {"順序":6,"項目":"60m K","內容":"150檔各自聚合09/10/11/12/13時段60m K"},
+        {"順序":7,"項目":"Usage/重連","內容":"api.usage()低頻監控＋安全退避重連；盤中不輪詢Shioaji snapshots/ticks/kbars"},
+        {"順序":8,"項目":"人工備援","內容":"Streamlit仍可下載【Shioaji_TOP150訂閱清單】，但日常不需要手動餵檔"},
+    ])
+
+
+def read_shioaji_worker_status(path="runtime/shioaji_status.json"):
     """
-    V1.16.22 今日市場環境：
-    使用今天以前已完成日K，針對目前流動性TOP200計算市場廣度。
-    僅作風險提示，不直接過濾今日雷達訊號。
+    讀取同一台主機上的 Shioaji Worker 狀態。
+    Streamlit Cloud 無法直接讀取使用者家中電腦的 runtime 檔案；
+    Stage 1 先用來驗證本機 Worker。
     """
-    if top200_pool is None or top200_pool.empty:
-        return pd.DataFrame(), ["TOP200股票池為空，無法計算市場廣度。"]
+    p=Path(path)
+    if not p.exists():
+        return {}, f"找不到 {path}"
+    try:
+        obj=json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(obj,dict):
+            return {}, "狀態檔格式不是JSON物件"
+        return obj, ""
+    except Exception as e:
+        return {}, f"狀態檔讀取失敗：{e}"
 
-    symbols=top200_pool.loc[top200_pool["流動性排名"]<=200,"股票"].astype(str).tolist()
-    if not symbols:
-        return pd.DataFrame(), ["TOP200股票清單為空。"]
 
-    dmap=download_daily_batches(symbols,period="1y",batch_size=25)
-    today_tw=pd.Timestamp.now(tz="Asia/Taipei").date()
-    rec=[]
-    latest_dates=[]
-
-    for s in symbols:
-        d=dmap.get(s)
-        if d is None or d.empty:
-            continue
-        try:
-            x=d.copy()
-            x.index=pd.to_datetime(x.index,errors="coerce")
-            x=x[x.index.notna()].sort_index()
-            x=x[pd.Index([pd.Timestamp(i).date() for i in x.index]) < today_tw]
-            x=x.dropna(subset=["Close"]).copy()
-            if len(x)<60:
-                continue
-
-            c=pd.to_numeric(x["Close"],errors="coerce")
-            ma15=c.rolling(15,min_periods=15).mean()
-            ma30=c.rolling(30,min_periods=30).mean()
-            ma60=c.rolling(60,min_periods=60).mean()
-            ret5=(c/c.shift(5)-1)*100
-
-            rec.append({
-                "股票":s,
-                "Close":float(c.iloc[-1]) if pd.notna(c.iloc[-1]) else np.nan,
-                "MA15":float(ma15.iloc[-1]) if pd.notna(ma15.iloc[-1]) else np.nan,
-                "MA30":float(ma30.iloc[-1]) if pd.notna(ma30.iloc[-1]) else np.nan,
-                "MA60":float(ma60.iloc[-1]) if pd.notna(ma60.iloc[-1]) else np.nan,
-                "RET5%":float(ret5.iloc[-1]) if pd.notna(ret5.iloc[-1]) else np.nan,
-            })
-            latest_dates.append(pd.Timestamp(x.index[-1]).date())
-        except Exception:
-            continue
-
-    z=pd.DataFrame(rec)
-    if z.empty:
-        return pd.DataFrame(), ["TOP200市場廣度日K資料不足。"]
-
-    v15=z["Close"].notna()&z["MA15"].notna()
-    v30=z["Close"].notna()&z["MA30"].notna()
-    v60=z["Close"].notna()&z["MA60"].notna()
-    v5=z["RET5%"].notna()
-
-    ma15_pct=float((z.loc[v15,"Close"]>z.loc[v15,"MA15"]).mean()*100) if v15.any() else np.nan
-    ma30_pct=float((z.loc[v30,"Close"]>z.loc[v30,"MA30"]).mean()*100) if v30.any() else np.nan
-    ma60_pct=float((z.loc[v60,"Close"]>z.loc[v60,"MA60"]).mean()*100) if v60.any() else np.nan
-    up5_pct=float((z.loc[v5,"RET5%"]>0).mean()*100) if v5.any() else np.nan
-    med5=float(z.loc[v5,"RET5%"].median()) if v5.any() else np.nan
-
-    if pd.isna(ma60_pct):
-        risk="⚪ 資料不足"
-    elif ma60_pct>=65:
-        risk="🔴 高檔風險"
-    else:
-        risk="🟢 正常"
-
-    out=pd.DataFrame([{
-        "市場狀態":risk,
-        "基準完成日":str(max(latest_dates)) if latest_dates else "",
-        "TOP200有效股票數":len(z),
-        "站上MA15比例%":ma15_pct,
-        "站上MA30比例%":ma30_pct,
-        "站上MA60比例%":ma60_pct,
-        "5日上漲家數比例%":up5_pct,
-        "5日報酬中位數%":med5,
-        "風險規則":"MA60廣度>=65%僅顯示高檔風險警示，不過濾訊號"
-    }])
-    return out, []
+def shioaji_stage1_status_table(status):
+    keys=[
+        ("phase","階段"),
+        ("message","訊息"),
+        ("shioaji_version","Shioaji版本"),
+        ("simulation","模擬模式"),
+        ("pool_source","股票池來源"),
+        ("pool_file","股票池檔案"),
+        ("pool_basis_date","排名基準完成日"),
+        ("pool_code_count","股票池檔數"),
+        ("pool_refresh_status","股票池更新狀態"),
+        ("pool_refresh_seconds","建池耗時(秒)"),
+        ("login_time","登入時間"),
+        ("subscribe_time","訂閱時間"),
+        ("subscription_target","目標訂閱數"),
+        ("subscription_count","目前訂閱數"),
+        ("subscription_failed","訂閱失敗數"),
+        ("subscription_safe_limit","程式訂閱安全上限"),
+        ("official_subscription_limit","官方訂閱上限"),
+        ("last_tick_time","最後Tick時間"),
+        ("tick_count","Tick數"),
+        ("last_code","最新Tick股票"),
+        ("last_price","最新價"),
+        ("active_bar_count","進行中60m K數"),
+        ("finalized_bar_count","已完成60m K數"),
+        ("usage_connections","Usage連線數"),
+        ("usage_used_mb","Usage已用MB"),
+        ("usage_limit_mb","Usage上限MB"),
+        ("usage_remaining_mb","Usage剩餘MB"),
+        ("usage_pct","Usage使用率%"),
+        ("usage_level","Usage警示"),
+        ("reconnect_attempt","目前重連次數"),
+        ("updated_at","狀態更新時間"),
+    ]
+    return pd.DataFrame([{"項目":label,"內容":status.get(key,"")} for key,label in keys])
 
 
 def build_formal_daily_radar(cost: CostConfig):
@@ -1639,10 +1625,11 @@ with st.sidebar:
     if simple_mode=="進階研究":
         research_mode=st.radio(
             "研究模式",
-            ["策略凍結與即時規格","長期穩健度驗證","長期集中度健診"],
+            ["Shioaji即時引擎","策略凍結與即時規格","長期穩健度驗證","長期集中度健診"],
             index=0
         )
         captions={
+            "Shioaji即時引擎":"Stage 3.1：本機Worker自動更新每日TOP150，再訂閱Tick；不再需要每天手動下載CSV。",
             "策略凍結與即時規格":"查看正式凍結參數與未來 Shioaji 即時行情架構。",
             "長期穩健度驗證":"固定正式策略，以1y 60m資料、最後9mo評估與6段時間檢查長期穩健度。",
             "長期集中度健診":"沿用長期樣本，檢查月度、股票貢獻與Top貢獻集中度。"
@@ -1658,6 +1645,7 @@ with st.sidebar:
         btn_label="🔄 更新今日雷達"
     else:
         btn_label={
+            "Shioaji即時引擎":"🔌 檢查本機Worker狀態",
             "策略凍結與即時規格":"🔒 顯示正式凍結規格",
             "長期穩健度驗證":"🧱 執行1年長期穩健度驗證",
             "長期集中度健診":"🧮 執行長期集中度健診",
@@ -1761,6 +1749,18 @@ if simple_mode=="今日雷達":
                 mime="text/csv",use_container_width=True,on_click="ignore"
             )
 
+            _sj_pool=_pp.copy()
+            _sj_pool["代號"]=_sj_pool["股票"].astype(str).str.split(".").str[0]
+            _sj_cols=[c for c in ["代號","股票","公司","市場","流動性排名","股票池層級","排名基準完成日"] if c in _sj_pool.columns]
+            _sj_pool=_sj_pool[_sj_cols].sort_values("流動性排名").head(150)
+            st.download_button(
+                "⬇️ 下載【Shioaji_TOP150訂閱清單】",
+                _sj_pool.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"{APP_VERSION}_Shioaji_TOP150訂閱清單.csv",
+                mime="text/csv",use_container_width=True,on_click="ignore"
+            )
+            st.caption("V1.16.40起這份CSV只作人工備援；本機Worker平常會自行重建每日TOP150，不必每天下載。")
+
         with st.expander("🔧 今日雷達掃描診斷"):
             if not _pd.empty:
                 st.dataframe(_pd,use_container_width=True,hide_index=True)
@@ -1777,8 +1777,46 @@ if simple_mode=="今日雷達":
 
 
 # ============================================================
-# 進階研究：只保留3項
+# 進階研究：正式研究3項 + Shioaji Stage 1
 # ============================================================
+
+if simple_mode=="進階研究" and research_mode=="Shioaji即時引擎":
+    st.markdown("## 🔌 Shioaji Stage 3.1｜TOP150自動更新")
+    st.warning("Stage 3.1 仍完全不下單。本機Worker會自行依官方TWSE/TPEx母池＋Yahoo日K重建每日TOP150；Streamlit的TOP150下載鈕只保留作人工備援。")
+
+    st.markdown("### 操作檢查表")
+    st.dataframe(get_shioaji_stage1_checklist(),use_container_width=True,hide_index=True)
+
+    st.markdown("### Worker 狀態")
+    if run:
+        status,err=read_shioaji_worker_status()
+        st.session_state["st_v11636_shioaji_status"]={"status":status,"error":err}
+
+    sw=st.session_state.get("st_v11636_shioaji_status",{})
+    status=sw.get("status",{})
+    err=sw.get("error","")
+    if err:
+        st.info(
+            "目前這個 Streamlit 執行環境沒有讀到本機 Worker 狀態檔。"
+            "若你把 app 放在 Streamlit Cloud，這是正常的：Cloud 看不到你電腦上的 runtime/shioaji_status.json。"
+        )
+        st.caption(f"偵測結果：{err}")
+    elif status:
+        phase=str(status.get("phase",""))
+        if phase in ["running","subscribed"]:
+            st.success(f"Worker 狀態：{phase}")
+        elif phase=="error":
+            st.error(str(status.get("message","Worker發生錯誤")))
+        else:
+            st.info(f"Worker 狀態：{phase}")
+        st.dataframe(shioaji_stage1_status_table(status),use_container_width=True,hide_index=True)
+
+    st.markdown("### Stage 1 成功標準")
+    st.caption(
+        "先確認：① API登入成功、② 訂閱數=1且低於180安全上限、③ Tick持續增加、④ 60m K正常、⑤ Usage監控有數值或明確顯示查詢失敗。"
+        "這層穩定後，下一版才會擴充正式TOP150，仍只用Tick推播，不增加盤中輪詢。"
+    )
+
 if simple_mode=="進階研究" and research_mode=="策略凍結與即時規格":
     st.markdown("## 🔒 正式核心策略")
     if run:
@@ -1886,7 +1924,7 @@ if simple_mode=="進階研究" and research_mode=="長期集中度健診":
                            file_name=f"{APP_VERSION}_長期Top貢獻移除測試.csv",mime="text/csv",use_container_width=True,on_click="ignore")
 
 
-with st.expander("🧹 V1.16.35 已移除項目"):
+with st.expander("🧹 V1.16.40 已移除項目"):
     st.caption(
         "已從程式與進階選單移除：多週期當沖/隔日、單股/跨股舊回測、股票池1.x/2.0探索、"
         "TOP50暖機/品質/Gate拆解、環境Gate/市場轉折、持有天數、獲利保護、固定停損、"
