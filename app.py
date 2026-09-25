@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.16.43
+黑嚕嚕－短線交易雷達 ST V1.16.44
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.43"
+APP_VERSION = "ST V1.16.44"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.43"
-EXPORT_PREFIX = "ST_V1.16.43"
+APP_VERSION = "ST_V1.16.44"
+EXPORT_PREFIX = "ST_V1.16.44"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -677,7 +677,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.16.43",
+        "strategy_version":"ST V1.16.44",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -856,15 +856,16 @@ def build_current_market_breadth(top200_pool: pd.DataFrame):
     up5_pct=float((z.loc[v5,"RET5%"]>0).mean()*100) if v5.any() else np.nan
     med5=float(z.loc[v5,"RET5%"].median()) if v5.any() else np.nan
 
-    if pd.isna(ma60_pct):
-        risk="⚪ 資料不足"
-    elif ma60_pct>=65:
-        risk="🔴 高檔風險"
-    else:
-        risk="🟢 正常"
+    _tmp={
+        "站上MA15比例%":ma15_pct,
+        "站上MA30比例%":ma30_pct,
+        "站上MA60比例%":ma60_pct,
+    }
+    risk,meaning=market_breadth_interpretation(_tmp)
 
     out=pd.DataFrame([{
         "市場狀態":risk,
+        "狀態解讀":meaning,
         "基準完成日":str(max(latest_dates)) if latest_dates else "",
         "TOP200有效股票數":len(z),
         "站上MA15比例%":ma15_pct,
@@ -872,7 +873,7 @@ def build_current_market_breadth(top200_pool: pd.DataFrame):
         "站上MA60比例%":ma60_pct,
         "5日上漲家數比例%":up5_pct,
         "5日報酬中位數%":med5,
-        "風險規則":"MA60廣度>=65%僅顯示高檔風險警示，不過濾訊號"
+        "使用方式":"市場廣度只做環境提示，不直接過濾正式策略訊號"
     }])
     return out, []
 
@@ -1707,6 +1708,99 @@ SECTOR_POOLS = {
 
 
 
+
+def diagnose_worker_runtime():
+    """
+    診斷目前Streamlit執行環境為何讀不到本機Worker runtime。
+    不把「Cloud看不到Windows本機」誤判成使用者放錯檔案。
+    """
+    cwd = Path.cwd()
+    runtime_dir = cwd / "runtime"
+    status_path = runtime_dir / "shioaji_status.json"
+
+    cwd_text = str(cwd).replace("\\", "/")
+    likely_cloud = (
+        cwd_text.startswith("/mount/src/")
+        or cwd_text.startswith("/home/adminuser/")
+        or bool(os.getenv("STREAMLIT_SHARING_MODE"))
+    )
+
+    result = {
+        "cwd": str(cwd),
+        "runtime_dir": str(runtime_dir),
+        "status_path": str(status_path),
+        "runtime_exists": runtime_dir.exists(),
+        "status_exists": status_path.exists(),
+        "likely_cloud": likely_cloud,
+        "diagnosis": "",
+        "suggestion": "",
+    }
+
+    if status_path.exists():
+        result["diagnosis"] = "OK：目前Streamlit可以讀到Worker狀態檔。"
+        result["suggestion"] = "Worker與Streamlit資料來源已接通。"
+        return result
+
+    if likely_cloud:
+        result["diagnosis"] = (
+            "目前App很可能跑在Streamlit Cloud，而Worker跑在你的Windows電腦；"
+            "這兩台機器不是同一個檔案系統，所以Cloud看不到Windows的runtime。"
+        )
+        result["suggestion"] = (
+            "這通常不是你把檔案放錯地方。下一階段要接共享資料層，"
+            "讓Windows Worker把狀態寫到雲端，Streamlit Cloud再讀取。"
+        )
+        return result
+
+    if not runtime_dir.exists():
+        result["diagnosis"] = "本機Streamlit目前找不到 runtime 資料夾。"
+        result["suggestion"] = (
+            "若Streamlit與Worker都在同一台電腦，請確認app.py與Worker使用同一個專案根目錄，"
+            "或把Worker產生的runtime資料夾放在目前App工作目錄下。"
+        )
+        return result
+
+    result["diagnosis"] = "runtime資料夾存在，但 shioaji_status.json 不存在。"
+    result["suggestion"] = (
+        "請確認Worker是否真的有啟動並成功寫入狀態；也可能是Worker與App指向不同的runtime資料夾。"
+    )
+    return result
+
+
+def market_breadth_interpretation(row):
+    """把MA15/30/60廣度翻成較直觀的市場狀態；只做提示，不過濾策略訊號。"""
+    def _num(k):
+        try:
+            v=float(row.get(k))
+            return v if np.isfinite(v) else None
+        except Exception:
+            return None
+
+    b15=_num("站上MA15比例%")
+    b30=_num("站上MA30比例%")
+    b60=_num("站上MA60比例%")
+
+    if b15 is None or b30 is None or b60 is None:
+        return "⚪ 資料不足", "廣度資料不足，暫不判讀。"
+
+    if b15 >= 70 and b30 >= 65 and b60 >= 60:
+        return "🟢 強勢擴散", "短中期多數股票都站在均線上，市場參與度廣。"
+
+    if b15 < 45 and b30 >= 55 and b60 >= 55:
+        return "🟡 短線轉弱", "MA15先下滑，但MA30/60仍高，常見於強勢市場短線降溫。"
+
+    if b15 >= 60 and b30 < 50 and b60 < 50:
+        return "🟠 反彈初期", "短線先回到MA15之上，但中期廣度尚未跟上。"
+
+    if b15 < 40 and b30 < 40 and b60 < 40:
+        return "🔴 全面偏弱", "短中期大多數股票都在均線下方。"
+
+    if b60 >= 65:
+        return "🟠 中期高檔", "MA60廣度偏高，代表中期多數股票仍在強勢區，需留意高檔震盪風險。"
+
+    return "⚪ 中性", "多空廣度沒有明顯極端，視個股訊號為主。"
+
+
 def smart_refresh_seconds(now_ts=None):
     """
     60分K策略的智慧刷新：
@@ -1767,7 +1861,7 @@ with st.sidebar:
             index=0
         )
         captions={
-            "Shioaji即時引擎":"Stage 4.1：加入固定/智慧自動刷新；平常60秒，60分K收盤前後自動加速到10秒。",
+            "Shioaji即時引擎":"Stage 4.2：加入Worker狀態診斷與市場廣度解讀；可判斷是Cloud/本機路徑/檔案缺失問題。",
             "策略凍結與即時規格":"查看正式凍結參數與未來 Shioaji 即時行情架構。",
             "長期穩健度驗證":"固定正式策略，以1y 60m資料、最後9mo評估與6段時間檢查長期穩健度。",
             "長期集中度健診":"沿用長期樣本，檢查月度、股票貢獻與Top貢獻集中度。"
@@ -1938,11 +2032,31 @@ if simple_mode=="今日雷達":
 # ============================================================
 
 if simple_mode=="進階研究" and research_mode=="Shioaji即時引擎":
-    st.markdown("## 🧪 Shioaji Stage 4.1｜模擬交易＋智慧刷新")
+    st.markdown("## 🧪 Shioaji Stage 4.2｜模擬交易＋連線診斷")
     st.warning("Stage 4 只做程式內模擬成交，不呼叫Shioaji place_order/update_order/cancel_order。正式訊號在下一根60m K第一筆Tick模擬建倉，建倉/出場後可推送Telegram。")
 
     st.markdown("### 操作檢查表")
     st.dataframe(get_shioaji_stage1_checklist(),use_container_width=True,hide_index=True)
+
+    st.markdown("### 🔎 Worker連線診斷")
+    _diag=diagnose_worker_runtime()
+    if _diag["status_exists"]:
+        st.success(_diag["diagnosis"])
+    elif _diag["likely_cloud"]:
+        st.info(_diag["diagnosis"])
+    else:
+        st.warning(_diag["diagnosis"])
+
+    st.caption(_diag["suggestion"])
+    with st.expander("查看診斷路徑"):
+        st.code(
+            f"Streamlit工作目錄：{_diag['cwd']}\n"
+            f"預期runtime：{_diag['runtime_dir']}\n"
+            f"預期狀態檔：{_diag['status_path']}\n"
+            f"runtime存在：{_diag['runtime_exists']}\n"
+            f"status存在：{_diag['status_exists']}\n"
+            f"推測Cloud環境：{_diag['likely_cloud']}"
+        )
 
     st.markdown("### Worker 即時狀態")
 
