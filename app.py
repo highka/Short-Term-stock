@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.16.42.1
+黑嚕嚕－短線交易雷達 ST V1.16.43
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.42.1"
+APP_VERSION = "ST V1.16.43"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.42.1"
-EXPORT_PREFIX = "ST_V1.16.42.1"
+APP_VERSION = "ST_V1.16.43"
+EXPORT_PREFIX = "ST_V1.16.43"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -677,7 +677,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.16.42.1",
+        "strategy_version":"ST V1.16.43",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -1706,6 +1706,51 @@ SECTOR_POOLS = {
 
 
 
+
+def smart_refresh_seconds(now_ts=None):
+    """
+    60分K策略的智慧刷新：
+    - 平常 60 秒
+    - 09:55~10:02 / 10:55~11:02 / 11:55~12:02 / 12:55~13:02：10 秒
+    - 13:25~13:32：10 秒
+    - 非交易時段：300 秒
+    """
+    now_ts = now_ts or pd.Timestamp.now(tz="Asia/Taipei")
+    if now_ts.tzinfo is None:
+        now_ts = now_ts.tz_localize("Asia/Taipei")
+    else:
+        now_ts = now_ts.tz_convert("Asia/Taipei")
+
+    if now_ts.weekday() >= 5:
+        return 300, "非交易日｜300秒"
+
+    hhmm = now_ts.hour * 100 + now_ts.minute
+    windows = [
+        (955, 1002),
+        (1055, 1102),
+        (1155, 1202),
+        (1255, 1302),
+        (1325, 1332),
+    ]
+    if any(a <= hhmm <= b for a, b in windows):
+        return 10, "60分K收盤前後｜10秒"
+
+    if 900 <= hhmm <= 1335:
+        return 60, "盤中一般監控｜60秒"
+
+    return 300, "非交易時段｜300秒"
+
+
+def resolve_refresh_seconds(enabled, mode, fixed_seconds):
+    if not enabled:
+        return None, "自動刷新關閉"
+    if mode == "智慧":
+        return smart_refresh_seconds()
+    sec = int(fixed_seconds)
+    return sec, f"固定刷新｜{sec}秒"
+
+
+
 st.title(f"⚡ {APP_NAME}")
 st.caption(f"{APP_VERSION}｜🔒 正式核心策略｜全市場動態TOP150｜60m KD黃金交叉 + K<30｜持有5日")
 st.info("策略研究基準已凍結。日常頁只跑正式雷達；進階頁僅保留必要的長期驗證與 Shioaji 即時串接規格。")
@@ -1722,7 +1767,7 @@ with st.sidebar:
             index=0
         )
         captions={
-            "Shioaji即時引擎":"Stage 4：TOP150即時策略＋模擬建倉＋Telegram通知；仍沒有任何真實下單API。",
+            "Shioaji即時引擎":"Stage 4.1：加入固定/智慧自動刷新；平常60秒，60分K收盤前後自動加速到10秒。",
             "策略凍結與即時規格":"查看正式凍結參數與未來 Shioaji 即時行情架構。",
             "長期穩健度驗證":"固定正式策略，以1y 60m資料、最後9mo評估與6段時間檢查長期穩健度。",
             "長期集中度健診":"沿用長期樣本，檢查月度、股票貢獻與Top貢獻集中度。"
@@ -1733,6 +1778,25 @@ with st.sidebar:
         fee_discount=st.number_input("手續費折數",min_value=0.1,max_value=1.0,value=0.28,step=0.01)
         slip_bp=st.number_input("單邊滑價（bp）",min_value=0.0,max_value=30.0,value=5.0,step=1.0)
     cost=CostConfig(fee_discount=fee_discount,slippage_pct=slip_bp/10000)
+
+    refresh_enabled=False
+    refresh_mode="智慧"
+    refresh_fixed=60
+    if simple_mode=="進階研究" and research_mode=="Shioaji即時引擎":
+        with st.expander("🔄 即時畫面刷新", expanded=True):
+            refresh_enabled=st.toggle("自動刷新", value=True)
+            refresh_mode=st.radio("刷新模式", ["智慧","固定"], horizontal=True, index=0)
+            if refresh_mode=="固定":
+                refresh_fixed=st.select_slider(
+                    "固定刷新秒數",
+                    options=[5,10,30,60,300],
+                    value=60
+                )
+            _refresh_sec,_refresh_desc=resolve_refresh_seconds(
+                refresh_enabled, refresh_mode, refresh_fixed
+            )
+            st.caption(f"目前：{_refresh_desc}")
+            st.caption("建議60分K策略使用智慧模式；平常60秒即可，接近60分K收盤才加速到10秒。")
 
     if simple_mode=="今日雷達":
         btn_label="🔄 更新今日雷達"
@@ -1874,27 +1938,37 @@ if simple_mode=="今日雷達":
 # ============================================================
 
 if simple_mode=="進階研究" and research_mode=="Shioaji即時引擎":
-    st.markdown("## 🧪 Shioaji Stage 4｜模擬交易引擎")
+    st.markdown("## 🧪 Shioaji Stage 4.1｜模擬交易＋智慧刷新")
     st.warning("Stage 4 只做程式內模擬成交，不呼叫Shioaji place_order/update_order/cancel_order。正式訊號在下一根60m K第一筆Tick模擬建倉，建倉/出場後可推送Telegram。")
 
     st.markdown("### 操作檢查表")
     st.dataframe(get_shioaji_stage1_checklist(),use_container_width=True,hide_index=True)
 
-    st.markdown("### Worker 狀態")
-    if run:
-        status,err=read_shioaji_worker_status()
-        st.session_state["st_v11636_shioaji_status"]={"status":status,"error":err}
+    st.markdown("### Worker 即時狀態")
 
-    sw=st.session_state.get("st_v11636_shioaji_status",{})
-    status=sw.get("status",{})
-    err=sw.get("error","")
-    if err:
-        st.info(
-            "目前這個 Streamlit 執行環境沒有讀到本機 Worker 狀態檔。"
-            "若你把 app 放在 Streamlit Cloud，這是正常的：Cloud 看不到你電腦上的 runtime/shioaji_status.json。"
-        )
-        st.caption(f"偵測結果：{err}")
-    elif status:
+    _refresh_sec,_refresh_desc=resolve_refresh_seconds(
+        refresh_enabled, refresh_mode, refresh_fixed
+    )
+    st.caption(f"刷新策略：{_refresh_desc}")
+
+    @st.fragment(run_every=_refresh_sec)
+    def render_worker_live_panel():
+        status,err=read_shioaji_worker_status()
+        st.session_state["st_v11643_shioaji_status"]={"status":status,"error":err}
+
+        if err:
+            st.info(
+                "目前這個 Streamlit 執行環境沒有讀到 Worker 狀態檔。"
+                "如果 app 在 Streamlit Cloud、Worker 跑在你的 Windows 電腦，Cloud 仍無法直接讀本機 runtime；"
+                "自動刷新只會重新讀目前 Streamlit 能存取的資料來源。"
+            )
+            st.caption(f"偵測結果：{err}")
+            return
+
+        if not status:
+            st.info("尚未取得 Worker 狀態。")
+            return
+
         phase=str(status.get("phase",""))
         if phase in ["running","subscribed"]:
             st.success(f"Worker 狀態：{phase}")
@@ -1902,12 +1976,41 @@ if simple_mode=="進階研究" and research_mode=="Shioaji即時引擎":
             st.error(str(status.get("message","Worker發生錯誤")))
         else:
             st.info(f"Worker 狀態：{phase}")
-        st.dataframe(shioaji_stage1_status_table(status),use_container_width=True,hide_index=True)
 
-    st.markdown("### Stage 1 成功標準")
+        st.dataframe(
+            shioaji_stage1_status_table(status),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        _sim_positions=read_worker_json("runtime/sim_positions.json")
+        _sim_pending=read_worker_json("runtime/sim_pending_entries.json")
+
+        c1,c2,c3,c4=st.columns(4)
+        c1.metric("模擬持倉", len(_sim_positions) if isinstance(_sim_positions,dict) else 0)
+        c2.metric("待進場", len(_sim_pending) if isinstance(_sim_pending,dict) else 0)
+        c3.metric("正式訊號", int(status.get("formal_signal_count",0) or 0))
+        c4.metric("已完成模擬交易", int(status.get("sim_closed_trade_count",0) or 0))
+
+        if isinstance(_sim_positions,dict) and _sim_positions:
+            st.markdown("#### 🧪 模擬持倉")
+            _sp=pd.DataFrame(list(_sim_positions.values()))
+            st.dataframe(_sp,use_container_width=True,hide_index=True)
+
+        if isinstance(_sim_pending,dict) and _sim_pending:
+            st.markdown("#### ⏳ 待模擬進場")
+            _pe=pd.DataFrame(list(_sim_pending.values()))
+            st.dataframe(_pe,use_container_width=True,hide_index=True)
+
+        _now_tw=pd.Timestamp.now(tz="Asia/Taipei")
+        st.caption(f"畫面更新時間：{_now_tw.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    render_worker_live_panel()
+
+    st.markdown("### Stage 4.1 驗證重點")
     st.caption(
-        "先確認：① API登入成功、② 訂閱數=1且低於180安全上限、③ Tick持續增加、④ 60m K正常、⑤ Usage監控有數值或明確顯示查詢失敗。"
-        "這層穩定後，下一版才會擴充正式TOP150，仍只用Tick推播，不增加盤中輪詢。"
+        "確認：① TOP150自動建池正常、② 訂閱接近150/150、③ 60m暖機成功、④ Tick與60m K持續更新、"
+        "⑤ 正式訊號→下一根60m第一筆Tick模擬建倉、⑥ Telegram建倉/出場通知、⑦ 第5個後續交易日出場正確。"
     )
 
 if simple_mode=="進階研究" and research_mode=="策略凍結與即時規格":
