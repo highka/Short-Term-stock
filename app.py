@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.16.41
+黑嚕嚕－短線交易雷達 ST V1.16.42
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.41"
+APP_VERSION = "ST V1.16.42"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.41"
-EXPORT_PREFIX = "ST_V1.16.41"
+APP_VERSION = "ST_V1.16.42"
+EXPORT_PREFIX = "ST_V1.16.42"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -677,7 +677,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.16.41",
+        "strategy_version":"ST V1.16.42",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -716,16 +716,16 @@ def get_shioaji_realtime_spec():
     ])
 
 def get_shioaji_stage1_checklist():
-    """V1.16.40：Shioaji Stage 3.1，每日TOP150自動更新。"""
+    """V1.16.42：即時策略＋模擬交易＋Telegram。"""
     return pd.DataFrame([
-        {"順序":1,"項目":"自動判斷基準日","內容":"Worker啟動先確認最近完成交易日；盤中永遠排除今天未完成日K"},
-        {"順序":2,"項目":"本機自動建池","內容":"官方TWSE+TPEx公司母池 → Yahoo 2mo日K → 最近20完成交易日成交金額中位數排名"},
-        {"順序":3,"項目":"每日只重建一次","內容":"若 top150_latest.csv 已是最新完成交易日就直接使用，不重抓全市場"},
-        {"順序":4,"項目":"失敗保護","內容":"自動更新失敗時沿用最近一次有效TOP150；沒有快取才退回2330單股"},
-        {"順序":5,"項目":"TOP150訂閱","內容":"只訂Tick、不訂BidAsk；安全上限180/官方200；每筆約0.05秒"},
-        {"順序":6,"項目":"60m K","內容":"150檔各自聚合09/10/11/12/13時段60m K"},
-        {"順序":7,"項目":"Usage/重連","內容":"api.usage()低頻監控＋安全退避重連；盤中不輪詢Shioaji snapshots/ticks/kbars"},
-        {"順序":8,"項目":"人工備援","內容":"Streamlit仍可下載【Shioaji_TOP150訂閱清單】，但日常不需要手動餵檔"},
+        {"順序":1,"項目":"每日TOP150","內容":"沿用自動建池；TOP1-100保留全部核心訊號，TOP101-150只接受S級"},
+        {"順序":2,"項目":"60m暖機","內容":"Worker啟動用Yahoo 60m歷史資料暖機KD/MA60/量比20，不占Shioaji歷史查詢額度"},
+        {"順序":3,"項目":"正式訊號","內容":"完成60m K：KD(9,3,3)黃金交叉且K<30；S/A/B依量比20與MA60斜率3"},
+        {"順序":4,"項目":"模擬進場","內容":"訊號完成後的下一根60m K第一筆Tick模擬成交，符合原回測「下一根Open」語意"},
+        {"順序":5,"項目":"非重疊","內容":"同一股票已有模擬持倉或待進場時，不重複建立新部位"},
+        {"順序":6,"項目":"模擬出場","內容":"固定5日：進場日不算，於第5個後續交易日最後一根60m K收盤模擬出場"},
+        {"順序":7,"項目":"Telegram","內容":"模擬建倉與出場成功後推送通知；Telegram本版只通知，不接受下單指令"},
+        {"順序":8,"項目":"正式下單","內容":"本版仍0真實委託；待模擬狀態/重啟/出場驗證後，再做人工確認正式下單"},
     ])
 
 
@@ -747,35 +747,42 @@ def read_shioaji_worker_status(path="runtime/shioaji_status.json"):
         return {}, f"狀態檔讀取失敗：{e}"
 
 
+
+def read_worker_json(path):
+    p=Path(path)
+    if not p.exists():
+        return {}
+    try:
+        x=json.loads(p.read_text(encoding="utf-8"))
+        return x if isinstance(x,(dict,list)) else {}
+    except Exception:
+        return {}
+
+
 def shioaji_stage1_status_table(status):
     keys=[
         ("phase","階段"),
         ("message","訊息"),
         ("shioaji_version","Shioaji版本"),
-        ("simulation","模擬模式"),
+        ("simulation","Shioaji模擬環境"),
+        ("strategy_mode","交易模式"),
         ("pool_source","股票池來源"),
-        ("pool_file","股票池檔案"),
         ("pool_basis_date","排名基準完成日"),
         ("pool_code_count","股票池檔數"),
-        ("pool_refresh_status","股票池更新狀態"),
-        ("pool_refresh_seconds","建池耗時(秒)"),
-        ("login_time","登入時間"),
-        ("subscribe_time","訂閱時間"),
+        ("warmup_success","60m暖機成功檔數"),
+        ("warmup_failed","60m暖機失敗檔數"),
         ("subscription_target","目標訂閱數"),
         ("subscription_count","目前訂閱數"),
         ("subscription_failed","訂閱失敗數"),
-        ("subscription_safe_limit","程式訂閱安全上限"),
-        ("official_subscription_limit","官方訂閱上限"),
-        ("last_tick_time","最後Tick時間"),
         ("tick_count","Tick數"),
-        ("last_code","最新Tick股票"),
-        ("last_price","最新價"),
         ("active_bar_count","進行中60m K數"),
         ("finalized_bar_count","已完成60m K數"),
-        ("usage_connections","Usage連線數"),
-        ("usage_used_mb","Usage已用MB"),
-        ("usage_limit_mb","Usage上限MB"),
-        ("usage_remaining_mb","Usage剩餘MB"),
+        ("formal_signal_count","正式訊號數"),
+        ("pending_entry_count","待模擬進場"),
+        ("sim_position_count","模擬持倉數"),
+        ("sim_closed_trade_count","已完成模擬交易"),
+        ("telegram_enabled","Telegram通知"),
+        ("last_trade_event","最後交易事件"),
         ("usage_pct","Usage使用率%"),
         ("usage_level","Usage警示"),
         ("reconnect_attempt","目前重連次數"),
@@ -1629,7 +1636,7 @@ with st.sidebar:
             index=0
         )
         captions={
-            "Shioaji即時引擎":"Stage 3.1.1：修正新電腦SSL憑證相容性、.env優先權與金鑰錯誤遮罩；TOP150自動更新邏輯不變。",
+            "Shioaji即時引擎":"Stage 4：TOP150即時策略＋模擬建倉＋Telegram通知；仍沒有任何真實下單API。",
             "策略凍結與即時規格":"查看正式凍結參數與未來 Shioaji 即時行情架構。",
             "長期穩健度驗證":"固定正式策略，以1y 60m資料、最後9mo評估與6段時間檢查長期穩健度。",
             "長期集中度健診":"沿用長期樣本，檢查月度、股票貢獻與Top貢獻集中度。"
@@ -1781,8 +1788,8 @@ if simple_mode=="今日雷達":
 # ============================================================
 
 if simple_mode=="進階研究" and research_mode=="Shioaji即時引擎":
-    st.markdown("## 🔌 Shioaji Stage 3.1.1｜新電腦相容性修正")
-    st.warning("Stage 3.1.1 仍完全不下單。修正部分Windows/Python環境存取TWSE/TPEx時的SSL憑證錯誤，並避免登入錯誤把完整API Key印在畫面。")
+    st.markdown("## 🧪 Shioaji Stage 4｜模擬交易引擎")
+    st.warning("Stage 4 只做程式內模擬成交，不呼叫Shioaji place_order/update_order/cancel_order。正式訊號在下一根60m K第一筆Tick模擬建倉，建倉/出場後可推送Telegram。")
 
     st.markdown("### 操作檢查表")
     st.dataframe(get_shioaji_stage1_checklist(),use_container_width=True,hide_index=True)
@@ -1924,7 +1931,7 @@ if simple_mode=="進階研究" and research_mode=="長期集中度健診":
                            file_name=f"{APP_VERSION}_長期Top貢獻移除測試.csv",mime="text/csv",use_container_width=True,on_click="ignore")
 
 
-with st.expander("🧹 V1.16.41 已移除項目"):
+with st.expander("🧹 V1.16.42 已移除項目"):
     st.caption(
         "已從程式與進階選單移除：多週期當沖/隔日、單股/跨股舊回測、股票池1.x/2.0探索、"
         "TOP50暖機/品質/Gate拆解、環境Gate/市場轉折、持有天數、獲利保護、固定停損、"
