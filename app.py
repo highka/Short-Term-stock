@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.16.42
+黑嚕嚕－短線交易雷達 ST V1.16.42.1
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.42"
+APP_VERSION = "ST V1.16.42.1"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.42"
-EXPORT_PREFIX = "ST_V1.16.42"
+APP_VERSION = "ST_V1.16.42.1"
+EXPORT_PREFIX = "ST_V1.16.42.1"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -677,7 +677,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.16.42",
+        "strategy_version":"ST V1.16.42.1",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -789,6 +789,92 @@ def shioaji_stage1_status_table(status):
         ("updated_at","狀態更新時間"),
     ]
     return pd.DataFrame([{"項目":label,"內容":status.get(key,"")} for key,label in keys])
+
+
+
+def build_current_market_breadth(top200_pool: pd.DataFrame):
+    """
+    今日市場環境：
+    使用今天以前已完成日K，針對目前流動性TOP200計算市場廣度。
+    僅作風險提示，不直接過濾今日雷達訊號。
+    """
+    if top200_pool is None or top200_pool.empty:
+        return pd.DataFrame(), ["TOP200股票池為空，無法計算市場廣度。"]
+
+    symbols=top200_pool.loc[top200_pool["流動性排名"]<=200,"股票"].astype(str).tolist()
+    if not symbols:
+        return pd.DataFrame(), ["TOP200股票清單為空。"]
+
+    dmap=download_daily_batches(symbols,period="1y",batch_size=25)
+    today_tw=pd.Timestamp.now(tz="Asia/Taipei").date()
+    rec=[]
+    latest_dates=[]
+
+    for s in symbols:
+        d=dmap.get(s)
+        if d is None or d.empty:
+            continue
+        try:
+            x=d.copy()
+            x.index=pd.to_datetime(x.index,errors="coerce")
+            x=x[x.index.notna()].sort_index()
+            x=x[pd.Index([pd.Timestamp(i).date() for i in x.index]) < today_tw]
+            x=x.dropna(subset=["Close"]).copy()
+            if len(x)<60:
+                continue
+
+            c=pd.to_numeric(x["Close"],errors="coerce")
+            ma15=c.rolling(15,min_periods=15).mean()
+            ma30=c.rolling(30,min_periods=30).mean()
+            ma60=c.rolling(60,min_periods=60).mean()
+            ret5=(c/c.shift(5)-1)*100
+
+            rec.append({
+                "股票":s,
+                "Close":float(c.iloc[-1]) if pd.notna(c.iloc[-1]) else np.nan,
+                "MA15":float(ma15.iloc[-1]) if pd.notna(ma15.iloc[-1]) else np.nan,
+                "MA30":float(ma30.iloc[-1]) if pd.notna(ma30.iloc[-1]) else np.nan,
+                "MA60":float(ma60.iloc[-1]) if pd.notna(ma60.iloc[-1]) else np.nan,
+                "RET5%":float(ret5.iloc[-1]) if pd.notna(ret5.iloc[-1]) else np.nan,
+            })
+            latest_dates.append(pd.Timestamp(x.index[-1]).date())
+        except Exception:
+            continue
+
+    z=pd.DataFrame(rec)
+    if z.empty:
+        return pd.DataFrame(), ["TOP200市場廣度日K資料不足。"]
+
+    v15=z["Close"].notna()&z["MA15"].notna()
+    v30=z["Close"].notna()&z["MA30"].notna()
+    v60=z["Close"].notna()&z["MA60"].notna()
+    v5=z["RET5%"].notna()
+
+    ma15_pct=float((z.loc[v15,"Close"]>z.loc[v15,"MA15"]).mean()*100) if v15.any() else np.nan
+    ma30_pct=float((z.loc[v30,"Close"]>z.loc[v30,"MA30"]).mean()*100) if v30.any() else np.nan
+    ma60_pct=float((z.loc[v60,"Close"]>z.loc[v60,"MA60"]).mean()*100) if v60.any() else np.nan
+    up5_pct=float((z.loc[v5,"RET5%"]>0).mean()*100) if v5.any() else np.nan
+    med5=float(z.loc[v5,"RET5%"].median()) if v5.any() else np.nan
+
+    if pd.isna(ma60_pct):
+        risk="⚪ 資料不足"
+    elif ma60_pct>=65:
+        risk="🔴 高檔風險"
+    else:
+        risk="🟢 正常"
+
+    out=pd.DataFrame([{
+        "市場狀態":risk,
+        "基準完成日":str(max(latest_dates)) if latest_dates else "",
+        "TOP200有效股票數":len(z),
+        "站上MA15比例%":ma15_pct,
+        "站上MA30比例%":ma30_pct,
+        "站上MA60比例%":ma60_pct,
+        "5日上漲家數比例%":up5_pct,
+        "5日報酬中位數%":med5,
+        "風險規則":"MA60廣度>=65%僅顯示高檔風險警示，不過濾訊號"
+    }])
+    return out, []
 
 
 def build_formal_daily_radar(cost: CostConfig):
