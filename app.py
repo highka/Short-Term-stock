@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.16.40
+黑嚕嚕－短線交易雷達 ST V1.16.41
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -50,13 +50,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.40"
+APP_VERSION = "ST V1.16.41"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.40"
-EXPORT_PREFIX = "ST_V1.16.40"
+APP_VERSION = "ST_V1.16.41"
+EXPORT_PREFIX = "ST_V1.16.41"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -677,7 +677,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.16.40",
+        "strategy_version":"ST V1.16.41",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -1629,7 +1629,7 @@ with st.sidebar:
             index=0
         )
         captions={
-            "Shioaji即時引擎":"Stage 3.1：本機Worker自動更新每日TOP150，再訂閱Tick；不再需要每天手動下載CSV。",
+            "Shioaji即時引擎":"Stage 3.1.1：修正新電腦SSL憑證相容性、.env優先權與金鑰錯誤遮罩；TOP150自動更新邏輯不變。",
             "策略凍結與即時規格":"查看正式凍結參數與未來 Shioaji 即時行情架構。",
             "長期穩健度驗證":"固定正式策略，以1y 60m資料、最後9mo評估與6段時間檢查長期穩健度。",
             "長期集中度健診":"沿用長期樣本，檢查月度、股票貢獻與Top貢獻集中度。"
@@ -1781,8 +1781,8 @@ if simple_mode=="今日雷達":
 # ============================================================
 
 if simple_mode=="進階研究" and research_mode=="Shioaji即時引擎":
-    st.markdown("## 🔌 Shioaji Stage 3.1｜TOP150自動更新")
-    st.warning("Stage 3.1 仍完全不下單。本機Worker會自行依官方TWSE/TPEx母池＋Yahoo日K重建每日TOP150；Streamlit的TOP150下載鈕只保留作人工備援。")
+    st.markdown("## 🔌 Shioaji Stage 3.1.1｜新電腦相容性修正")
+    st.warning("Stage 3.1.1 仍完全不下單。修正部分Windows/Python環境存取TWSE/TPEx時的SSL憑證錯誤，並避免登入錯誤把完整API Key印在畫面。")
 
     st.markdown("### 操作檢查表")
     st.dataframe(get_shioaji_stage1_checklist(),use_container_width=True,hide_index=True)
@@ -1924,7 +1924,7 @@ if simple_mode=="進階研究" and research_mode=="長期集中度健診":
                            file_name=f"{APP_VERSION}_長期Top貢獻移除測試.csv",mime="text/csv",use_container_width=True,on_click="ignore")
 
 
-with st.expander("🧹 V1.16.40 已移除項目"):
+with st.expander("🧹 V1.16.41 已移除項目"):
     st.caption(
         "已從程式與進階選單移除：多週期當沖/隔日、單股/跨股舊回測、股票池1.x/2.0探索、"
         "TOP50暖機/品質/Gate拆解、環境Gate/市場轉折、持有天數、獲利保護、固定停損、"
