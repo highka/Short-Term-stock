@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.16.49
+黑嚕嚕－短線交易雷達 ST V1.16.50
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -51,13 +51,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.49"
+APP_VERSION = "ST V1.16.50"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.49"
-EXPORT_PREFIX = "ST_V1.16.49"
+APP_VERSION = "ST_V1.16.50"
+EXPORT_PREFIX = "ST_V1.16.50"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -678,7 +678,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.16.49",
+        "strategy_version":"ST V1.16.50",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -1949,14 +1949,22 @@ def find_dynamic_exit(
     max_hold_days: int=5,
 ):
     """
-    動態出場規則（訊號一律以完成60分K判斷）：
-    1) 停利：完成60m Close >= 進場價，且 K>80 且當根KD死亡交叉
-    2) 停損：完成60m Close < 進場價，且當根KD死亡交叉
-    3) 加速停損研究版：完成60m Close < 進場價 且 K<D（不要求當根新死叉）
-    4) 最晚第5個後續交易日最後一根60m收盤出場
-    為避免偷看完成K棒後又用同一根Close成交：
-      - KD條件觸發 -> 下一根60m Open出場
-      - 第5日兜底為預先知道的時間規則 -> 當日最後一根60m Close出場
+    動態出場規則（完成60分K後判斷）：
+
+    共通停利：
+      Close >= 進場價 且 K>80 且當根KD死亡交叉
+      -> 下一根60m Open出場
+
+    停損研究版本：
+      A. 連續2根60m Close < 進場價 且目前K<D
+      B. Close <= 進場價 * 0.97 且目前K<D
+      C. Close <= 進場價 * 0.95 且目前K<D
+
+    兜底：
+      第5個後續交易日最後一根60m Close出場
+
+    為避免look-ahead：
+      KD/價格條件需等完成K棒後確認，實際成交用下一根60m Open。
     """
     if d is None or d.empty or entry_i>=len(d):
         return None,None,None
@@ -1964,7 +1972,7 @@ def find_dynamic_exit(
     x=add_kd_death_cross_flags(d)
     entry_date=pd.Timestamp(x.index[entry_i]).date()
 
-    # 找第5個後續交易日的最後一根bar
+    # 第5個後續交易日最後一根bar
     trade_dates=[]
     for j in range(entry_i, len(x)):
         dt=pd.Timestamp(x.index[j]).date()
@@ -1977,47 +1985,68 @@ def find_dynamic_exit(
         if idxs:
             fallback_i=max(idxs)
 
-    # 從進場後完成的bar開始檢查；entry_i這根是進場bar，不能在開盤後立刻拿同一根未完成資訊
+    below_entry_streak=0
+
     for j in range(entry_i, len(x)):
-        # 到第5日最後一根時，兜底時間出場優先，不再等待下一根
         if fallback_i is not None and j>=fallback_i:
             return fallback_i, "第5日兜底", "close"
-
-        if j+1>=len(x):
-            break
 
         close=float(pd.to_numeric(pd.Series([x["Close"].iloc[j]]),errors="coerce").iloc[0])
         k=float(pd.to_numeric(pd.Series([x["K"].iloc[j]]),errors="coerce").iloc[0]) if "K" in x else float("nan")
         dd=float(pd.to_numeric(pd.Series([x["D"].iloc[j]]),errors="coerce").iloc[0]) if "D" in x else float("nan")
         dead=bool(x["KD_DEAD"].iloc[j])
 
+        if np.isfinite(close) and close < entry_price:
+            below_entry_streak += 1
+        else:
+            below_entry_streak = 0
+
+        # 停利：保留目前已驗證版本
         take_profit = (
-            exit_mode in ["原案：KD停利+KD停損+5日兜底","只測KD停利+5日兜底","加速停損研究版"]
+            exit_mode in [
+                "KD停利+2根跌破停損+5日兜底",
+                "KD停利+-3%停損+5日兜底",
+                "KD停利+-5%停損+5日兜底",
+                "只測KD停利+5日兜底",
+            ]
             and np.isfinite(close) and close>=entry_price
             and np.isfinite(k) and k>80
             and dead
         )
-        stop_loss = (
-            exit_mode in ["原案：KD停利+KD停損+5日兜底","只測KD停損+5日兜底"]
-            and np.isfinite(close) and close<entry_price
-            and dead
+
+        # 停損：完成60m後確認，下一根Open成交
+        stop_2bars = (
+            exit_mode=="KD停利+2根跌破停損+5日兜底"
+            and below_entry_streak>=2
+            and np.isfinite(k) and np.isfinite(dd) and k<dd
         )
-        fast_stop = (
-            exit_mode=="加速停損研究版"
-            and np.isfinite(close) and close<entry_price
+        stop_3pct = (
+            exit_mode=="KD停利+-3%停損+5日兜底"
+            and np.isfinite(close) and close <= entry_price*0.97
+            and np.isfinite(k) and np.isfinite(dd) and k<dd
+        )
+        stop_5pct = (
+            exit_mode=="KD停利+-5%停損+5日兜底"
+            and np.isfinite(close) and close <= entry_price*0.95
             and np.isfinite(k) and np.isfinite(dd) and k<dd
         )
 
+        if j+1>=len(x):
+            break
+
         if take_profit:
             return j+1, "KD>80死叉停利", "open"
-        if stop_loss:
-            return j+1, "跌破進場價+KD死叉停損", "open"
-        if fast_stop:
-            return j+1, "跌破進場價+K<D加速停損", "open"
+        if stop_2bars:
+            return j+1, "連續2根跌破進場價+K<D停損", "open"
+        if stop_3pct:
+            return j+1, "-3%且K<D停損", "open"
+        if stop_5pct:
+            return j+1, "-5%且K<D停損", "open"
 
     if fallback_i is not None:
         return fallback_i, "第5日兜底", "close"
     return None,None,None
+
 
 
 def backtest_dynamic_exit(
@@ -2026,7 +2055,7 @@ def backtest_dynamic_exit(
     cost: CostConfig,
     exit_mode: str,
 ) -> pd.DataFrame:
-    """下一根60m Open進場；採動態KD出場＋第5日兜底。"""
+    """下一根60m Open進場；動態停利/停損 + 第5日兜底，並追蹤停損反事實結果。"""
     if d is None or d.empty:
         return pd.DataFrame()
 
@@ -2047,17 +2076,27 @@ def backtest_dynamic_exit(
         if exit_i is None or exit_i<=entry_i:
             continue
 
-        if fill_at=="open":
-            exitp=float(x["Open"].iloc[exit_i])
-        else:
-            exitp=float(x["Close"].iloc[exit_i])
-
+        exitp=float(x["Open"].iloc[exit_i]) if fill_at=="open" else float(x["Close"].iloc[exit_i])
         if not np.isfinite(exitp):
             continue
 
         gross=(exitp/entry-1)*100
         cost_pct=cost.roundtrip_cost_pct(daytrade=False)
         path=x.iloc[entry_i:exit_i+1]
+
+        # 反事實：若不在停損點出場，而是照原baseline抱到第5日，結果會怎樣
+        cf_exit_i=find_exit_index(x, entry_i, "5日", "60m")
+        cf_exit_price=np.nan
+        cf_net=np.nan
+        cf_delta=np.nan
+        cf_recovered=np.nan
+        if cf_exit_i is not None and cf_exit_i>entry_i:
+            cf_exit_price=float(x["Close"].iloc[cf_exit_i])
+            if np.isfinite(cf_exit_price):
+                cf_net=(cf_exit_price/entry-1)*100-cost_pct
+                cf_delta=cf_net-(gross-cost_pct)
+                if "停損" in str(reason):
+                    cf_recovered=bool(cf_net>0)
 
         rows.append({
             "訊號時間":x.index[i],
@@ -2072,6 +2111,10 @@ def backtest_dynamic_exit(
             "淨報酬%":gross-cost_pct,
             "MFE%":(float(path["High"].max())/entry-1)*100,
             "MAE%":(float(path["Low"].min())/entry-1)*100,
+            "若抱到第5日出場價":cf_exit_price,
+            "若抱到第5日淨報酬%":cf_net,
+            "停損相對第5日改善pp":-cf_delta if ("停損" in str(reason) and pd.notna(cf_delta)) else np.nan,
+            "停損後若續抱會轉正":cf_recovered,
             "訊號K":float(x["K"].iloc[i]) if pd.notna(x["K"].iloc[i]) else np.nan,
             "訊號D":float(x["D"].iloc[i]) if pd.notna(x["D"].iloc[i]) else np.nan,
             "量比20":float(x["VOL_RATIO20"].iloc[i]) if "VOL_RATIO20" in x and pd.notna(x["VOL_RATIO20"].iloc[i]) else np.nan,
@@ -2079,47 +2122,6 @@ def backtest_dynamic_exit(
         })
         last_exit_i=exit_i
 
-    return pd.DataFrame(rows)
-
-
-def backtest_with_mask(d: pd.DataFrame, sig: pd.Series, hold_days: int, cost: CostConfig) -> pd.DataFrame:
-    if d is None or d.empty:
-        return pd.DataFrame()
-    rows=[]
-    last_exit_i=-1
-    mode=f"{int(hold_days)}日"
-    for i in np.flatnonzero(sig.fillna(False).to_numpy()):
-        entry_i=int(i)+1
-        if entry_i>=len(d) or entry_i<=last_exit_i:
-            continue
-        exit_i=find_exit_index(d, entry_i, mode, "60m")
-        if exit_i is None or exit_i<=entry_i:
-            continue
-        entry=float(d["Open"].iloc[entry_i])
-        exitp=float(d["Close"].iloc[exit_i])
-        if not np.isfinite(entry) or entry<=0 or not np.isfinite(exitp):
-            continue
-        gross=(exitp/entry-1)*100
-        cost_pct=cost.roundtrip_cost_pct(daytrade=False)
-        path=d.iloc[entry_i:exit_i+1]
-        rows.append({
-            "訊號時間":d.index[i],
-            "進場時間":d.index[entry_i],
-            "出場時間":d.index[exit_i],
-            "持有":mode,
-            "進場價":entry,
-            "出場價":exitp,
-            "毛報酬%":gross,
-            "成本%":cost_pct,
-            "淨報酬%":gross-cost_pct,
-            "MFE%":(float(path["High"].max())/entry-1)*100,
-            "MAE%":(float(path["Low"].min())/entry-1)*100,
-            "訊號K":float(d["K"].iloc[i]) if pd.notna(d["K"].iloc[i]) else np.nan,
-            "訊號D":float(d["D"].iloc[i]) if pd.notna(d["D"].iloc[i]) else np.nan,
-            "量比20":float(d["VOL_RATIO20"].iloc[i]) if "VOL_RATIO20" in d and pd.notna(d["VOL_RATIO20"].iloc[i]) else np.nan,
-            "MA60斜率3":float(d["MA60_SLOPE3"].iloc[i]) if "MA60_SLOPE3" in d and pd.notna(d["MA60_SLOPE3"].iloc[i]) else np.nan,
-        })
-        last_exit_i=exit_i
     return pd.DataFrame(rows)
 
 
@@ -2140,6 +2142,34 @@ def strategy_lab_exit_reason_summary(trades: pd.DataFrame) -> pd.DataFrame:
             "占候選交易比%":float(len(g)/max(1,len(trades[trades["樣本"]==sample]))*100),
         })
     return pd.DataFrame(rows)
+
+
+
+def strategy_lab_stop_counterfactual_summary(trades: pd.DataFrame) -> pd.DataFrame:
+    """只看停損交易：比較實際停損 vs 如果繼續抱到第5日。"""
+    if trades is None or trades.empty or "出場原因" not in trades.columns:
+        return pd.DataFrame()
+    x=trades[trades["出場原因"].astype(str).str.contains("停損",na=False)].copy()
+    if x.empty:
+        return pd.DataFrame()
+
+    rows=[]
+    for sample,g in x.groupby("樣本"):
+        actual=pd.to_numeric(g["淨報酬%"],errors="coerce")
+        cf=pd.to_numeric(g["若抱到第5日淨報酬%"],errors="coerce")
+        improve=pd.to_numeric(g["停損相對第5日改善pp"],errors="coerce")
+        recovered=g["停損後若續抱會轉正"].dropna().astype(bool)
+        rows.append({
+            "樣本":sample,
+            "停損筆數":int(len(g)),
+            "實際停損平均淨報酬%":float(actual.mean()) if actual.notna().any() else np.nan,
+            "若抱到第5日平均淨報酬%":float(cf.mean()) if cf.notna().any() else np.nan,
+            "停損平均改善pp":float(improve.mean()) if improve.notna().any() else np.nan,
+            "停損有效比例%":float((improve>0).mean()*100) if improve.notna().any() else np.nan,
+            "被停損後若續抱會轉正比例%":float(recovered.mean()*100) if len(recovered) else np.nan,
+        })
+    return pd.DataFrame(rows)
+
 
 
 def strategy_lab_metrics(trades: pd.DataFrame) -> dict:
@@ -2302,7 +2332,7 @@ with st.sidebar:
         )
         captions={
             "Shioaji即時引擎":"Stage 4.4：Supabase共享狀態正式化；支援新版Publishable/Secret Key並保留舊Key相容。",
-            "策略實驗室":"B線研究區：正式baseline鎖定；可測KD動態停利/停損＋第5日兜底，不影響今日雷達與Worker。",
+            "策略實驗室":"B線研究區：正式baseline鎖定；可測2根跌破、-3%、-5%三種延遲停損與停損反事實，不影響今日雷達與Worker。",
             "策略凍結與即時規格":"查看正式凍結參數與未來 Shioaji 即時行情架構。",
             "長期穩健度驗證":"固定正式策略，以1y 60m資料、最後9mo評估與6段時間檢查長期穩健度。",
             "長期集中度健診":"沿用長期樣本，檢查月度、股票貢獻與Top貢獻集中度。"
@@ -2335,7 +2365,7 @@ with st.sidebar:
 
     lab_filter="無（正式baseline）"
     lab_hold_days=5
-    lab_exit_mode="原案：KD停利+KD停損+5日兜底"
+    lab_exit_mode="KD停利+2根跌破停損+5日兜底"
     lab_pool_n=50
     if simple_mode=="進階研究" and research_mode=="策略實驗室":
         with st.expander("🧪 B線策略實驗設定", expanded=True):
@@ -2348,10 +2378,10 @@ with st.sidebar:
             lab_exit_mode=st.selectbox(
                 "候選出場方式",
                 [
-                    "原案：KD停利+KD停損+5日兜底",
+                    "KD停利+2根跌破停損+5日兜底",
+                    "KD停利+-3%停損+5日兜底",
+                    "KD停利+-5%停損+5日兜底",
                     "只測KD停利+5日兜底",
-                    "只測KD停損+5日兜底",
-                    "加速停損研究版",
                     "固定持有N日",
                 ],
                 index=0
@@ -2361,7 +2391,7 @@ with st.sidebar:
                 lab_hold_days=st.select_slider("候選固定持有天數", options=[3,4,5,6,7], value=5)
             else:
                 st.caption("KD動態出場皆以第5個後續交易日最後一根60分K收盤作最晚兜底。")
-            st.caption("KD停利/停損皆用完成60分K確認；觸發後在下一根60分K Open模擬出場，避免偷看同根收盤。")
+            st.caption("KD停利/停損皆用完成60分K確認；觸發後在下一根60分K Open模擬出場，並追蹤『若不停損抱到第5日』的反事實結果。")
             st.caption("30/50檔適合快速篩選；要考慮納入正式策略，至少再跑TOP150與OOS/時間區塊/集中度驗證。")
 
     if simple_mode=="今日雷達":
@@ -2554,6 +2584,12 @@ if simple_mode=="進階研究" and research_mode=="策略實驗室":
                 st.markdown("### 出場原因拆解")
                 st.dataframe(_exit_sum,use_container_width=True,hide_index=True)
                 st.caption("這張表用來判斷究竟是停利、停損還是第5日兜底在改善/拖累績效。")
+
+            _cf=strategy_lab_stop_counterfactual_summary(_cand_detail)
+            if not _cf.empty:
+                st.markdown("### 停損反事實追蹤")
+                st.dataframe(_cf,use_container_width=True,hide_index=True)
+                st.caption("停損有效比例＝實際停損結果優於同一筆交易若繼續抱到第5日的比例；越高代表停損比較像真的有幫助，而不是單純提早認賠。")
 
             oos=_sum[_sum["樣本"]=="樣本外40%"]
             if len(oos)>=2:
