@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.16.56
+黑嚕嚕－短線交易雷達 ST V1.16.57
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -51,13 +51,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.56"
+APP_VERSION = "ST V1.16.57"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.56"
-EXPORT_PREFIX = "ST_V1.16.56"
+APP_VERSION = "ST_V1.16.57"
+EXPORT_PREFIX = "ST_V1.16.57"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -678,7 +678,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.16.56",
+        "strategy_version":"ST V1.16.57",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -2518,6 +2518,104 @@ def strategy_lab_oos_equity_curves(
 
 
 
+
+def strategy_lab_time_block_summary(detail: pd.DataFrame, blocks: int=6) -> pd.DataFrame:
+    """將OOS依時間切成N個連續區塊，檢查不同時段是否穩定。"""
+    if detail is None or detail.empty:
+        return pd.DataFrame()
+    x=detail.copy()
+    x["_dt"]=_as_taipei_series(x["訊號時間"])
+    x=x[x["樣本"]=="樣本外40%"].dropna(subset=["_dt"]).copy()
+    if x.empty:
+        return pd.DataFrame()
+
+    tmin=x["_dt"].min()
+    tmax=x["_dt"].max()
+    if tmin==tmax:
+        return pd.DataFrame()
+
+    edges=pd.date_range(tmin,tmax,periods=blocks+1)
+    rows=[]
+    for scheme in ["正式Baseline","候選策略"]:
+        g=x[x["方案"]==scheme].copy()
+        if g.empty:
+            continue
+        for i in range(blocks):
+            left=edges[i]
+            right=edges[i+1]
+            if i<blocks-1:
+                p=g[(g["_dt"]>=left)&(g["_dt"]<right)]
+            else:
+                p=g[(g["_dt"]>=left)&(g["_dt"]<=right)]
+            m=strategy_lab_metrics(p)
+            rows.append({
+                "方案":scheme,
+                "區塊":f"B{i+1}",
+                "開始":left,
+                "結束":right,
+                **m
+            })
+    return pd.DataFrame(rows)
+
+
+def strategy_lab_concentration_summary(detail: pd.DataFrame) -> pd.DataFrame:
+    """OOS依股票彙總，檢查績效是否過度集中少數股票。"""
+    if detail is None or detail.empty:
+        return pd.DataFrame()
+    x=detail[detail["樣本"]=="樣本外40%"].copy()
+    if x.empty:
+        return pd.DataFrame()
+
+    rows=[]
+    for scheme in ["正式Baseline","候選策略"]:
+        g=x[x["方案"]==scheme].copy()
+        if g.empty:
+            continue
+
+        by_stock=(
+            g.groupby("股票",dropna=False)
+             .agg(
+                 交易數=("淨報酬%","count"),
+                 平均淨報酬_pct=("淨報酬%","mean"),
+                 累積淨報酬_pct=("淨報酬%","sum"),
+             )
+             .reset_index()
+        )
+        total=float(by_stock["累積淨報酬_pct"].sum())
+        pos_share=float((by_stock["平均淨報酬_pct"]>0).mean()*100) if len(by_stock) else np.nan
+        top20=by_stock.sort_values("累積淨報酬_pct",ascending=False).head(20)
+        top20_contrib=float(top20["累積淨報酬_pct"].sum()/total*100) if total!=0 else np.nan
+
+        trimmed=g.copy()
+        top20_symbols=set(top20["股票"].astype(str))
+        trimmed=trimmed[~trimmed["股票"].astype(str).isin(top20_symbols)]
+        tm=strategy_lab_metrics(trimmed)
+
+        rows.append({
+            "方案":scheme,
+            "股票數":int(by_stock["股票"].nunique()),
+            "正報酬股票比例%":pos_share,
+            "Top20累積報酬貢獻%":top20_contrib,
+            "移除Top20後交易數":tm["交易數"],
+            "移除Top20後平均淨報酬%":tm["平均淨報酬%"],
+            "移除Top20後PF":tm["PF"],
+        })
+    return pd.DataFrame(rows)
+
+
+def strategy_lab_validation_pack(
+    detail: pd.DataFrame,
+    initial_capital: float,
+) -> dict:
+    return {
+        "time_blocks": strategy_lab_time_block_summary(detail,blocks=6),
+        "concentration": strategy_lab_concentration_summary(detail),
+        "capital_matrix": strategy_lab_capital_matrix(
+            detail,initial_capital,allocations=(0.0333,0.05,0.10)
+        ),
+    }
+
+
 def strategy_lab_metrics(trades: pd.DataFrame) -> dict:
     if trades is None or trades.empty:
         return {"交易數":0,"勝率%":np.nan,"平均淨報酬%":np.nan,"PF":np.nan,"報酬中位數%":np.nan}
@@ -2683,7 +2781,7 @@ with st.sidebar:
         )
         captions={
             "Shioaji即時引擎":"Stage 4.4：Supabase共享狀態正式化；支援新版Publishable/Secret Key並保留舊Key相容。",
-            "策略實驗室":"B線研究區：正式baseline鎖定；新增第2/3日時間型失敗退出，並保留價格型停損做對照，不影響今日雷達與Worker。",
+            "策略實驗室":"B線正式驗證：TOP150＋OOS六區塊＋集中度＋資金配置矩陣；正式baseline/Worker仍鎖定不動。",
             "策略凍結與即時規格":"查看正式凍結參數與未來 Shioaji 即時行情架構。",
             "長期穩健度驗證":"固定正式策略，以1y 60m資料、最後9mo評估與6段時間檢查長期穩健度。",
             "長期集中度健診":"沿用長期樣本，檢查月度、股票貢獻與Top貢獻集中度。"
@@ -2717,12 +2815,12 @@ with st.sidebar:
     lab_filter="無（正式baseline）"
     lab_hold_days=5
     lab_exit_mode="KD停利+第2日MFE<2%失敗退出+5日兜底"
-    lab_pool_n=50
+    lab_pool_n=150
     lab_capital=1000000
     lab_alloc_pct=3.33
     if simple_mode=="進階研究" and research_mode=="策略實驗室":
         with st.expander("🧪 B線策略實驗設定", expanded=True):
-            lab_pool_n=st.select_slider("測試流動性前N名", options=[30,50,100,150], value=50)
+            lab_pool_n=st.select_slider("測試流動性前N名", options=[30,50,100,150], value=150)
             lab_filter=st.selectbox(
                 "候選額外進場條件",
                 ["無（正式baseline）","S級雙條件","量比20 >= 1.5","MA60斜率3 <= 0","站上VWAP","站上MA15","站上MA30"],
@@ -2765,7 +2863,7 @@ with st.sidebar:
             else:
                 st.caption("KD動態出場皆以第5個後續交易日最後一根60分K收盤作最晚兜底。")
             st.caption("KD停利、價格型停損與時間型失敗退出都用完成60分K確認；觸發後在下一根60分K Open模擬出場。")
-            st.caption("30/50檔適合快速篩選；要考慮納入正式策略，至少再跑TOP150與OOS/時間區塊/集中度驗證。")
+            st.caption("正式驗證建議使用TOP150；本版會額外產生OOS時間區塊、集中度、3.33/5/10%資金配置矩陣。")
             st.caption("V1.16.51起：60/40 OOS切點只由正式Baseline決定，所有候選出場方案共用同一切點，避免候選提早出場造成比較區間漂移。")
 
     if simple_mode=="今日雷達":
@@ -3022,6 +3120,35 @@ if simple_mode=="進階研究" and research_mode=="策略實驗室":
                         mime="text/csv",
                         use_container_width=True
                     )
+
+            _validation=strategy_lab_validation_pack(
+                _detail,
+                float(_lab.get("capital",1000000))
+            ) if (_detail is not None and not _detail.empty) else {}
+
+            _tb=_validation.get("time_blocks",pd.DataFrame()) if isinstance(_validation,dict) else pd.DataFrame()
+            if _tb is not None and not _tb.empty:
+                st.markdown("### 🧱 OOS六區塊穩健度")
+                st.dataframe(_tb,use_container_width=True,hide_index=True)
+                st.download_button(
+                    "⬇️ 下載OOS六區塊驗證 CSV",
+                    data=_tb.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"{APP_VERSION}_OOS六區塊驗證.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+
+            _conc=_validation.get("concentration",pd.DataFrame()) if isinstance(_validation,dict) else pd.DataFrame()
+            if _conc is not None and not _conc.empty:
+                st.markdown("### 🎯 OOS集中度健診")
+                st.dataframe(_conc,use_container_width=True,hide_index=True)
+                st.download_button(
+                    "⬇️ 下載OOS集中度健診 CSV",
+                    data=_conc.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"{APP_VERSION}_OOS集中度健診.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
 
             _cand_detail=_detail[_detail["方案"]=="候選策略"].copy() if (_detail is not None and not _detail.empty and "方案" in _detail.columns) else pd.DataFrame()
             _exit_sum=strategy_lab_exit_reason_summary(_cand_detail)
