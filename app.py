@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.16.58
+黑嚕嚕－短線交易雷達 ST V1.16.59
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -51,13 +51,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.58"
+APP_VERSION = "ST V1.16.59"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.58"
-EXPORT_PREFIX = "ST_V1.16.58"
+APP_VERSION = "ST_V1.16.59"
+EXPORT_PREFIX = "ST_V1.16.59"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -678,7 +678,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.16.58",
+        "strategy_version":"ST V1.16.59",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -2644,7 +2644,7 @@ def strategy_lab_metrics(trades: pd.DataFrame) -> dict:
 def run_strategy_lab(ranked_pool: pd.DataFrame, cost: CostConfig, candidate_filter: str,
                      candidate_hold_days: int, candidate_exit_mode: str="固定持有N日", period: str="1y"):
     if ranked_pool is None or ranked_pool.empty:
-        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame()
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),{}
 
     ranked_pool=ranked_pool.copy()
     symbols=ranked_pool["股票"].astype(str).tolist()
@@ -2689,7 +2689,7 @@ def run_strategy_lab(ranked_pool: pd.DataFrame, cost: CostConfig, candidate_filt
     _base_times=all_t.loc[all_t["方案"]=="正式Baseline","_signal_dt"].dropna()
     times=pd.Series(_base_times.drop_duplicates().sort_values().to_list())
     if len(times)<2:
-        return pd.DataFrame(),pd.DataFrame(),all_t.drop(columns=["_signal_dt"],errors="ignore")
+        return pd.DataFrame(),pd.DataFrame(),all_t.drop(columns=["_signal_dt"],errors="ignore"),raw
 
     cut_i=max(1,min(len(times)-1,int(len(times)*0.60)))
     cutoff=times.iloc[cut_i]
@@ -2725,7 +2725,7 @@ def run_strategy_lab(ranked_pool: pd.DataFrame, cost: CostConfig, candidate_filt
             "候選-基準 PF":float(cr["PF"]-br["PF"]) if pd.notna(cr["PF"]) and pd.notna(br["PF"]) and np.isfinite(cr["PF"]) and np.isfinite(br["PF"]) else np.nan,
         })
 
-    return summary_df,pd.DataFrame(delta),all_t.drop(columns=["_signal_dt"],errors="ignore").reset_index(drop=True)
+    return summary_df,pd.DataFrame(delta),all_t.drop(columns=["_signal_dt"],errors="ignore").reset_index(drop=True),raw
 
 
 
@@ -2796,7 +2796,7 @@ def run_strategy_lab_threeway(
         if rows[scheme]:
             frames.append(pd.concat(rows[scheme],ignore_index=True))
     if not frames:
-        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame()
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),raw
 
     all_t=pd.concat(frames,ignore_index=True)
     all_t["_signal_dt"]=_as_taipei_series(all_t["訊號時間"])
@@ -2854,6 +2854,273 @@ def run_strategy_lab_threeway(
             })
 
     return summary_df,pd.DataFrame(delta),all_t.drop(columns=["_signal_dt"],errors="ignore").reset_index(drop=True)
+
+
+
+def strategy_lab_adjust_cost_scenario(
+    detail: pd.DataFrame,
+    cost: CostConfig,
+    slippage_bp: float,
+) -> pd.DataFrame:
+    """以既有進出場價格重算指定滑價下的淨報酬；不改變訊號與出場時點。"""
+    if detail is None or detail.empty:
+        return pd.DataFrame()
+    x=detail.copy()
+    gross=pd.to_numeric(x["毛報酬%"],errors="coerce")
+    scenario_cost=CostConfig(
+        fee_rate=cost.fee_rate,
+        fee_discount=cost.fee_discount,
+        tax_rate=cost.tax_rate,
+        daytrade_tax_rate=cost.daytrade_tax_rate,
+        slippage_pct=float(slippage_bp)/10000.0,
+    ).roundtrip_cost_pct(daytrade=False)
+    x["成本%"]=scenario_cost
+    x["淨報酬%"]=gross-scenario_cost
+    x["壓力測試滑價bp"]=float(slippage_bp)
+    return x
+
+
+def strategy_lab_cost_stress_summary(
+    detail: pd.DataFrame,
+    cost: CostConfig,
+    initial_capital: float,
+    allocation_pct: float=0.05,
+    slippage_bps=(5,10,20),
+) -> pd.DataFrame:
+    """OOS成本/滑價壓力測試；同一批交易僅重算交易摩擦。"""
+    if detail is None or detail.empty:
+        return pd.DataFrame()
+    rows=[]
+    for bp in slippage_bps:
+        d=strategy_lab_adjust_cost_scenario(detail,cost,bp)
+        for scheme in strategy_lab_scheme_order(d):
+            g=d[(d["方案"]==scheme)&(d["樣本"]=="樣本外40%")].copy()
+            if g.empty:
+                continue
+            m=strategy_lab_metrics(g)
+            cap=strategy_lab_capital_sim(g,float(initial_capital),float(allocation_pct))
+            rows.append({
+                "滑價bp/單邊":float(bp),
+                "方案":scheme,
+                "OOS交易數":m["交易數"],
+                "OOS平均淨報酬%":m["平均淨報酬%"],
+                "OOS PF":m["PF"],
+                "5%組合報酬%":cap["組合報酬%"],
+                "5%已實現MDD%":cap["已實現MDD%"],
+                "5%報酬/MDD":cap["報酬/MDD"],
+                "5%資金不足略過":cap["資金不足略過"],
+            })
+    return pd.DataFrame(rows)
+
+
+def strategy_lab_capital_select(
+    trades: pd.DataFrame,
+    initial_capital: float,
+    allocation_pct: float,
+    priority_mode: str="流動性排名優先",
+) -> pd.DataFrame:
+    """
+    依固定資金挑出實際可進場交易。
+    priority_mode 全部只使用進場當下可知欄位，禁止用未來報酬/出場結果排序。
+    """
+    if trades is None or trades.empty:
+        return pd.DataFrame()
+
+    x=trades.copy()
+    x["_entry"]=_as_taipei_series(x["進場時間"])
+    x["_exit"]=_as_taipei_series(x["出場時間"])
+    x["_rank"]=pd.to_numeric(x["流動性排名"],errors="coerce").fillna(9999) if "流動性排名" in x.columns else 9999
+    x["_symbol"]=x["股票"].astype(str) if "股票" in x.columns else ""
+    x["_ret"]=pd.to_numeric(x["淨報酬%"],errors="coerce")/100.0
+    x=x.dropna(subset=["_entry","_exit","_ret"]).copy()
+    if x.empty:
+        return pd.DataFrame()
+
+    target=float(initial_capital)*float(allocation_pct)
+    cash=float(initial_capital)
+    open_positions=[]
+    accepted=[]
+
+    for entry_t,grp in x.groupby("_entry",sort=True):
+        # 先釋放同時或更早出場的部位
+        due=sorted([p for p in open_positions if p["exit"]<=entry_t],key=lambda z:z["exit"])
+        for p in due:
+            cash += p["proceeds"]
+            open_positions.remove(p)
+
+        if priority_mode=="流動性排名反向":
+            grp=grp.sort_values(by=["_rank","_symbol"],ascending=[False,True],kind="mergesort")
+        elif priority_mode=="股票代碼優先":
+            grp=grp.sort_values(by=["_symbol","_rank"],ascending=[True,True],kind="mergesort")
+        else:
+            grp=grp.sort_values(by=["_rank","_symbol"],ascending=[True,True],kind="mergesort")
+
+        for idx,r in grp.iterrows():
+            if cash + 1e-9 < target:
+                continue
+            principal=target
+            proceeds=principal*(1.0+float(r["_ret"]))
+            cash -= principal
+            open_positions.append({
+                "exit":r["_exit"],
+                "proceeds":proceeds,
+            })
+            accepted.append(idx)
+
+    if not accepted:
+        return pd.DataFrame()
+    return x.loc[accepted].drop(columns=["_entry","_exit","_rank","_symbol","_ret"],errors="ignore").reset_index(drop=True)
+
+
+def strategy_lab_priority_stress_summary(
+    detail: pd.DataFrame,
+    initial_capital: float,
+    allocation_pct: float=0.05,
+) -> pd.DataFrame:
+    """資金不足時，改變合理的同時訊號優先序，檢查結果是否依賴排序。"""
+    if detail is None or detail.empty:
+        return pd.DataFrame()
+
+    rows=[]
+    modes=["流動性排名優先","流動性排名反向","股票代碼優先"]
+    for scheme in strategy_lab_scheme_order(detail):
+        g=detail[(detail["方案"]==scheme)&(detail["樣本"]=="樣本外40%")].copy()
+        if g.empty:
+            continue
+        for mode in modes:
+            picked=strategy_lab_capital_select(g,initial_capital,allocation_pct,mode)
+            if picked.empty:
+                continue
+            # picked已是資金容量下的實際交易，直接累積固定名目損益
+            ret=pd.to_numeric(picked["淨報酬%"],errors="coerce").dropna()
+            portfolio_ret=float(ret.sum()*allocation_pct)
+            rows.append({
+                "方案":scheme,
+                "同時訊號優先序":mode,
+                "單筆配置%":float(allocation_pct*100),
+                "實際進場筆數":int(len(picked)),
+                "組合報酬近似%":portfolio_ret,
+                "平均單筆淨報酬%":float(ret.mean()) if len(ret) else np.nan,
+                "勝率%":float((ret>0).mean()*100) if len(ret) else np.nan,
+            })
+    return pd.DataFrame(rows)
+
+
+def strategy_lab_mtm_curve(
+    trades: pd.DataFrame,
+    raw: dict,
+    initial_capital: float,
+    allocation_pct: float,
+    priority_mode: str="流動性排名優先",
+) -> pd.DataFrame:
+    """
+    60m Close mark-to-market 權益曲線。
+    已進場未出場部位，以該時點最新60m Close估值，並預扣該筆完整回合成本。
+    這比「已實現MDD」更接近實際帳戶浮動風險，但不是盤中Low逐tick最差MDD。
+    """
+    picked=strategy_lab_capital_select(trades,initial_capital,allocation_pct,priority_mode)
+    if picked is None or picked.empty or not isinstance(raw,dict) or not raw:
+        return pd.DataFrame()
+
+    x=picked.copy()
+    x["_entry"]=_as_taipei_series(x["進場時間"])
+    x["_exit"]=_as_taipei_series(x["出場時間"])
+    x["_entry_price"]=pd.to_numeric(x["進場價"],errors="coerce")
+    x["_net"]=pd.to_numeric(x["淨報酬%"],errors="coerce")/100.0
+    x["_cost"]=pd.to_numeric(x["成本%"],errors="coerce")/100.0
+    x=x.dropna(subset=["_entry","_exit","_entry_price","_net"]).copy()
+    if x.empty:
+        return pd.DataFrame()
+
+    # 建立各股票60m Close series
+    close_map={}
+    timeline=set()
+    for symbol in x["股票"].astype(str).unique():
+        d=raw.get(symbol,pd.DataFrame())
+        if d is None or d.empty or "Close" not in d.columns:
+            continue
+        s=pd.Series(pd.to_numeric(d["Close"],errors="coerce").values,
+                    index=_as_taipei_series(pd.Series(d.index))).dropna()
+        s=s[~s.index.duplicated(keep="last")].sort_index()
+        close_map[symbol]=s
+        timeline.update(s.index.tolist())
+
+    if not timeline:
+        return pd.DataFrame()
+
+    tmin=x["_entry"].min()
+    tmax=x["_exit"].max()
+    times=sorted(t for t in timeline if tmin<=t<=tmax)
+    if not times:
+        return pd.DataFrame()
+
+    target=float(initial_capital)*float(allocation_pct)
+    rows=[]
+    for t in times:
+        equity=float(initial_capital)
+        for _,r in x.iterrows():
+            entry_t=r["_entry"]; exit_t=r["_exit"]
+            if t < entry_t:
+                continue
+
+            principal=target
+            if t >= exit_t:
+                # 已完成交易：直接反映整筆已實現損益
+                equity += principal*float(r["_net"])
+                continue
+
+            symbol=str(r["股票"])
+            s=close_map.get(symbol)
+            if s is None or s.empty:
+                continue
+            hist=s[s.index<=t]
+            if hist.empty:
+                continue
+            px=float(hist.iloc[-1])
+            gross=px/float(r["_entry_price"])-1.0
+            cost=float(r["_cost"]) if pd.notna(r["_cost"]) else 0.0
+            equity += principal*(gross-cost)
+
+        rows.append({"時間":t,"MTM資金權益":equity})
+
+    c=pd.DataFrame(rows).sort_values("時間").drop_duplicates("時間",keep="last").reset_index(drop=True)
+    if c.empty:
+        return c
+    peak=c["MTM資金權益"].cummax()
+    c["MTM累積報酬%"]=(c["MTM資金權益"]/float(initial_capital)-1.0)*100.0
+    c["MTM回撤%"]=(c["MTM資金權益"]/peak-1.0)*100.0
+    return c
+
+
+def strategy_lab_mtm_summary(
+    detail: pd.DataFrame,
+    raw: dict,
+    initial_capital: float,
+    allocation_pct: float=0.05,
+) -> tuple:
+    """Baseline與候選B的OOS 60m Close MTM MDD。"""
+    rows=[]
+    curves=[]
+    schemes=["正式Baseline","候選B｜第3日未站回成本"]
+    for scheme in schemes:
+        g=detail[(detail["方案"]==scheme)&(detail["樣本"]=="樣本外40%")].copy()
+        if g.empty:
+            continue
+        c=strategy_lab_mtm_curve(g,raw,initial_capital,allocation_pct,"流動性排名優先")
+        if c.empty:
+            continue
+        c["方案"]=scheme
+        curves.append(c)
+        mdd=abs(float(pd.to_numeric(c["MTM回撤%"],errors="coerce").min()))
+        final_ret=float(c["MTM累積報酬%"].iloc[-1])
+        rows.append({
+            "方案":scheme,
+            "單筆配置%":float(allocation_pct*100),
+            "60m Close MTM最終報酬%":final_ret,
+            "60m Close MTM MDD%":mdd,
+            "MTM報酬/MDD":final_ret/mdd if mdd>0 else np.nan,
+        })
+    return pd.DataFrame(rows), (pd.concat(curves,ignore_index=True) if curves else pd.DataFrame())
 
 
 def strategy_lab_formal_validation_summary(
@@ -3195,7 +3462,7 @@ if run and simple_mode=="進階研究" and research_mode=="策略實驗室":
     with st.spinner("建立股票池並執行策略驗證…"):
         _lab_pool,_lab_diag,_lab_err=build_current_formal_radar_pool(max_rank=int(lab_pool_n))
         if lab_exit_mode=="正式三方案驗證｜Baseline vs MFE2 vs 第3日成本":
-            _lab_summary,_lab_delta,_lab_detail=run_strategy_lab_threeway(
+            _lab_summary,_lab_delta,_lab_detail,_lab_raw=run_strategy_lab_threeway(
                 _lab_pool,cost,lab_filter,period="1y"
             )
             _lab_validation_mode="threeway"
@@ -3203,6 +3470,7 @@ if run and simple_mode=="進階研究" and research_mode=="策略實驗室":
             _lab_summary,_lab_delta,_lab_detail=run_strategy_lab(
                 _lab_pool,cost,lab_filter,int(lab_hold_days),lab_exit_mode,period="1y"
             )
+            _lab_raw={}
             _lab_validation_mode="single"
     st.session_state["st_v11647_strategy_lab"]={
         "pool":_lab_pool,"pool_diag":_lab_diag,"errors":_lab_err,
@@ -3210,11 +3478,12 @@ if run and simple_mode=="進階研究" and research_mode=="策略實驗室":
         "filter":lab_filter,"hold":lab_hold_days,"exit_mode":lab_exit_mode,"pool_n":lab_pool_n,
         "capital":lab_capital,"alloc_pct":lab_alloc_pct,
         "validation_mode":_lab_validation_mode,
+        "raw_60m":_lab_raw,
     }
 
 if simple_mode=="進階研究" and research_mode=="策略實驗室":
-    st.markdown("## 🧪 B線策略實驗室｜V1.16.58 正式三方案驗證")
-    st.caption("比較原則：TOP150、同一批60m資料、同Baseline OOS切點；Baseline / MFE2 / 第3日成本一次同場驗證。")
+    st.markdown("## 🧪 B線策略實驗室｜V1.16.59 候選B壓力測試")
+    st.caption("比較原則：三方案同場驗證後，再對候選B做5/10/20bp滑價、訊號排序敏感度與60m Close MTM MDD壓力測試。")
     st.warning("這裡只做研究。正式今日雷達、Shioaji Worker與Telegram仍維持原凍結baseline。")
     st.caption("Baseline：TOP1–100＝KD黃金交叉+K<30；TOP101–150再要求S級；下一根60m Open進場；固定5個後續交易日出場。")
 
@@ -3248,6 +3517,67 @@ if simple_mode=="進階研究" and research_mode=="策略實驗室":
                     mime="text/csv",
                     use_container_width=True
                 )
+
+                st.markdown("### 🧯 候選B壓力測試")
+
+                _cost_stress=strategy_lab_cost_stress_summary(
+                    _detail,cost,float(_lab.get("capital",1000000)),
+                    allocation_pct=0.05,slippage_bps=(5,10,20)
+                )
+                if not _cost_stress.empty:
+                    st.markdown("#### ① 交易成本 / 滑價壓力")
+                    st.dataframe(_cost_stress,use_container_width=True,hide_index=True)
+                    st.download_button(
+                        "⬇️ 下載滑價壓力測試 CSV",
+                        data=_cost_stress.to_csv(index=False).encode("utf-8-sig"),
+                        file_name=f"{APP_VERSION}_滑價壓力測試.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+
+                _priority_stress=strategy_lab_priority_stress_summary(
+                    _detail,float(_lab.get("capital",1000000)),allocation_pct=0.05
+                )
+                if not _priority_stress.empty:
+                    st.markdown("#### ② 資金不足時的訊號排序敏感度")
+                    st.dataframe(_priority_stress,use_container_width=True,hide_index=True)
+                    st.caption("只使用進場當下可知資訊排序：流動性排名正向 / 反向 / 股票代碼；不使用未來報酬。")
+                    st.download_button(
+                        "⬇️ 下載排序敏感度 CSV",
+                        data=_priority_stress.to_csv(index=False).encode("utf-8-sig"),
+                        file_name=f"{APP_VERSION}_排序敏感度.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+
+                _raw60=_lab.get("raw_60m",{})
+                _mtm_sum,_mtm_curve=strategy_lab_mtm_summary(
+                    _detail,_raw60,float(_lab.get("capital",1000000)),allocation_pct=0.05
+                )
+                if not _mtm_sum.empty:
+                    st.markdown("#### ③ 60m Close Mark-to-Market MDD")
+                    st.dataframe(_mtm_sum,use_container_width=True,hide_index=True)
+                    st.caption("這是持倉期間逐60分K收盤價估值的浮動權益MDD；比已實現MDD更接近帳戶風險，但不是逐Tick/盤中Low的極端MDD。")
+                    if not _mtm_curve.empty:
+                        _mtm_plot=_mtm_curve.pivot_table(
+                            index="時間",columns="方案",values="MTM資金權益",aggfunc="last"
+                        ).sort_index().ffill()
+                        st.line_chart(_mtm_plot,use_container_width=True)
+                    st.download_button(
+                        "⬇️ 下載MTM MDD摘要 CSV",
+                        data=_mtm_sum.to_csv(index=False).encode("utf-8-sig"),
+                        file_name=f"{APP_VERSION}_MTM_MDD摘要.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+                    if not _mtm_curve.empty:
+                        st.download_button(
+                            "⬇️ 下載MTM資金曲線 CSV",
+                            data=_mtm_curve.to_csv(index=False).encode("utf-8-sig"),
+                            file_name=f"{APP_VERSION}_MTM資金曲線.csv",
+                            mime="text/csv",
+                            use_container_width=True
+                        )
 
         if _sum is None or _sum.empty:
             st.error("本次沒有足夠交易資料可比較。")
