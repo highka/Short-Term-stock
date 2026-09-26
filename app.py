@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.16.52
+黑嚕嚕－短線交易雷達 ST V1.16.53
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -51,13 +51,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.52"
+APP_VERSION = "ST V1.16.53"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.52"
-EXPORT_PREFIX = "ST_V1.16.52"
+APP_VERSION = "ST_V1.16.53"
+EXPORT_PREFIX = "ST_V1.16.53"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -678,7 +678,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.16.52",
+        "strategy_version":"ST V1.16.53",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -2291,6 +2291,157 @@ def strategy_lab_failure_exit_summary(trades: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+
+def strategy_lab_capital_sim(
+    trades: pd.DataFrame,
+    initial_capital: float,
+    allocation_pct: float,
+) -> dict:
+    """
+    固定資金資本利用率參考模擬：
+    - 每筆交易目標投入 = 初始資金 * allocation_pct
+    - 不使用槓桿、不借款
+    - 同時間資金不足時，該筆交易略過
+    - 研究用，不做整張/零股取整
+    - 出場後本金+損益回到現金池，可再利用
+    """
+    empty = {
+        "初始資金": float(initial_capital),
+        "單筆配置%": float(allocation_pct*100),
+        "可容納理論槽位": int(math.floor(1/allocation_pct)) if allocation_pct>0 else 0,
+        "實際進場筆數": 0,
+        "資金不足略過": 0,
+        "期末資金": float(initial_capital),
+        "組合報酬%": 0.0,
+        "平均資金利用率%": 0.0,
+        "最高同時持倉": 0,
+        "資金週轉倍數": 0.0,
+        "每1%平均利用率貢獻報酬pp": np.nan,
+        "測試天數": 0,
+    }
+    if trades is None or trades.empty or initial_capital<=0 or allocation_pct<=0:
+        return empty
+
+    x=trades.copy()
+    x["_entry"]=_as_taipei_series(x["進場時間"])
+    x["_exit"]=_as_taipei_series(x["出場時間"])
+    x["_ret"]=pd.to_numeric(x["淨報酬%"],errors="coerce")/100.0
+    x=x.dropna(subset=["_entry","_exit","_ret"]).sort_values(["_entry","_exit"]).reset_index(drop=True)
+    if x.empty:
+        return empty
+
+    target=float(initial_capital)*float(allocation_pct)
+    cash=float(initial_capital)
+    open_positions=[]  # dict(exit, principal, proceeds)
+    accepted=0
+    skipped=0
+    turnover=0.0
+    max_concurrent=0
+
+    first_t=x["_entry"].min()
+    last_t=max(x["_exit"].max(), first_t)
+    last_event=first_t
+    deployed=0.0
+    occupied_capital_seconds=0.0
+
+    def release_until(t):
+        nonlocal cash, open_positions, deployed
+        due=[p for p in open_positions if p["exit"]<=t]
+        if due:
+            for p in sorted(due,key=lambda z:z["exit"]):
+                cash += p["proceeds"]
+                deployed -= p["principal"]
+                open_positions.remove(p)
+
+    # event-based utilization integration: before each entry, integrate until that time,
+    # but exits in between must be processed in chronological order.
+    events=[]
+    for _,r in x.iterrows():
+        events.append(("entry",r["_entry"],r))
+    # We'll process entry sequence, explicitly integrate intermediate exits.
+    last_event=first_t
+
+    for _,r in x.iterrows():
+        entry_t=r["_entry"]
+
+        # process exits before this entry in exact order for utilization
+        due_sorted=sorted([p for p in open_positions if p["exit"]<=entry_t], key=lambda z:z["exit"])
+        for p in due_sorted:
+            dt=max(0.0,(p["exit"]-last_event).total_seconds())
+            occupied_capital_seconds += deployed*dt
+            last_event=p["exit"]
+            cash += p["proceeds"]
+            deployed -= p["principal"]
+            open_positions.remove(p)
+
+        dt=max(0.0,(entry_t-last_event).total_seconds())
+        occupied_capital_seconds += deployed*dt
+        last_event=entry_t
+
+        if cash + 1e-9 < target:
+            skipped += 1
+            continue
+
+        principal=target
+        ret=float(r["_ret"])
+        proceeds=principal*(1.0+ret)
+        cash -= principal
+        deployed += principal
+        turnover += principal
+        accepted += 1
+        open_positions.append({
+            "exit":r["_exit"],
+            "principal":principal,
+            "proceeds":proceeds,
+        })
+        max_concurrent=max(max_concurrent,len(open_positions))
+
+    # release remaining positions and integrate utilization
+    for p in sorted(open_positions,key=lambda z:z["exit"]):
+        dt=max(0.0,(p["exit"]-last_event).total_seconds())
+        occupied_capital_seconds += deployed*dt
+        last_event=p["exit"]
+        cash += p["proceeds"]
+        deployed -= p["principal"]
+
+    end_t=max(last_event,last_t)
+    total_seconds=max(1.0,(end_t-first_t).total_seconds())
+    avg_util=occupied_capital_seconds/(float(initial_capital)*total_seconds)*100.0
+    portfolio_ret=(cash/float(initial_capital)-1.0)*100.0
+    days=max(0.0,total_seconds/86400.0)
+
+    return {
+        "初始資金": float(initial_capital),
+        "單筆配置%": float(allocation_pct*100),
+        "可容納理論槽位": int(math.floor(1/allocation_pct)),
+        "實際進場筆數": int(accepted),
+        "資金不足略過": int(skipped),
+        "期末資金": float(cash),
+        "組合報酬%": float(portfolio_ret),
+        "平均資金利用率%": float(avg_util),
+        "最高同時持倉": int(max_concurrent),
+        "資金週轉倍數": float(turnover/float(initial_capital)),
+        "每1%平均利用率貢獻報酬pp": float(portfolio_ret/avg_util) if avg_util>0 else np.nan,
+        "測試天數": float(days),
+    }
+
+
+def strategy_lab_capital_compare(
+    detail: pd.DataFrame,
+    initial_capital: float,
+    allocation_pct: float,
+) -> pd.DataFrame:
+    if detail is None or detail.empty:
+        return pd.DataFrame()
+    rows=[]
+    for sample in ["樣本內60%","樣本外40%"]:
+        for scheme in ["正式Baseline","候選策略"]:
+            g=detail[(detail["樣本"]==sample)&(detail["方案"]==scheme)].copy()
+            m=strategy_lab_capital_sim(g,initial_capital,allocation_pct)
+            rows.append({"樣本":sample,"方案":scheme,**m})
+    return pd.DataFrame(rows)
+
+
 def strategy_lab_metrics(trades: pd.DataFrame) -> dict:
     if trades is None or trades.empty:
         return {"交易數":0,"勝率%":np.nan,"平均淨報酬%":np.nan,"PF":np.nan,"報酬中位數%":np.nan}
@@ -2491,6 +2642,8 @@ with st.sidebar:
     lab_hold_days=5
     lab_exit_mode="KD停利+第2日MFE<2%失敗退出+5日兜底"
     lab_pool_n=50
+    lab_capital=1000000
+    lab_alloc_pct=3.33
     if simple_mode=="進階研究" and research_mode=="策略實驗室":
         with st.expander("🧪 B線策略實驗設定", expanded=True):
             lab_pool_n=st.select_slider("測試流動性前N名", options=[30,50,100,150], value=50)
@@ -2513,6 +2666,21 @@ with st.sidebar:
                 ],
                 index=0
             )
+            lab_capital=st.number_input(
+                "固定測試資金",
+                min_value=100000,
+                max_value=100000000,
+                value=1000000,
+                step=100000,
+                help="只作資金利用率研究，不影響正式下單。"
+            )
+            lab_alloc_pct=st.select_slider(
+                "每筆交易資金配置%",
+                options=[1.0,2.0,3.33,5.0,10.0,20.0],
+                value=3.33
+            )
+            st.caption("資金利用率模擬：不使用槓桿；資金不足時該筆略過；不做整張/零股取整，作策略比較參考。")
+
             lab_hold_days=5
             if lab_exit_mode=="固定持有N日":
                 lab_hold_days=st.select_slider("候選固定持有天數", options=[3,4,5,6,7], value=5)
@@ -2673,6 +2841,7 @@ if run and simple_mode=="進階研究" and research_mode=="策略實驗室":
         "pool":_lab_pool,"pool_diag":_lab_diag,"errors":_lab_err,
         "summary":_lab_summary,"delta":_lab_delta,"detail":_lab_detail,
         "filter":lab_filter,"hold":lab_hold_days,"exit_mode":lab_exit_mode,"pool_n":lab_pool_n,
+        "capital":lab_capital,"alloc_pct":lab_alloc_pct,
     }
 
 if simple_mode=="進階研究" and research_mode=="策略實驗室":
@@ -2707,6 +2876,20 @@ if simple_mode=="進階研究" and research_mode=="策略實驗室":
                 st.markdown("### 候選策略相對Baseline差異")
                 st.dataframe(_delta,use_container_width=True,hide_index=True)
 
+            _cap_compare=strategy_lab_capital_compare(
+                _detail,
+                float(_lab.get("capital",1000000)),
+                float(_lab.get("alloc_pct",3.33))/100.0
+            ) if (_detail is not None and not _detail.empty) else pd.DataFrame()
+
+            if not _cap_compare.empty:
+                st.markdown("### 💰 固定資金利用率比較")
+                st.dataframe(_cap_compare,use_container_width=True,hide_index=True)
+                st.caption(
+                    "這張表回答『5日雖然單筆報酬較高，但會不會因佔用資金較久而降低整體效率』。"
+                    "重點看OOS的組合報酬%、平均資金利用率%、資金週轉倍數、資金不足略過與最高同時持倉。"
+                )
+
             _cand_detail=_detail[_detail["方案"]=="候選策略"].copy() if (_detail is not None and not _detail.empty and "方案" in _detail.columns) else pd.DataFrame()
             _exit_sum=strategy_lab_exit_reason_summary(_cand_detail)
             if not _exit_sum.empty:
@@ -2737,7 +2920,7 @@ if simple_mode=="進階研究" and research_mode=="策略實驗室":
                         f"Baseline：交易 {int(b['交易數'])}｜平均淨報酬 {b['平均淨報酬%']:.3f}%｜PF {b['PF']:.3f}；"
                         f"候選：交易 {int(c['交易數'])}｜平均淨報酬 {c['平均淨報酬%']:.3f}%｜PF {c['PF']:.3f}。"
                     )
-                    st.info("不會自動宣布候選策略勝出；要納入正式版，還需TOP150、時間區塊、集中度與資料品質驗證。")
+                    st.info("不會只看單筆平均報酬判斷；新增固定資金利用率後，還要同時比較OOS組合報酬、資金占用與週轉效率。要納入正式版仍需TOP150、時間區塊、集中度與資料品質驗證。")
 
             if _detail is not None and not _detail.empty:
                 st.download_button(
