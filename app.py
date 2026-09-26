@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.16.59.1
+黑嚕嚕－短線交易雷達 ST V1.16.60
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -51,13 +51,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.59.1"
+APP_VERSION = "ST V1.16.60"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.59.1"
-EXPORT_PREFIX = "ST_V1.16.59.1"
+APP_VERSION = "ST_V1.16.60"
+EXPORT_PREFIX = "ST_V1.16.60"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -678,7 +678,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.16.59.1",
+        "strategy_version":"ST V1.16.60",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -3123,6 +3123,270 @@ def strategy_lab_mtm_summary(
     return pd.DataFrame(rows), (pd.concat(curves,ignore_index=True) if curves else pd.DataFrame())
 
 
+
+def strategy_lab_rank_bucket_summary(detail: pd.DataFrame) -> pd.DataFrame:
+    """候選B OOS依流動性排名分層，檢查績效是否集中在前段排名。"""
+    if detail is None or detail.empty:
+        return pd.DataFrame()
+
+    x=detail[
+        (detail["方案"]=="候選B｜第3日未站回成本")
+        & (detail["樣本"]=="樣本外40%")
+    ].copy()
+    if x.empty or "流動性排名" not in x.columns:
+        return pd.DataFrame()
+
+    x["_rank"]=pd.to_numeric(x["流動性排名"],errors="coerce")
+    x=x.dropna(subset=["_rank"]).copy()
+    if x.empty:
+        return pd.DataFrame()
+
+    bins=[
+        ("Rank 1-50",1,50),
+        ("Rank 51-100",51,100),
+        ("Rank 101-150",101,150),
+    ]
+    rows=[]
+    for label,lo,hi in bins:
+        g=x[(x["_rank"]>=lo)&(x["_rank"]<=hi)].copy()
+        if g.empty:
+            rows.append({
+                "排名區間":label,
+                "交易數":0,
+                "股票數":0,
+                "勝率%":np.nan,
+                "平均淨報酬%":np.nan,
+                "PF":np.nan,
+                "報酬中位數%":np.nan,
+            })
+            continue
+        m=strategy_lab_metrics(g)
+        rows.append({
+            "排名區間":label,
+            "交易數":m["交易數"],
+            "股票數":int(g["股票"].astype(str).nunique()) if "股票" in g.columns else np.nan,
+            "勝率%":m["勝率%"],
+            "平均淨報酬%":m["平均淨報酬%"],
+            "PF":m["PF"],
+            "報酬中位數%":m["報酬中位數%"],
+        })
+    return pd.DataFrame(rows)
+
+
+def strategy_lab_capital_priority_sim(
+    trades: pd.DataFrame,
+    initial_capital: float,
+    allocation_pct: float,
+    priority_mode: str="流動性排名優先",
+    random_seed: int=0,
+) -> tuple:
+    """
+    固定資金精確模擬，允許不同『同時進場』排序。
+    僅使用進場時可知資訊，不使用未來報酬決定排序。
+    """
+    empty={
+        "期末資金":float(initial_capital),
+        "組合報酬%":0.0,
+        "實際進場筆數":0,
+        "資金不足略過":0,
+        "已實現MDD%":0.0,
+        "報酬/MDD":np.nan,
+        "最高同時持倉":0,
+    }
+    empty_curve=pd.DataFrame(columns=["時間","資金權益","累積報酬%","回撤%"])
+
+    if trades is None or trades.empty or initial_capital<=0 or allocation_pct<=0:
+        return empty,empty_curve
+
+    x=trades.copy()
+    x["_entry"]=_as_taipei_series(x["進場時間"])
+    x["_exit"]=_as_taipei_series(x["出場時間"])
+    x["_ret"]=pd.to_numeric(x["淨報酬%"],errors="coerce")/100.0
+    x["_rank"]=pd.to_numeric(x["流動性排名"],errors="coerce").fillna(9999) if "流動性排名" in x.columns else 9999
+    x["_symbol"]=x["股票"].astype(str) if "股票" in x.columns else ""
+    x=x.dropna(subset=["_entry","_exit","_ret"]).copy()
+    if x.empty:
+        return empty,empty_curve
+
+    target=float(initial_capital)*float(allocation_pct)
+    cash=float(initial_capital)
+    open_positions=[]
+    accepted=0
+    skipped=0
+    max_concurrent=0
+    curve_rows=[]
+    rng=np.random.default_rng(int(random_seed))
+
+    def append_equity(ts):
+        deployed=sum(float(p["principal"]) for p in open_positions)
+        eq=float(cash+deployed)
+        if curve_rows and curve_rows[-1]["時間"]==ts:
+            curve_rows[-1]["資金權益"]=eq
+        else:
+            curve_rows.append({"時間":ts,"資金權益":eq})
+
+    all_entries=sorted(x["_entry"].dropna().unique().tolist())
+    if all_entries:
+        curve_rows=[{"時間":all_entries[0],"資金權益":float(initial_capital)}]
+
+    for entry_t,grp in x.groupby("_entry",sort=True):
+        due=sorted([p for p in open_positions if p["exit"]<=entry_t],key=lambda z:z["exit"])
+        for p in due:
+            cash += p["proceeds"]
+            open_positions.remove(p)
+            append_equity(p["exit"])
+
+        grp=grp.copy()
+        if priority_mode=="流動性排名優先":
+            grp=grp.sort_values(by=["_rank","_symbol"],ascending=[True,True],kind="mergesort")
+        elif priority_mode=="流動性排名反向":
+            grp=grp.sort_values(by=["_rank","_symbol"],ascending=[False,True],kind="mergesort")
+        elif priority_mode=="股票代碼優先":
+            grp=grp.sort_values(by=["_symbol","_rank"],ascending=[True,True],kind="mergesort")
+        elif priority_mode=="隨機":
+            grp["_rand"]=rng.random(len(grp))
+            grp=grp.sort_values(by=["_rand","_symbol"],ascending=[True,True],kind="mergesort")
+        else:
+            grp=grp.sort_values(by=["_rank","_symbol"],ascending=[True,True],kind="mergesort")
+
+        for _,r in grp.iterrows():
+            if cash + 1e-9 < target:
+                skipped += 1
+                continue
+
+            principal=target
+            proceeds=principal*(1.0+float(r["_ret"]))
+            cash -= principal
+            open_positions.append({
+                "exit":r["_exit"],
+                "principal":principal,
+                "proceeds":proceeds,
+            })
+            accepted += 1
+            max_concurrent=max(max_concurrent,len(open_positions))
+
+    for p in sorted(open_positions,key=lambda z:z["exit"]):
+        cash += p["proceeds"]
+        open_positions.remove(p)
+        append_equity(p["exit"])
+
+    curve=pd.DataFrame(curve_rows).sort_values("時間").drop_duplicates("時間",keep="last").reset_index(drop=True)
+    if curve.empty:
+        mdd=0.0
+    else:
+        eq=pd.to_numeric(curve["資金權益"],errors="coerce").astype(float)
+        peak=eq.cummax()
+        curve["累積報酬%"]=(eq/float(initial_capital)-1.0)*100.0
+        curve["回撤%"]=(eq/peak-1.0)*100.0
+        mdd=abs(float(curve["回撤%"].min())) if curve["回撤%"].notna().any() else 0.0
+
+    port_ret=(cash/float(initial_capital)-1.0)*100.0
+    metrics={
+        "期末資金":float(cash),
+        "組合報酬%":float(port_ret),
+        "實際進場筆數":int(accepted),
+        "資金不足略過":int(skipped),
+        "已實現MDD%":float(mdd),
+        "報酬/MDD":float(port_ret/mdd) if mdd>0 else np.nan,
+        "最高同時持倉":int(max_concurrent),
+    }
+    return metrics,curve
+
+
+def strategy_lab_random_priority_monte_carlo(
+    detail: pd.DataFrame,
+    initial_capital: float,
+    allocation_pct: float=0.05,
+    trials: int=100,
+    base_seed: int=11660,
+) -> tuple:
+    """
+    候選B OOS：同時訊號隨機排序 Monte Carlo。
+    固定交易集合、固定5%單筆名目配置，只改變同時訊號的資金取得順序。
+    """
+    if detail is None or detail.empty:
+        return pd.DataFrame(),pd.DataFrame()
+
+    g=detail[
+        (detail["方案"]=="候選B｜第3日未站回成本")
+        & (detail["樣本"]=="樣本外40%")
+    ].copy()
+    if g.empty:
+        return pd.DataFrame(),pd.DataFrame()
+
+    rows=[]
+    for i in range(int(trials)):
+        m,_=strategy_lab_capital_priority_sim(
+            g,float(initial_capital),float(allocation_pct),
+            priority_mode="隨機",
+            random_seed=int(base_seed)+i
+        )
+        rows.append({
+            "trial":i+1,
+            "seed":int(base_seed)+i,
+            **m,
+        })
+    trials_df=pd.DataFrame(rows)
+    if trials_df.empty:
+        return pd.DataFrame(),pd.DataFrame()
+
+    liq,_=strategy_lab_capital_priority_sim(
+        g,float(initial_capital),float(allocation_pct),
+        priority_mode="流動性排名優先",
+        random_seed=base_seed
+    )
+
+    ret=pd.to_numeric(trials_df["組合報酬%"],errors="coerce")
+    mdd=pd.to_numeric(trials_df["已實現MDD%"],errors="coerce")
+    rm=pd.to_numeric(trials_df["報酬/MDD"],errors="coerce")
+
+    summary=pd.DataFrame([{
+        "試驗次數":int(len(trials_df)),
+        "單筆配置%":float(allocation_pct*100),
+        "隨機報酬平均%":float(ret.mean()),
+        "隨機報酬中位數%":float(ret.median()),
+        "隨機報酬P05%":float(ret.quantile(0.05)),
+        "隨機報酬P95%":float(ret.quantile(0.95)),
+        "隨機MDD平均%":float(mdd.mean()),
+        "隨機MDD中位數%":float(mdd.median()),
+        "隨機報酬/MDD中位數":float(rm.median()),
+        "流動性優先報酬%":float(liq["組合報酬%"]),
+        "流動性優先MDD%":float(liq["已實現MDD%"]),
+        "流動性優先報酬/MDD":float(liq["報酬/MDD"]) if pd.notna(liq["報酬/MDD"]) else np.nan,
+        "流動性優先報酬百分位%":float((ret<=float(liq["組合報酬%"])).mean()*100.0),
+    }])
+    return summary,trials_df
+
+
+def strategy_lab_candidate_b_capacity_summary(
+    detail: pd.DataFrame,
+    initial_capital: float,
+) -> pd.DataFrame:
+    """候選B固定資金容量觀察：3.33/5/10%。"""
+    if detail is None or detail.empty:
+        return pd.DataFrame()
+    g=detail[
+        (detail["方案"]=="候選B｜第3日未站回成本")
+        & (detail["樣本"]=="樣本外40%")
+    ].copy()
+    if g.empty:
+        return pd.DataFrame()
+
+    rows=[]
+    for alloc in (0.0333,0.05,0.10):
+        m,_=strategy_lab_capital_priority_sim(
+            g,float(initial_capital),float(alloc),
+            priority_mode="流動性排名優先",
+            random_seed=11660
+        )
+        rows.append({
+            "單筆配置%":float(alloc*100),
+            "理論槽位":int(math.floor(1/alloc)),
+            **m,
+        })
+    return pd.DataFrame(rows)
+
+
 def strategy_lab_formal_validation_summary(
     detail: pd.DataFrame,
     initial_capital: float,
@@ -3482,8 +3746,8 @@ if run and simple_mode=="進階研究" and research_mode=="策略實驗室":
     }
 
 if simple_mode=="進階研究" and research_mode=="策略實驗室":
-    st.markdown("## 🧪 B線策略實驗室｜V1.16.59 候選B壓力測試")
-    st.caption("比較原則：三方案同場驗證後，再對候選B做5/10/20bp滑價、訊號排序敏感度與60m Close MTM MDD壓力測試。")
+    st.markdown("## 🧪 B線策略實驗室｜V1.16.60 候選B排序與容量驗證")
+    st.caption("比較原則：三方案同場驗證後，對候選B追加流動性排名分層、100次同時訊號隨機排序Monte Carlo與3.33/5/10%容量驗證。")
     st.caption("V1.16.59.1修正：三方案驗證函式所有返回路徑統一回傳4個值，避免ValueError解包失敗。")
     st.warning("這裡只做研究。正式今日雷達、Shioaji Worker與Telegram仍維持原凍結baseline。")
     st.caption("Baseline：TOP1–100＝KD黃金交叉+K<30；TOP101–150再要求S級；下一根60m Open進場；固定5個後續交易日出場。")
@@ -3550,6 +3814,55 @@ if simple_mode=="進階研究" and research_mode=="策略實驗室":
                         mime="text/csv",
                         use_container_width=True
                     )
+
+                    _rank_bucket=strategy_lab_rank_bucket_summary(_detail)
+                    if not _rank_bucket.empty:
+                        st.markdown("#### ②-A 候選B流動性排名分層")
+                        st.dataframe(_rank_bucket,use_container_width=True,hide_index=True)
+                        st.download_button(
+                            "⬇️ 下載候選B排名分層 CSV",
+                            data=_rank_bucket.to_csv(index=False).encode("utf-8-sig"),
+                            file_name=f"{APP_VERSION}_候選B排名分層.csv",
+                            mime="text/csv",
+                            use_container_width=True
+                        )
+
+                    _mc_sum,_mc_trials=strategy_lab_random_priority_monte_carlo(
+                        _detail,float(_lab.get("capital",1000000)),
+                        allocation_pct=0.05,trials=100,base_seed=11660
+                    )
+                    if not _mc_sum.empty:
+                        st.markdown("#### ②-B 候選B同時訊號隨機排序 Monte Carlo（100次）")
+                        st.dataframe(_mc_sum,use_container_width=True,hide_index=True)
+                        st.caption("只隨機化『同一進場時間』的資金取得順序；訊號、進出場時間與交易成本完全不變。")
+                        st.download_button(
+                            "⬇️ 下載Monte Carlo摘要 CSV",
+                            data=_mc_sum.to_csv(index=False).encode("utf-8-sig"),
+                            file_name=f"{APP_VERSION}_MonteCarlo摘要.csv",
+                            mime="text/csv",
+                            use_container_width=True
+                        )
+                        st.download_button(
+                            "⬇️ 下載Monte Carlo 100次明細 CSV",
+                            data=_mc_trials.to_csv(index=False).encode("utf-8-sig"),
+                            file_name=f"{APP_VERSION}_MonteCarlo100次明細.csv",
+                            mime="text/csv",
+                            use_container_width=True
+                        )
+
+                    _capacity=strategy_lab_candidate_b_capacity_summary(
+                        _detail,float(_lab.get("capital",1000000))
+                    )
+                    if not _capacity.empty:
+                        st.markdown("#### ②-C 候選B資金容量")
+                        st.dataframe(_capacity,use_container_width=True,hide_index=True)
+                        st.download_button(
+                            "⬇️ 下載候選B資金容量 CSV",
+                            data=_capacity.to_csv(index=False).encode("utf-8-sig"),
+                            file_name=f"{APP_VERSION}_候選B資金容量.csv",
+                            mime="text/csv",
+                            use_container_width=True
+                        )
 
                 _raw60=_lab.get("raw_60m",{})
                 _mtm_sum,_mtm_curve=strategy_lab_mtm_summary(
