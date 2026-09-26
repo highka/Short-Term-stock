@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.16.50
+黑嚕嚕－短線交易雷達 ST V1.16.50.1
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -51,13 +51,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.50"
+APP_VERSION = "ST V1.16.50.1"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.50"
-EXPORT_PREFIX = "ST_V1.16.50"
+APP_VERSION = "ST_V1.16.50.1"
+EXPORT_PREFIX = "ST_V1.16.50.1"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -678,7 +678,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.16.50",
+        "strategy_version":"ST V1.16.50.1",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -2048,6 +2048,46 @@ def find_dynamic_exit(
     return None,None,None
 
 
+
+def backtest_with_mask(d: pd.DataFrame, sig: pd.Series, hold_days: int, cost: CostConfig) -> pd.DataFrame:
+    if d is None or d.empty:
+        return pd.DataFrame()
+    rows=[]
+    last_exit_i=-1
+    mode=f"{int(hold_days)}日"
+    for i in np.flatnonzero(sig.fillna(False).to_numpy()):
+        entry_i=int(i)+1
+        if entry_i>=len(d) or entry_i<=last_exit_i:
+            continue
+        exit_i=find_exit_index(d, entry_i, mode, "60m")
+        if exit_i is None or exit_i<=entry_i:
+            continue
+        entry=float(d["Open"].iloc[entry_i])
+        exitp=float(d["Close"].iloc[exit_i])
+        if not np.isfinite(entry) or entry<=0 or not np.isfinite(exitp):
+            continue
+        gross=(exitp/entry-1)*100
+        cost_pct=cost.roundtrip_cost_pct(daytrade=False)
+        path=d.iloc[entry_i:exit_i+1]
+        rows.append({
+            "訊號時間":d.index[i],
+            "進場時間":d.index[entry_i],
+            "出場時間":d.index[exit_i],
+            "持有":mode,
+            "進場價":entry,
+            "出場價":exitp,
+            "毛報酬%":gross,
+            "成本%":cost_pct,
+            "淨報酬%":gross-cost_pct,
+            "MFE%":(float(path["High"].max())/entry-1)*100,
+            "MAE%":(float(path["Low"].min())/entry-1)*100,
+            "訊號K":float(d["K"].iloc[i]) if pd.notna(d["K"].iloc[i]) else np.nan,
+            "訊號D":float(d["D"].iloc[i]) if pd.notna(d["D"].iloc[i]) else np.nan,
+            "量比20":float(d["VOL_RATIO20"].iloc[i]) if "VOL_RATIO20" in d and pd.notna(d["VOL_RATIO20"].iloc[i]) else np.nan,
+            "MA60斜率3":float(d["MA60_SLOPE3"].iloc[i]) if "MA60_SLOPE3" in d and pd.notna(d["MA60_SLOPE3"].iloc[i]) else np.nan,
+        })
+        last_exit_i=exit_i
+    return pd.DataFrame(rows)
 
 def backtest_dynamic_exit(
     d: pd.DataFrame,
