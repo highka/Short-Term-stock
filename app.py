@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.16.46
+黑嚕嚕－短線交易雷達 ST V1.16.48
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -51,13 +51,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.46"
+APP_VERSION = "ST V1.16.48"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.46"
-EXPORT_PREFIX = "ST_V1.16.46"
+APP_VERSION = "ST_V1.16.48"
+EXPORT_PREFIX = "ST_V1.16.48"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -678,7 +678,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.16.46",
+        "strategy_version":"ST V1.16.48",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -1891,6 +1891,337 @@ def market_breadth_interpretation(row):
     return "⚪ 中性", "多空廣度沒有明顯極端，視個股訊號為主。"
 
 
+
+def strategy_lab_extra_mask(d: pd.DataFrame, mode: str) -> pd.Series:
+    false = pd.Series(False, index=d.index)
+    if mode == "無（正式baseline）":
+        return pd.Series(True, index=d.index)
+    if mode == "S級雙條件":
+        return (
+            pd.to_numeric(d.get("VOL_RATIO20"), errors="coerce").ge(1.5)
+            & pd.to_numeric(d.get("MA60_SLOPE3"), errors="coerce").le(0)
+        ).fillna(False)
+    if mode == "量比20 >= 1.5":
+        return pd.to_numeric(d.get("VOL_RATIO20"), errors="coerce").ge(1.5).fillna(False)
+    if mode == "MA60斜率3 <= 0":
+        return pd.to_numeric(d.get("MA60_SLOPE3"), errors="coerce").le(0).fillna(False)
+    if mode == "站上VWAP":
+        return d.get("PRICE_GT_VWAP", false).fillna(False)
+    if mode == "站上MA15":
+        return (pd.to_numeric(d.get("Close"), errors="coerce") > pd.to_numeric(d.get("MA15"), errors="coerce")).fillna(False)
+    if mode == "站上MA30":
+        return (pd.to_numeric(d.get("Close"), errors="coerce") > pd.to_numeric(d.get("MA30"), errors="coerce")).fillna(False)
+    return pd.Series(True, index=d.index)
+
+
+def strategy_lab_base_mask(d: pd.DataFrame, rank: int) -> pd.Series:
+    base = (
+        d.get("KD_GOLD", pd.Series(False, index=d.index)).fillna(False)
+        & pd.to_numeric(d.get("K"), errors="coerce").lt(30).fillna(False)
+    )
+    if int(rank) <= 100:
+        return base
+    s_grade = (
+        pd.to_numeric(d.get("VOL_RATIO20"), errors="coerce").ge(1.5)
+        & pd.to_numeric(d.get("MA60_SLOPE3"), errors="coerce").le(0)
+    ).fillna(False)
+    return base & s_grade
+
+
+
+def add_kd_death_cross_flags(d: pd.DataFrame) -> pd.DataFrame:
+    """補上完成60分K的KD死亡交叉旗標。"""
+    x=d.copy()
+    if "K" not in x.columns or "D" not in x.columns:
+        x["KD_DEAD"]=False
+        return x
+    k=pd.to_numeric(x["K"],errors="coerce")
+    dd=pd.to_numeric(x["D"],errors="coerce")
+    x["KD_DEAD"]=((k.shift(1)>=dd.shift(1)) & (k<dd)).fillna(False)
+    return x
+
+
+def find_dynamic_exit(
+    d: pd.DataFrame,
+    entry_i: int,
+    entry_price: float,
+    exit_mode: str,
+    max_hold_days: int=5,
+):
+    """
+    動態出場規則（訊號一律以完成60分K判斷）：
+    1) 停利：完成60m Close >= 進場價，且 K>80 且當根KD死亡交叉
+    2) 停損：完成60m Close < 進場價，且當根KD死亡交叉
+    3) 加速停損研究版：完成60m Close < 進場價 且 K<D（不要求當根新死叉）
+    4) 最晚第5個後續交易日最後一根60m收盤出場
+    為避免偷看完成K棒後又用同一根Close成交：
+      - KD條件觸發 -> 下一根60m Open出場
+      - 第5日兜底為預先知道的時間規則 -> 當日最後一根60m Close出場
+    """
+    if d is None or d.empty or entry_i>=len(d):
+        return None,None,None
+
+    x=add_kd_death_cross_flags(d)
+    entry_date=pd.Timestamp(x.index[entry_i]).date()
+
+    # 找第5個後續交易日的最後一根bar
+    trade_dates=[]
+    for j in range(entry_i, len(x)):
+        dt=pd.Timestamp(x.index[j]).date()
+        if dt>entry_date and dt not in trade_dates:
+            trade_dates.append(dt)
+    fallback_date=trade_dates[max_hold_days-1] if len(trade_dates)>=max_hold_days else None
+    fallback_i=None
+    if fallback_date is not None:
+        idxs=[j for j in range(entry_i, len(x)) if pd.Timestamp(x.index[j]).date()==fallback_date]
+        if idxs:
+            fallback_i=max(idxs)
+
+    # 從進場後完成的bar開始檢查；entry_i這根是進場bar，不能在開盤後立刻拿同一根未完成資訊
+    for j in range(entry_i, len(x)):
+        # 到第5日最後一根時，兜底時間出場優先，不再等待下一根
+        if fallback_i is not None and j>=fallback_i:
+            return fallback_i, "第5日兜底", "close"
+
+        if j+1>=len(x):
+            break
+
+        close=float(pd.to_numeric(pd.Series([x["Close"].iloc[j]]),errors="coerce").iloc[0])
+        k=float(pd.to_numeric(pd.Series([x["K"].iloc[j]]),errors="coerce").iloc[0]) if "K" in x else float("nan")
+        dd=float(pd.to_numeric(pd.Series([x["D"].iloc[j]]),errors="coerce").iloc[0]) if "D" in x else float("nan")
+        dead=bool(x["KD_DEAD"].iloc[j])
+
+        take_profit = (
+            exit_mode in ["原案：KD停利+KD停損+5日兜底","只測KD停利+5日兜底","加速停損研究版"]
+            and np.isfinite(close) and close>=entry_price
+            and np.isfinite(k) and k>80
+            and dead
+        )
+        stop_loss = (
+            exit_mode in ["原案：KD停利+KD停損+5日兜底","只測KD停損+5日兜底"]
+            and np.isfinite(close) and close<entry_price
+            and dead
+        )
+        fast_stop = (
+            exit_mode=="加速停損研究版"
+            and np.isfinite(close) and close<entry_price
+            and np.isfinite(k) and np.isfinite(dd) and k<dd
+        )
+
+        if take_profit:
+            return j+1, "KD>80死叉停利", "open"
+        if stop_loss:
+            return j+1, "跌破進場價+KD死叉停損", "open"
+        if fast_stop:
+            return j+1, "跌破進場價+K<D加速停損", "open"
+
+    if fallback_i is not None:
+        return fallback_i, "第5日兜底", "close"
+    return None,None,None
+
+
+def backtest_dynamic_exit(
+    d: pd.DataFrame,
+    sig: pd.Series,
+    cost: CostConfig,
+    exit_mode: str,
+) -> pd.DataFrame:
+    """下一根60m Open進場；採動態KD出場＋第5日兜底。"""
+    if d is None or d.empty:
+        return pd.DataFrame()
+
+    x=add_kd_death_cross_flags(d)
+    rows=[]
+    last_exit_i=-1
+
+    for i in np.flatnonzero(sig.fillna(False).to_numpy()):
+        entry_i=int(i)+1
+        if entry_i>=len(x) or entry_i<=last_exit_i:
+            continue
+
+        entry=float(x["Open"].iloc[entry_i])
+        if not np.isfinite(entry) or entry<=0:
+            continue
+
+        exit_i,reason,fill_at=find_dynamic_exit(x,entry_i,entry,exit_mode,max_hold_days=5)
+        if exit_i is None or exit_i<=entry_i:
+            continue
+
+        if fill_at=="open":
+            exitp=float(x["Open"].iloc[exit_i])
+        else:
+            exitp=float(x["Close"].iloc[exit_i])
+
+        if not np.isfinite(exitp):
+            continue
+
+        gross=(exitp/entry-1)*100
+        cost_pct=cost.roundtrip_cost_pct(daytrade=False)
+        path=x.iloc[entry_i:exit_i+1]
+
+        rows.append({
+            "訊號時間":x.index[i],
+            "進場時間":x.index[entry_i],
+            "出場時間":x.index[exit_i],
+            "出場原因":reason,
+            "成交依據":"下一根60m Open" if fill_at=="open" else "第5日最後60m Close",
+            "進場價":entry,
+            "出場價":exitp,
+            "毛報酬%":gross,
+            "成本%":cost_pct,
+            "淨報酬%":gross-cost_pct,
+            "MFE%":(float(path["High"].max())/entry-1)*100,
+            "MAE%":(float(path["Low"].min())/entry-1)*100,
+            "訊號K":float(x["K"].iloc[i]) if pd.notna(x["K"].iloc[i]) else np.nan,
+            "訊號D":float(x["D"].iloc[i]) if pd.notna(x["D"].iloc[i]) else np.nan,
+            "量比20":float(x["VOL_RATIO20"].iloc[i]) if "VOL_RATIO20" in x and pd.notna(x["VOL_RATIO20"].iloc[i]) else np.nan,
+            "MA60斜率3":float(x["MA60_SLOPE3"].iloc[i]) if "MA60_SLOPE3" in x and pd.notna(x["MA60_SLOPE3"].iloc[i]) else np.nan,
+        })
+        last_exit_i=exit_i
+
+    return pd.DataFrame(rows)
+
+
+def backtest_with_mask(d: pd.DataFrame, sig: pd.Series, hold_days: int, cost: CostConfig) -> pd.DataFrame:
+    if d is None or d.empty:
+        return pd.DataFrame()
+    rows=[]
+    last_exit_i=-1
+    mode=f"{int(hold_days)}日"
+    for i in np.flatnonzero(sig.fillna(False).to_numpy()):
+        entry_i=int(i)+1
+        if entry_i>=len(d) or entry_i<=last_exit_i:
+            continue
+        exit_i=find_exit_index(d, entry_i, mode, "60m")
+        if exit_i is None or exit_i<=entry_i:
+            continue
+        entry=float(d["Open"].iloc[entry_i])
+        exitp=float(d["Close"].iloc[exit_i])
+        if not np.isfinite(entry) or entry<=0 or not np.isfinite(exitp):
+            continue
+        gross=(exitp/entry-1)*100
+        cost_pct=cost.roundtrip_cost_pct(daytrade=False)
+        path=d.iloc[entry_i:exit_i+1]
+        rows.append({
+            "訊號時間":d.index[i],
+            "進場時間":d.index[entry_i],
+            "出場時間":d.index[exit_i],
+            "持有":mode,
+            "進場價":entry,
+            "出場價":exitp,
+            "毛報酬%":gross,
+            "成本%":cost_pct,
+            "淨報酬%":gross-cost_pct,
+            "MFE%":(float(path["High"].max())/entry-1)*100,
+            "MAE%":(float(path["Low"].min())/entry-1)*100,
+            "訊號K":float(d["K"].iloc[i]) if pd.notna(d["K"].iloc[i]) else np.nan,
+            "訊號D":float(d["D"].iloc[i]) if pd.notna(d["D"].iloc[i]) else np.nan,
+            "量比20":float(d["VOL_RATIO20"].iloc[i]) if "VOL_RATIO20" in d and pd.notna(d["VOL_RATIO20"].iloc[i]) else np.nan,
+            "MA60斜率3":float(d["MA60_SLOPE3"].iloc[i]) if "MA60_SLOPE3" in d and pd.notna(d["MA60_SLOPE3"].iloc[i]) else np.nan,
+        })
+        last_exit_i=exit_i
+    return pd.DataFrame(rows)
+
+
+def strategy_lab_metrics(trades: pd.DataFrame) -> dict:
+    if trades is None or trades.empty:
+        return {"交易數":0,"勝率%":np.nan,"平均淨報酬%":np.nan,"PF":np.nan,"報酬中位數%":np.nan}
+    r=pd.to_numeric(trades["淨報酬%"],errors="coerce").dropna()
+    if r.empty:
+        return {"交易數":0,"勝率%":np.nan,"平均淨報酬%":np.nan,"PF":np.nan,"報酬中位數%":np.nan}
+    gp=float(r[r>0].sum()); gl=float(-r[r<0].sum())
+    pf=np.inf if gl==0 and gp>0 else (gp/gl if gl>0 else np.nan)
+    return {
+        "交易數":int(len(r)),
+        "勝率%":float((r>0).mean()*100),
+        "平均淨報酬%":float(r.mean()),
+        "PF":float(pf) if np.isfinite(pf) else pf,
+        "報酬中位數%":float(r.median()),
+    }
+
+
+def run_strategy_lab(ranked_pool: pd.DataFrame, cost: CostConfig, candidate_filter: str,
+                     candidate_hold_days: int, candidate_exit_mode: str="固定持有N日", period: str="1y"):
+    if ranked_pool is None or ranked_pool.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame()
+
+    ranked_pool=ranked_pool.copy()
+    symbols=ranked_pool["股票"].astype(str).tolist()
+    rank_map=dict(zip(ranked_pool["股票"].astype(str),ranked_pool["流動性排名"].astype(int)))
+    raw=download_intraday_batch(symbols,"60m",period)
+
+    base_rows=[]; cand_rows=[]
+    p=st.progress(0,text="策略實驗室：計算60m資料…")
+    for n,symbol in enumerate(symbols,1):
+        d=raw.get(symbol,pd.DataFrame())
+        if d is None or d.empty:
+            p.progress(n/max(1,len(symbols)),text=f"{symbol} 無資料｜{n}/{len(symbols)}")
+            continue
+        x=add_indicators(d)
+        rank=int(rank_map.get(symbol,9999))
+        base_mask=strategy_lab_base_mask(x,rank)
+        cand_mask=base_mask & strategy_lab_extra_mask(x,candidate_filter)
+
+        b=backtest_with_mask(x,base_mask,5,cost)
+        if candidate_exit_mode=="固定持有N日":
+            c=backtest_with_mask(x,cand_mask,int(candidate_hold_days),cost)
+        else:
+            c=backtest_dynamic_exit(x,cand_mask,cost,candidate_exit_mode)
+        if not b.empty:
+            b.insert(0,"股票",symbol); b["流動性排名"]=rank; b["方案"]="正式Baseline"; base_rows.append(b)
+        if not c.empty:
+            c.insert(0,"股票",symbol); c["流動性排名"]=rank; c["方案"]="候選策略"; cand_rows.append(c)
+        p.progress(n/max(1,len(symbols)),text=f"{symbol}｜{n}/{len(symbols)}")
+    p.empty()
+
+    base=pd.concat(base_rows,ignore_index=True) if base_rows else pd.DataFrame()
+    cand=pd.concat(cand_rows,ignore_index=True) if cand_rows else pd.DataFrame()
+    if base.empty and cand.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame()
+
+    all_t=pd.concat([base,cand],ignore_index=True)
+    all_t["_signal_dt"]=_as_taipei_series(all_t["訊號時間"])
+    times=pd.Series(all_t["_signal_dt"].dropna().drop_duplicates().sort_values().to_list())
+    if len(times)<2:
+        return pd.DataFrame(),pd.DataFrame(),all_t.drop(columns=["_signal_dt"],errors="ignore")
+
+    cut_i=max(1,min(len(times)-1,int(len(times)*0.60)))
+    cutoff=times.iloc[cut_i]
+    all_t["樣本"]=np.where(all_t["_signal_dt"]<cutoff,"樣本內60%","樣本外40%")
+    all_t["共同切割時間"]=cutoff
+
+    summary=[]
+    for scheme in ["正式Baseline","候選策略"]:
+        for sample in ["樣本內60%","樣本外40%"]:
+            part=all_t[(all_t["方案"]==scheme)&(all_t["樣本"]==sample)]
+            summary.append({
+                "方案":scheme,
+                "樣本":sample,
+                "額外進場條件":"無" if scheme=="正式Baseline" else candidate_filter,
+                "持有天數/出場":"5日固定" if scheme=="正式Baseline" else (f"{int(candidate_hold_days)}日固定" if candidate_exit_mode=="固定持有N日" else candidate_exit_mode),
+                "共同切割時間":cutoff,
+                **strategy_lab_metrics(part),
+            })
+    summary_df=pd.DataFrame(summary)
+
+    delta=[]
+    for sample in ["樣本內60%","樣本外40%"]:
+        b=summary_df[(summary_df["方案"]=="正式Baseline")&(summary_df["樣本"]==sample)]
+        c=summary_df[(summary_df["方案"]=="候選策略")&(summary_df["樣本"]==sample)]
+        if b.empty or c.empty:
+            continue
+        br=b.iloc[0]; cr=c.iloc[0]
+        delta.append({
+            "樣本":sample,
+            "候選-基準 交易數":int(cr["交易數"])-int(br["交易數"]),
+            "候選-基準 勝率pp":float(cr["勝率%"]-br["勝率%"]) if pd.notna(cr["勝率%"]) and pd.notna(br["勝率%"]) else np.nan,
+            "候選-基準 平均淨報酬pp":float(cr["平均淨報酬%"]-br["平均淨報酬%"]) if pd.notna(cr["平均淨報酬%"]) and pd.notna(br["平均淨報酬%"]) else np.nan,
+            "候選-基準 PF":float(cr["PF"]-br["PF"]) if pd.notna(cr["PF"]) and pd.notna(br["PF"]) and np.isfinite(cr["PF"]) and np.isfinite(br["PF"]) else np.nan,
+        })
+
+    return summary_df,pd.DataFrame(delta),all_t.drop(columns=["_signal_dt"],errors="ignore").reset_index(drop=True)
+
+
 def smart_refresh_seconds(now_ts=None):
     """
     60分K策略的智慧刷新：
@@ -1937,7 +2268,7 @@ def resolve_refresh_seconds(enabled, mode, fixed_seconds):
 
 st.title(f"⚡ {APP_NAME}")
 st.caption(f"{APP_VERSION}｜🔒 正式核心策略｜全市場動態TOP150｜60m KD黃金交叉 + K<30｜持有5日")
-st.info("策略研究基準已凍結。日常頁只跑正式雷達；進階頁僅保留必要的長期驗證與 Shioaji 即時串接規格。")
+st.info("正式策略baseline仍凍結。B線策略實驗室與正式雷達/Worker完全分離；研究通過後才考慮併入正式版。")
 
 with st.sidebar:
     st.header("⚡ 黑嚕嚕短線雷達")
@@ -1947,11 +2278,12 @@ with st.sidebar:
     if simple_mode=="進階研究":
         research_mode=st.radio(
             "研究模式",
-            ["Shioaji即時引擎","策略凍結與即時規格","長期穩健度驗證","長期集中度健診"],
+            ["Shioaji即時引擎","策略實驗室","策略凍結與即時規格","長期穩健度驗證","長期集中度健診"],
             index=0
         )
         captions={
             "Shioaji即時引擎":"Stage 4.4：Supabase共享狀態正式化；支援新版Publishable/Secret Key並保留舊Key相容。",
+            "策略實驗室":"B線研究區：正式baseline鎖定；可測KD動態停利/停損＋第5日兜底，不影響今日雷達與Worker。",
             "策略凍結與即時規格":"查看正式凍結參數與未來 Shioaji 即時行情架構。",
             "長期穩健度驗證":"固定正式策略，以1y 60m資料、最後9mo評估與6段時間檢查長期穩健度。",
             "長期集中度健診":"沿用長期樣本，檢查月度、股票貢獻與Top貢獻集中度。"
@@ -1982,11 +2314,43 @@ with st.sidebar:
             st.caption(f"目前：{_refresh_desc}")
             st.caption("建議60分K策略使用智慧模式；平常60秒即可，接近60分K收盤才加速到10秒。")
 
+    lab_filter="無（正式baseline）"
+    lab_hold_days=5
+    lab_exit_mode="原案：KD停利+KD停損+5日兜底"
+    lab_pool_n=50
+    if simple_mode=="進階研究" and research_mode=="策略實驗室":
+        with st.expander("🧪 B線策略實驗設定", expanded=True):
+            lab_pool_n=st.select_slider("測試流動性前N名", options=[30,50,100,150], value=50)
+            lab_filter=st.selectbox(
+                "候選額外進場條件",
+                ["無（正式baseline）","S級雙條件","量比20 >= 1.5","MA60斜率3 <= 0","站上VWAP","站上MA15","站上MA30"],
+                index=0
+            )
+            lab_exit_mode=st.selectbox(
+                "候選出場方式",
+                [
+                    "原案：KD停利+KD停損+5日兜底",
+                    "只測KD停利+5日兜底",
+                    "只測KD停損+5日兜底",
+                    "加速停損研究版",
+                    "固定持有N日",
+                ],
+                index=0
+            )
+            lab_hold_days=5
+            if lab_exit_mode=="固定持有N日":
+                lab_hold_days=st.select_slider("候選固定持有天數", options=[3,4,5,6,7], value=5)
+            else:
+                st.caption("KD動態出場皆以第5個後續交易日最後一根60分K收盤作最晚兜底。")
+            st.caption("KD停利/停損皆用完成60分K確認；觸發後在下一根60分K Open模擬出場，避免偷看同根收盤。")
+            st.caption("30/50檔適合快速篩選；要考慮納入正式策略，至少再跑TOP150與OOS/時間區塊/集中度驗證。")
+
     if simple_mode=="今日雷達":
         btn_label="🔄 更新今日雷達"
     else:
         btn_label={
             "Shioaji即時引擎":"🔌 檢查本機Worker狀態",
+            "策略實驗室":"🧪 執行Baseline vs 候選策略",
             "策略凍結與即時規格":"🔒 顯示正式凍結規格",
             "長期穩健度驗證":"🧱 執行1年長期穩健度驗證",
             "長期集中度健診":"🧮 執行長期集中度健診",
@@ -2118,6 +2482,76 @@ if simple_mode=="今日雷達":
 
 
 # ============================================================
+
+# ============================================================
+# B線：策略實驗室
+# ============================================================
+if run and simple_mode=="進階研究" and research_mode=="策略實驗室":
+    with st.spinner("建立股票池並執行Baseline / 候選策略比較…"):
+        _lab_pool,_lab_diag,_lab_err=build_current_formal_radar_pool(max_rank=int(lab_pool_n))
+        _lab_summary,_lab_delta,_lab_detail=run_strategy_lab(
+            _lab_pool,cost,lab_filter,int(lab_hold_days),lab_exit_mode,period="1y"
+        )
+    st.session_state["st_v11647_strategy_lab"]={
+        "pool":_lab_pool,"pool_diag":_lab_diag,"errors":_lab_err,
+        "summary":_lab_summary,"delta":_lab_delta,"detail":_lab_detail,
+        "filter":lab_filter,"hold":lab_hold_days,"exit_mode":lab_exit_mode,"pool_n":lab_pool_n,
+    }
+
+if simple_mode=="進階研究" and research_mode=="策略實驗室":
+    st.markdown("## 🧪 B線策略實驗室")
+    st.warning("這裡只做研究。正式今日雷達、Shioaji Worker與Telegram仍維持原凍結baseline。")
+    st.caption("Baseline：TOP1–100＝KD黃金交叉+K<30；TOP101–150再要求S級；下一根60m Open進場；固定5個後續交易日出場。")
+
+    _lab=st.session_state.get("st_v11647_strategy_lab")
+    if not _lab:
+        st.info("左側設定候選條件後，按「🧪 執行Baseline vs 候選策略」。")
+    else:
+        if _lab.get("errors"):
+            st.warning("股票池資料來源提醒："+"；".join(_lab.get("errors",[])))
+
+        c1,c2,c3=st.columns(3)
+        c1.metric("測試股票數",_lab.get("pool_n"))
+        c2.metric("候選進場條件",_lab.get("filter"))
+        c3.metric("候選出場",_lab.get("exit_mode"))
+
+        _sum=_lab.get("summary",pd.DataFrame())
+        _delta=_lab.get("delta",pd.DataFrame())
+        _detail=_lab.get("detail",pd.DataFrame())
+
+        if _sum is None or _sum.empty:
+            st.error("本次沒有足夠交易資料可比較。")
+        else:
+            st.markdown("### Baseline vs 候選策略")
+            st.dataframe(_sum,use_container_width=True,hide_index=True)
+
+            if _delta is not None and not _delta.empty:
+                st.markdown("### 候選策略相對Baseline差異")
+                st.dataframe(_delta,use_container_width=True,hide_index=True)
+
+            oos=_sum[_sum["樣本"]=="樣本外40%"]
+            if len(oos)>=2:
+                b=oos[oos["方案"]=="正式Baseline"]
+                c=oos[oos["方案"]=="候選策略"]
+                if not b.empty and not c.empty:
+                    b=b.iloc[0]; c=c.iloc[0]
+                    st.markdown("### OOS判讀")
+                    st.caption(
+                        f"Baseline：交易 {int(b['交易數'])}｜平均淨報酬 {b['平均淨報酬%']:.3f}%｜PF {b['PF']:.3f}；"
+                        f"候選：交易 {int(c['交易數'])}｜平均淨報酬 {c['平均淨報酬%']:.3f}%｜PF {c['PF']:.3f}。"
+                    )
+                    st.info("不會自動宣布候選策略勝出；要納入正式版，還需TOP150、時間區塊、集中度與資料品質驗證。")
+
+            if _detail is not None and not _detail.empty:
+                st.download_button(
+                    "⬇️ 下載策略實驗交易明細",
+                    data=_detail.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"{APP_VERSION}_策略實驗室交易明細.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+
+
 # 進階研究：正式研究3項 + Shioaji Stage 1
 # ============================================================
 
