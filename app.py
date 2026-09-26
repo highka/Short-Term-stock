@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.16.59
+黑嚕嚕－短線交易雷達 ST V1.16.59.1
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -51,13 +51,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.59"
+APP_VERSION = "ST V1.16.59.1"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.59"
-EXPORT_PREFIX = "ST_V1.16.59"
+APP_VERSION = "ST_V1.16.59.1"
+EXPORT_PREFIX = "ST_V1.16.59.1"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -678,7 +678,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.16.59",
+        "strategy_version":"ST V1.16.59.1",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -2744,7 +2744,7 @@ def run_strategy_lab_threeway(
     三方案共用Baseline決定的60/40切點。
     """
     if ranked_pool is None or ranked_pool.empty:
-        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame()
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame(),{}
 
     ranked_pool=ranked_pool.copy()
     symbols=ranked_pool["股票"].astype(str).tolist()
@@ -2804,7 +2804,7 @@ def run_strategy_lab_threeway(
     base_times=all_t.loc[all_t["方案"]=="正式Baseline","_signal_dt"].dropna()
     times=pd.Series(base_times.drop_duplicates().sort_values().to_list())
     if len(times)<2:
-        return pd.DataFrame(),pd.DataFrame(),all_t.drop(columns=["_signal_dt"],errors="ignore")
+        return pd.DataFrame(),pd.DataFrame(),all_t.drop(columns=["_signal_dt"],errors="ignore"),raw
 
     cut_i=max(1,min(len(times)-1,int(len(times)*0.60)))
     cutoff=times.iloc[cut_i]
@@ -2853,7 +2853,7 @@ def run_strategy_lab_threeway(
                 "相對Baseline PF":float(cr["PF"]-br["PF"]) if pd.notna(cr["PF"]) and pd.notna(br["PF"]) and np.isfinite(cr["PF"]) and np.isfinite(br["PF"]) else np.nan,
             })
 
-    return summary_df,pd.DataFrame(delta),all_t.drop(columns=["_signal_dt"],errors="ignore").reset_index(drop=True)
+    return summary_df,pd.DataFrame(delta),all_t.drop(columns=["_signal_dt"],errors="ignore").reset_index(drop=True),raw
 
 
 
@@ -3484,6 +3484,7 @@ if run and simple_mode=="進階研究" and research_mode=="策略實驗室":
 if simple_mode=="進階研究" and research_mode=="策略實驗室":
     st.markdown("## 🧪 B線策略實驗室｜V1.16.59 候選B壓力測試")
     st.caption("比較原則：三方案同場驗證後，再對候選B做5/10/20bp滑價、訊號排序敏感度與60m Close MTM MDD壓力測試。")
+    st.caption("V1.16.59.1修正：三方案驗證函式所有返回路徑統一回傳4個值，避免ValueError解包失敗。")
     st.warning("這裡只做研究。正式今日雷達、Shioaji Worker與Telegram仍維持原凍結baseline。")
     st.caption("Baseline：TOP1–100＝KD黃金交叉+K<30；TOP101–150再要求S級；下一根60m Open進場；固定5個後續交易日出場。")
 
