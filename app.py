@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.16.53
+黑嚕嚕－短線交易雷達 ST V1.16.54
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -51,13 +51,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.53"
+APP_VERSION = "ST V1.16.54"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.53"
-EXPORT_PREFIX = "ST_V1.16.53"
+APP_VERSION = "ST_V1.16.54"
+EXPORT_PREFIX = "ST_V1.16.54"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -678,7 +678,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.16.53",
+        "strategy_version":"ST V1.16.54",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -2888,6 +2888,13 @@ if simple_mode=="進階研究" and research_mode=="策略實驗室":
                 st.caption(
                     "這張表回答『5日雖然單筆報酬較高，但會不會因佔用資金較久而降低整體效率』。"
                     "重點看OOS的組合報酬%、平均資金利用率%、資金週轉倍數、資金不足略過與最高同時持倉。"
+                )
+                st.download_button(
+                    "⬇️ 下載資金利用率比較 CSV",
+                    data=_cap_compare.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"{APP_VERSION}_資金利用率比較.csv",
+                    mime="text/csv",
+                    use_container_width=True
                 )
 
             _cand_detail=_detail[_detail["方案"]=="候選策略"].copy() if (_detail is not None and not _detail.empty and "方案" in _detail.columns) else pd.DataFrame()
