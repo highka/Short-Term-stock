@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.16.54
+黑嚕嚕－短線交易雷達 ST V1.16.55
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -51,13 +51,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.54"
+APP_VERSION = "ST V1.16.55"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.54"
-EXPORT_PREFIX = "ST_V1.16.54"
+APP_VERSION = "ST_V1.16.55"
+EXPORT_PREFIX = "ST_V1.16.55"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -678,7 +678,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.16.54",
+        "strategy_version":"ST V1.16.55",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -2292,18 +2292,22 @@ def strategy_lab_failure_exit_summary(trades: pd.DataFrame) -> pd.DataFrame:
 
 
 
-def strategy_lab_capital_sim(
+def strategy_lab_capital_sim_with_curve(
     trades: pd.DataFrame,
     initial_capital: float,
     allocation_pct: float,
-) -> dict:
+):
     """
-    固定資金資本利用率參考模擬：
-    - 每筆交易目標投入 = 初始資金 * allocation_pct
+    固定資金模擬 + 已實現資金曲線。
+
+    研究假設：
+    - 每筆目標投入 = 初始資金 * allocation_pct
     - 不使用槓桿、不借款
-    - 同時間資金不足時，該筆交易略過
-    - 研究用，不做整張/零股取整
-    - 出場後本金+損益回到現金池，可再利用
+    - 資金不足則略過該筆訊號
+    - 出場後本金+損益回到現金池
+    - 不做整張/零股取整
+    - MDD使用「已實現資金曲線」計算：
+      未出場部位以投入成本計價，因此不等同逐K mark-to-market MDD。
     """
     empty = {
         "初始資金": float(initial_capital),
@@ -2316,11 +2320,15 @@ def strategy_lab_capital_sim(
         "平均資金利用率%": 0.0,
         "最高同時持倉": 0,
         "資金週轉倍數": 0.0,
+        "已實現MDD%": 0.0,
+        "報酬/MDD": np.nan,
         "每1%平均利用率貢獻報酬pp": np.nan,
-        "測試天數": 0,
+        "測試天數": 0.0,
     }
+    empty_curve = pd.DataFrame(columns=["時間","資金權益","累積報酬%","回撤%"])
+
     if trades is None or trades.empty or initial_capital<=0 or allocation_pct<=0:
-        return empty
+        return empty, empty_curve
 
     x=trades.copy()
     x["_entry"]=_as_taipei_series(x["進場時間"])
@@ -2328,11 +2336,11 @@ def strategy_lab_capital_sim(
     x["_ret"]=pd.to_numeric(x["淨報酬%"],errors="coerce")/100.0
     x=x.dropna(subset=["_entry","_exit","_ret"]).sort_values(["_entry","_exit"]).reset_index(drop=True)
     if x.empty:
-        return empty
+        return empty, empty_curve
 
     target=float(initial_capital)*float(allocation_pct)
     cash=float(initial_capital)
-    open_positions=[]  # dict(exit, principal, proceeds)
+    open_positions=[]
     accepted=0
     skipped=0
     turnover=0.0
@@ -2344,35 +2352,35 @@ def strategy_lab_capital_sim(
     deployed=0.0
     occupied_capital_seconds=0.0
 
-    def release_until(t):
-        nonlocal cash, open_positions, deployed
-        due=[p for p in open_positions if p["exit"]<=t]
-        if due:
-            for p in sorted(due,key=lambda z:z["exit"]):
-                cash += p["proceeds"]
-                deployed -= p["principal"]
-                open_positions.remove(p)
+    curve_rows=[{
+        "時間":first_t,
+        "資金權益":float(initial_capital),
+    }]
 
-    # event-based utilization integration: before each entry, integrate until that time,
-    # but exits in between must be processed in chronological order.
-    events=[]
-    for _,r in x.iterrows():
-        events.append(("entry",r["_entry"],r))
-    # We'll process entry sequence, explicitly integrate intermediate exits.
-    last_event=first_t
+    def append_equity(ts):
+        equity=float(cash+deployed)
+        if curve_rows and curve_rows[-1]["時間"]==ts:
+            curve_rows[-1]["資金權益"]=equity
+        else:
+            curve_rows.append({"時間":ts,"資金權益":equity})
 
     for _,r in x.iterrows():
         entry_t=r["_entry"]
 
-        # process exits before this entry in exact order for utilization
-        due_sorted=sorted([p for p in open_positions if p["exit"]<=entry_t], key=lambda z:z["exit"])
+        # 先處理 entry_t 以前/同時到期的出場，釋放資金
+        due_sorted=sorted(
+            [p for p in open_positions if p["exit"]<=entry_t],
+            key=lambda z:z["exit"]
+        )
         for p in due_sorted:
             dt=max(0.0,(p["exit"]-last_event).total_seconds())
             occupied_capital_seconds += deployed*dt
             last_event=p["exit"]
+
             cash += p["proceeds"]
             deployed -= p["principal"]
             open_positions.remove(p)
+            append_equity(p["exit"])
 
         dt=max(0.0,(entry_t-last_event).total_seconds())
         occupied_capital_seconds += deployed*dt
@@ -2385,24 +2393,29 @@ def strategy_lab_capital_sim(
         principal=target
         ret=float(r["_ret"])
         proceeds=principal*(1.0+ret)
+
         cash -= principal
         deployed += principal
         turnover += principal
         accepted += 1
+
         open_positions.append({
             "exit":r["_exit"],
             "principal":principal,
             "proceeds":proceeds,
         })
         max_concurrent=max(max_concurrent,len(open_positions))
+        # 進場不改變權益，只改變現金/在場資金結構
 
-    # release remaining positions and integrate utilization
+    # 最後依時間釋放剩餘持倉
     for p in sorted(open_positions,key=lambda z:z["exit"]):
         dt=max(0.0,(p["exit"]-last_event).total_seconds())
         occupied_capital_seconds += deployed*dt
         last_event=p["exit"]
+
         cash += p["proceeds"]
         deployed -= p["principal"]
+        append_equity(p["exit"])
 
     end_t=max(last_event,last_t)
     total_seconds=max(1.0,(end_t-first_t).total_seconds())
@@ -2410,7 +2423,19 @@ def strategy_lab_capital_sim(
     portfolio_ret=(cash/float(initial_capital)-1.0)*100.0
     days=max(0.0,total_seconds/86400.0)
 
-    return {
+    curve=pd.DataFrame(curve_rows).sort_values("時間").drop_duplicates("時間",keep="last").reset_index(drop=True)
+    if curve.empty:
+        curve=empty_curve.copy()
+        realized_mdd=0.0
+    else:
+        eq=pd.to_numeric(curve["資金權益"],errors="coerce").astype(float)
+        peak=eq.cummax()
+        dd=(eq/peak-1.0)*100.0
+        curve["累積報酬%"]=(eq/float(initial_capital)-1.0)*100.0
+        curve["回撤%"]=dd
+        realized_mdd=abs(float(dd.min())) if dd.notna().any() else 0.0
+
+    metrics = {
         "初始資金": float(initial_capital),
         "單筆配置%": float(allocation_pct*100),
         "可容納理論槽位": int(math.floor(1/allocation_pct)),
@@ -2421,9 +2446,24 @@ def strategy_lab_capital_sim(
         "平均資金利用率%": float(avg_util),
         "最高同時持倉": int(max_concurrent),
         "資金週轉倍數": float(turnover/float(initial_capital)),
+        "已實現MDD%": float(realized_mdd),
+        "報酬/MDD": float(portfolio_ret/realized_mdd) if realized_mdd>0 else np.nan,
         "每1%平均利用率貢獻報酬pp": float(portfolio_ret/avg_util) if avg_util>0 else np.nan,
         "測試天數": float(days),
     }
+    return metrics,curve
+
+
+def strategy_lab_capital_sim(
+    trades: pd.DataFrame,
+    initial_capital: float,
+    allocation_pct: float,
+) -> dict:
+    metrics,_=strategy_lab_capital_sim_with_curve(
+        trades,initial_capital,allocation_pct
+    )
+    return metrics
+
 
 
 def strategy_lab_capital_compare(
@@ -2440,6 +2480,59 @@ def strategy_lab_capital_compare(
             m=strategy_lab_capital_sim(g,initial_capital,allocation_pct)
             rows.append({"樣本":sample,"方案":scheme,**m})
     return pd.DataFrame(rows)
+
+
+def strategy_lab_capital_matrix(
+    detail: pd.DataFrame,
+    initial_capital: float,
+    allocations=(0.0333,0.05,0.10),
+) -> pd.DataFrame:
+    """固定跑 3.33% / 5% / 10% 資金配置矩陣。"""
+    if detail is None or detail.empty:
+        return pd.DataFrame()
+
+    rows=[]
+    for sample in ["樣本內60%","樣本外40%"]:
+        for alloc in allocations:
+            for scheme in ["正式Baseline","候選策略"]:
+                g=detail[(detail["樣本"]==sample)&(detail["方案"]==scheme)].copy()
+                m=strategy_lab_capital_sim(g,initial_capital,float(alloc))
+                rows.append({
+                    "樣本":sample,
+                    "方案":scheme,
+                    "配置情境":f"{float(alloc)*100:.2f}%",
+                    **m,
+                })
+    return pd.DataFrame(rows)
+
+
+def strategy_lab_oos_equity_curves(
+    detail: pd.DataFrame,
+    initial_capital: float,
+    allocation_pct: float,
+):
+    """產生OOS Baseline / 候選的已實現資金曲線。"""
+    if detail is None or detail.empty:
+        return pd.DataFrame()
+
+    curves=[]
+    for scheme in ["正式Baseline","候選策略"]:
+        g=detail[
+            (detail["樣本"]=="樣本外40%")
+            & (detail["方案"]==scheme)
+        ].copy()
+        _,curve=strategy_lab_capital_sim_with_curve(
+            g,initial_capital,allocation_pct
+        )
+        if curve is None or curve.empty:
+            continue
+        c=curve.copy()
+        c["方案"]=scheme
+        c["單筆配置%"]=float(allocation_pct*100)
+        curves.append(c)
+
+    return pd.concat(curves,ignore_index=True) if curves else pd.DataFrame()
+
 
 
 def strategy_lab_metrics(trades: pd.DataFrame) -> dict:
@@ -2680,6 +2773,7 @@ with st.sidebar:
                 value=3.33
             )
             st.caption("資金利用率模擬：不使用槓桿；資金不足時該筆略過；不做整張/零股取整，作策略比較參考。")
+            st.caption("新版會固定額外跑3.33% / 5% / 10%矩陣；此處選擇值主要用於上方單一情境與OOS資金曲線。")
 
             lab_hold_days=5
             if lab_exit_mode=="固定持有N日":
@@ -2887,7 +2981,7 @@ if simple_mode=="進階研究" and research_mode=="策略實驗室":
                 st.dataframe(_cap_compare,use_container_width=True,hide_index=True)
                 st.caption(
                     "這張表回答『5日雖然單筆報酬較高，但會不會因佔用資金較久而降低整體效率』。"
-                    "重點看OOS的組合報酬%、平均資金利用率%、資金週轉倍數、資金不足略過與最高同時持倉。"
+                    "重點看OOS的組合報酬%、平均資金利用率%、資金週轉倍數、資金不足略過、最高同時持倉與已實現MDD%。"
                 )
                 st.download_button(
                     "⬇️ 下載資金利用率比較 CSV",
@@ -2896,6 +2990,53 @@ if simple_mode=="進階研究" and research_mode=="策略實驗室":
                     mime="text/csv",
                     use_container_width=True
                 )
+
+                _cap_matrix=strategy_lab_capital_matrix(
+                    _detail,
+                    float(_lab.get("capital",1000000)),
+                    allocations=(0.0333,0.05,0.10)
+                )
+                if not _cap_matrix.empty:
+                    st.markdown("### 💼 3.33% / 5% / 10% 資金配置矩陣")
+                    st.dataframe(_cap_matrix,use_container_width=True,hide_index=True)
+                    st.caption(
+                        "同一批交易同時比較三種單筆配置。"
+                        "重點看OOS的組合報酬%、已實現MDD%、報酬/MDD、資金不足略過與資金週轉倍數。"
+                    )
+                    st.download_button(
+                        "⬇️ 下載資金配置矩陣 CSV",
+                        data=_cap_matrix.to_csv(index=False).encode("utf-8-sig"),
+                        file_name=f"{APP_VERSION}_資金配置矩陣.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+
+                _curve_alloc=float(_lab.get("alloc_pct",3.33))/100.0
+                _equity_curve=strategy_lab_oos_equity_curves(
+                    _detail,
+                    float(_lab.get("capital",1000000)),
+                    _curve_alloc
+                )
+                if not _equity_curve.empty:
+                    st.markdown(f"### 📈 OOS已實現資金曲線｜單筆配置 {_curve_alloc*100:.2f}%")
+                    _plot=_equity_curve.pivot_table(
+                        index="時間",
+                        columns="方案",
+                        values="資金權益",
+                        aggfunc="last"
+                    ).sort_index().ffill()
+                    st.line_chart(_plot,use_container_width=True)
+                    st.caption(
+                        "此曲線以已實現損益計算；未出場持倉以成本計價。"
+                        "因此『已實現MDD』適合比較策略資金週轉與已落袋風險，但不是逐K mark-to-market 真實MDD。"
+                    )
+                    st.download_button(
+                        "⬇️ 下載OOS資金曲線 CSV",
+                        data=_equity_curve.to_csv(index=False).encode("utf-8-sig"),
+                        file_name=f"{APP_VERSION}_OOS資金曲線_{_curve_alloc*100:.2f}pct.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
 
             _cand_detail=_detail[_detail["方案"]=="候選策略"].copy() if (_detail is not None and not _detail.empty and "方案" in _detail.columns) else pd.DataFrame()
             _exit_sum=strategy_lab_exit_reason_summary(_cand_detail)
