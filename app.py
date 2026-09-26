@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.16.55
+黑嚕嚕－短線交易雷達 ST V1.16.56
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -51,13 +51,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.55"
+APP_VERSION = "ST V1.16.56"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.55"
-EXPORT_PREFIX = "ST_V1.16.55"
+APP_VERSION = "ST_V1.16.56"
+EXPORT_PREFIX = "ST_V1.16.56"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -678,7 +678,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.16.55",
+        "strategy_version":"ST V1.16.56",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -2297,18 +2297,7 @@ def strategy_lab_capital_sim_with_curve(
     initial_capital: float,
     allocation_pct: float,
 ):
-    """
-    固定資金模擬 + 已實現資金曲線。
-
-    研究假設：
-    - 每筆目標投入 = 初始資金 * allocation_pct
-    - 不使用槓桿、不借款
-    - 資金不足則略過該筆訊號
-    - 出場後本金+損益回到現金池
-    - 不做整張/零股取整
-    - MDD使用「已實現資金曲線」計算：
-      未出場部位以投入成本計價，因此不等同逐K mark-to-market MDD。
-    """
+    """固定資金模擬 + 已實現資金曲線（V1.16.56修正版）。"""
     empty = {
         "初始資金": float(initial_capital),
         "單筆配置%": float(allocation_pct*100),
@@ -2326,7 +2315,6 @@ def strategy_lab_capital_sim_with_curve(
         "測試天數": 0.0,
     }
     empty_curve = pd.DataFrame(columns=["時間","資金權益","累積報酬%","回撤%"])
-
     if trades is None or trades.empty or initial_capital<=0 or allocation_pct<=0:
         return empty, empty_curve
 
@@ -2334,7 +2322,12 @@ def strategy_lab_capital_sim_with_curve(
     x["_entry"]=_as_taipei_series(x["進場時間"])
     x["_exit"]=_as_taipei_series(x["出場時間"])
     x["_ret"]=pd.to_numeric(x["淨報酬%"],errors="coerce")/100.0
-    x=x.dropna(subset=["_entry","_exit","_ret"]).sort_values(["_entry","_exit"]).reset_index(drop=True)
+    x["_rank"]=pd.to_numeric(x["流動性排名"],errors="coerce").fillna(9999) if "流動性排名" in x.columns else 9999
+    x["_symbol"]=x["股票"].astype(str) if "股票" in x.columns else ""
+    x=x.dropna(subset=["_entry","_exit","_ret"]).sort_values(
+        by=["_entry","_rank","_symbol","_exit"],
+        kind="mergesort"
+    ).reset_index(drop=True)
     if x.empty:
         return empty, empty_curve
 
@@ -2345,81 +2338,70 @@ def strategy_lab_capital_sim_with_curve(
     skipped=0
     turnover=0.0
     max_concurrent=0
-
     first_t=x["_entry"].min()
     last_t=max(x["_exit"].max(), first_t)
     last_event=first_t
     deployed=0.0
-    occupied_capital_seconds=0.0
+    util_weighted_seconds=0.0
+    curve_rows=[{"時間":first_t,"資金權益":float(initial_capital)}]
 
-    curve_rows=[{
-        "時間":first_t,
-        "資金權益":float(initial_capital),
-    }]
+    def current_equity():
+        return float(cash + deployed)
+
+    def integrate_until(ts):
+        nonlocal last_event, util_weighted_seconds
+        dt=max(0.0,(ts-last_event).total_seconds())
+        if dt>0:
+            eq=max(current_equity(),1e-9)
+            util=(deployed/eq)*100.0
+            util_weighted_seconds += util*dt
+            last_event=ts
 
     def append_equity(ts):
-        equity=float(cash+deployed)
+        equity=current_equity()
         if curve_rows and curve_rows[-1]["時間"]==ts:
             curve_rows[-1]["資金權益"]=equity
         else:
             curve_rows.append({"時間":ts,"資金權益":equity})
 
-    for _,r in x.iterrows():
-        entry_t=r["_entry"]
-
-        # 先處理 entry_t 以前/同時到期的出場，釋放資金
-        due_sorted=sorted(
-            [p for p in open_positions if p["exit"]<=entry_t],
-            key=lambda z:z["exit"]
-        )
+    for entry_t, grp in x.groupby("_entry", sort=True):
+        due_sorted=sorted([p for p in open_positions if p["exit"]<=entry_t], key=lambda z:z["exit"])
         for p in due_sorted:
-            dt=max(0.0,(p["exit"]-last_event).total_seconds())
-            occupied_capital_seconds += deployed*dt
-            last_event=p["exit"]
-
+            integrate_until(p["exit"])
             cash += p["proceeds"]
             deployed -= p["principal"]
             open_positions.remove(p)
             append_equity(p["exit"])
 
-        dt=max(0.0,(entry_t-last_event).total_seconds())
-        occupied_capital_seconds += deployed*dt
-        last_event=entry_t
+        integrate_until(entry_t)
+        grp=grp.sort_values(by=["_rank","_symbol","_exit"],kind="mergesort")
+        for _,r in grp.iterrows():
+            if cash + 1e-9 < target:
+                skipped += 1
+                continue
+            principal=target
+            proceeds=principal*(1.0+float(r["_ret"]))
+            cash -= principal
+            deployed += principal
+            turnover += principal
+            accepted += 1
+            open_positions.append({
+                "exit":r["_exit"],
+                "principal":principal,
+                "proceeds":proceeds,
+            })
+            max_concurrent=max(max_concurrent,len(open_positions))
 
-        if cash + 1e-9 < target:
-            skipped += 1
-            continue
-
-        principal=target
-        ret=float(r["_ret"])
-        proceeds=principal*(1.0+ret)
-
-        cash -= principal
-        deployed += principal
-        turnover += principal
-        accepted += 1
-
-        open_positions.append({
-            "exit":r["_exit"],
-            "principal":principal,
-            "proceeds":proceeds,
-        })
-        max_concurrent=max(max_concurrent,len(open_positions))
-        # 進場不改變權益，只改變現金/在場資金結構
-
-    # 最後依時間釋放剩餘持倉
     for p in sorted(open_positions,key=lambda z:z["exit"]):
-        dt=max(0.0,(p["exit"]-last_event).total_seconds())
-        occupied_capital_seconds += deployed*dt
-        last_event=p["exit"]
-
+        integrate_until(p["exit"])
         cash += p["proceeds"]
         deployed -= p["principal"]
         append_equity(p["exit"])
 
     end_t=max(last_event,last_t)
+    integrate_until(end_t)
     total_seconds=max(1.0,(end_t-first_t).total_seconds())
-    avg_util=occupied_capital_seconds/(float(initial_capital)*total_seconds)*100.0
+    avg_util=util_weighted_seconds/total_seconds
     portfolio_ret=(cash/float(initial_capital)-1.0)*100.0
     days=max(0.0,total_seconds/86400.0)
 
@@ -2452,6 +2434,7 @@ def strategy_lab_capital_sim_with_curve(
         "測試天數": float(days),
     }
     return metrics,curve
+
 
 
 def strategy_lab_capital_sim(
@@ -2774,6 +2757,7 @@ with st.sidebar:
             )
             st.caption("資金利用率模擬：不使用槓桿；資金不足時該筆略過；不做整張/零股取整，作策略比較參考。")
             st.caption("新版會固定額外跑3.33% / 5% / 10%矩陣；此處選擇值主要用於上方單一情境與OOS資金曲線。")
+            st.caption("V1.16.56修正：同一時間多筆訊號改用流動性排名→股票代碼排序；平均資金利用率改用當下已實現權益為分母。")
 
             lab_hold_days=5
             if lab_exit_mode=="固定持有N日":
@@ -2998,6 +2982,7 @@ if simple_mode=="進階研究" and research_mode=="策略實驗室":
                 )
                 if not _cap_matrix.empty:
                     st.markdown("### 💼 3.33% / 5% / 10% 資金配置矩陣")
+                    st.info("資金模擬採固定名目部位。同時進場依流動性排名→股票代碼排序，避免CSV列順序影響結果。")
                     st.dataframe(_cap_matrix,use_container_width=True,hide_index=True)
                     st.caption(
                         "同一批交易同時比較三種單筆配置。"
