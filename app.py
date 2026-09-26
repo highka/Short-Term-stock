@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.16.48
+黑嚕嚕－短線交易雷達 ST V1.16.49
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -51,13 +51,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.48"
+APP_VERSION = "ST V1.16.49"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.48"
-EXPORT_PREFIX = "ST_V1.16.48"
+APP_VERSION = "ST_V1.16.49"
+EXPORT_PREFIX = "ST_V1.16.49"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -678,7 +678,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.16.48",
+        "strategy_version":"ST V1.16.49",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -2123,6 +2123,25 @@ def backtest_with_mask(d: pd.DataFrame, sig: pd.Series, hold_days: int, cost: Co
     return pd.DataFrame(rows)
 
 
+
+def strategy_lab_exit_reason_summary(trades: pd.DataFrame) -> pd.DataFrame:
+    """候選策略依出場原因拆解績效。"""
+    if trades is None or trades.empty or "出場原因" not in trades.columns:
+        return pd.DataFrame()
+    rows=[]
+    for (sample,reason),g in trades.dropna(subset=["出場原因"]).groupby(["樣本","出場原因"],dropna=False):
+        m=strategy_lab_metrics(g)
+        rows.append({
+            "樣本":sample,
+            "出場原因":reason,
+            **m,
+            "平均MAE%":float(pd.to_numeric(g["MAE%"],errors="coerce").mean()) if "MAE%" in g else np.nan,
+            "平均MFE%":float(pd.to_numeric(g["MFE%"],errors="coerce").mean()) if "MFE%" in g else np.nan,
+            "占候選交易比%":float(len(g)/max(1,len(trades[trades["樣本"]==sample]))*100),
+        })
+    return pd.DataFrame(rows)
+
+
 def strategy_lab_metrics(trades: pd.DataFrame) -> dict:
     if trades is None or trades.empty:
         return {"交易數":0,"勝率%":np.nan,"平均淨報酬%":np.nan,"PF":np.nan,"報酬中位數%":np.nan}
@@ -2528,6 +2547,13 @@ if simple_mode=="進階研究" and research_mode=="策略實驗室":
             if _delta is not None and not _delta.empty:
                 st.markdown("### 候選策略相對Baseline差異")
                 st.dataframe(_delta,use_container_width=True,hide_index=True)
+
+            _cand_detail=_detail[_detail["方案"]=="候選策略"].copy() if (_detail is not None and not _detail.empty and "方案" in _detail.columns) else pd.DataFrame()
+            _exit_sum=strategy_lab_exit_reason_summary(_cand_detail)
+            if not _exit_sum.empty:
+                st.markdown("### 出場原因拆解")
+                st.dataframe(_exit_sum,use_container_width=True,hide_index=True)
+                st.caption("這張表用來判斷究竟是停利、停損還是第5日兜底在改善/拖累績效。")
 
             oos=_sum[_sum["樣本"]=="樣本外40%"]
             if len(oos)>=2:
