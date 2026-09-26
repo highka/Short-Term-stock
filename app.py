@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.16.57
+黑嚕嚕－短線交易雷達 ST V1.16.58
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -51,13 +51,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.57"
+APP_VERSION = "ST V1.16.58"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.57"
-EXPORT_PREFIX = "ST_V1.16.57"
+APP_VERSION = "ST_V1.16.58"
+EXPORT_PREFIX = "ST_V1.16.58"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -678,7 +678,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.16.57",
+        "strategy_version":"ST V1.16.58",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -2449,6 +2449,14 @@ def strategy_lab_capital_sim(
 
 
 
+def strategy_lab_scheme_order(detail: pd.DataFrame):
+    """Baseline固定在前，其餘方案依出現順序排列。"""
+    if detail is None or detail.empty or "方案" not in detail.columns:
+        return []
+    vals=[str(x) for x in detail["方案"].dropna().astype(str).drop_duplicates().tolist()]
+    return (["正式Baseline"] if "正式Baseline" in vals else []) + [x for x in vals if x!="正式Baseline"]
+
+
 def strategy_lab_capital_compare(
     detail: pd.DataFrame,
     initial_capital: float,
@@ -2458,7 +2466,7 @@ def strategy_lab_capital_compare(
         return pd.DataFrame()
     rows=[]
     for sample in ["樣本內60%","樣本外40%"]:
-        for scheme in ["正式Baseline","候選策略"]:
+        for scheme in strategy_lab_scheme_order(detail):
             g=detail[(detail["樣本"]==sample)&(detail["方案"]==scheme)].copy()
             m=strategy_lab_capital_sim(g,initial_capital,allocation_pct)
             rows.append({"樣本":sample,"方案":scheme,**m})
@@ -2477,7 +2485,7 @@ def strategy_lab_capital_matrix(
     rows=[]
     for sample in ["樣本內60%","樣本外40%"]:
         for alloc in allocations:
-            for scheme in ["正式Baseline","候選策略"]:
+            for scheme in strategy_lab_scheme_order(detail):
                 g=detail[(detail["樣本"]==sample)&(detail["方案"]==scheme)].copy()
                 m=strategy_lab_capital_sim(g,initial_capital,float(alloc))
                 rows.append({
@@ -2499,7 +2507,7 @@ def strategy_lab_oos_equity_curves(
         return pd.DataFrame()
 
     curves=[]
-    for scheme in ["正式Baseline","候選策略"]:
+    for scheme in strategy_lab_scheme_order(detail):
         g=detail[
             (detail["樣本"]=="樣本外40%")
             & (detail["方案"]==scheme)
@@ -2536,7 +2544,7 @@ def strategy_lab_time_block_summary(detail: pd.DataFrame, blocks: int=6) -> pd.D
 
     edges=pd.date_range(tmin,tmax,periods=blocks+1)
     rows=[]
-    for scheme in ["正式Baseline","候選策略"]:
+    for scheme in strategy_lab_scheme_order(detail):
         g=x[x["方案"]==scheme].copy()
         if g.empty:
             continue
@@ -2567,7 +2575,7 @@ def strategy_lab_concentration_summary(detail: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     rows=[]
-    for scheme in ["正式Baseline","候選策略"]:
+    for scheme in strategy_lab_scheme_order(detail):
         g=x[x["方案"]==scheme].copy()
         if g.empty:
             continue
@@ -2689,7 +2697,7 @@ def run_strategy_lab(ranked_pool: pd.DataFrame, cost: CostConfig, candidate_filt
     all_t["共同切割時間"]=cutoff
 
     summary=[]
-    for scheme in ["正式Baseline","候選策略"]:
+    for scheme in strategy_lab_scheme_order(detail):
         for sample in ["樣本內60%","樣本外40%"]:
             part=all_t[(all_t["方案"]==scheme)&(all_t["樣本"]==sample)]
             summary.append({
@@ -2718,6 +2726,181 @@ def run_strategy_lab(ranked_pool: pd.DataFrame, cost: CostConfig, candidate_filt
         })
 
     return summary_df,pd.DataFrame(delta),all_t.drop(columns=["_signal_dt"],errors="ignore").reset_index(drop=True)
+
+
+
+def run_strategy_lab_threeway(
+    ranked_pool: pd.DataFrame,
+    cost: CostConfig,
+    candidate_filter: str="無（正式baseline）",
+    period: str="1y",
+):
+    """
+    一次下載同一批TOP150 60m資料，同場比較：
+    1. 正式Baseline：固定5日
+    2. 候選A：KD停利 + 第2日MFE<2%且K<D失敗退出 + 第5日兜底
+    3. 候選B：KD停利 + 第3日未站回成本且K<D失敗退出 + 第5日兜底
+
+    三方案共用Baseline決定的60/40切點。
+    """
+    if ranked_pool is None or ranked_pool.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame()
+
+    ranked_pool=ranked_pool.copy()
+    symbols=ranked_pool["股票"].astype(str).tolist()
+    rank_map=dict(zip(ranked_pool["股票"].astype(str),ranked_pool["流動性排名"].astype(int)))
+    raw=download_intraday_batch(symbols,"60m",period)
+
+    modes = [
+        ("正式Baseline", None),
+        ("候選A｜第2日MFE<2%", "KD停利+第2日MFE<2%失敗退出+5日兜底"),
+        ("候選B｜第3日未站回成本", "KD停利+第3日未站回成本失敗退出+5日兜底"),
+    ]
+
+    rows={name:[] for name,_ in modes}
+    p=st.progress(0,text="正式三方案驗證：計算TOP150 60m資料…")
+
+    for n,symbol in enumerate(symbols,1):
+        d=raw.get(symbol,pd.DataFrame())
+        if d is None or d.empty:
+            p.progress(n/max(1,len(symbols)),text=f"{symbol} 無資料｜{n}/{len(symbols)}")
+            continue
+
+        x=add_indicators(d)
+        rank=int(rank_map.get(symbol,9999))
+        base_mask=strategy_lab_base_mask(x,rank)
+        cand_mask=base_mask & strategy_lab_extra_mask(x,candidate_filter)
+
+        # Baseline
+        b=backtest_with_mask(x,base_mask,5,cost)
+        if not b.empty:
+            b.insert(0,"股票",symbol)
+            b["流動性排名"]=rank
+            b["方案"]="正式Baseline"
+            rows["正式Baseline"].append(b)
+
+        # Two frozen candidate exits on exactly same entry mask
+        for scheme,mode in modes[1:]:
+            c=backtest_dynamic_exit(x,cand_mask,cost,mode)
+            if not c.empty:
+                c.insert(0,"股票",symbol)
+                c["流動性排名"]=rank
+                c["方案"]=scheme
+                rows[scheme].append(c)
+
+        p.progress(n/max(1,len(symbols)),text=f"{symbol}｜{n}/{len(symbols)}")
+    p.empty()
+
+    frames=[]
+    for scheme,_ in modes:
+        if rows[scheme]:
+            frames.append(pd.concat(rows[scheme],ignore_index=True))
+    if not frames:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame()
+
+    all_t=pd.concat(frames,ignore_index=True)
+    all_t["_signal_dt"]=_as_taipei_series(all_t["訊號時間"])
+
+    base_times=all_t.loc[all_t["方案"]=="正式Baseline","_signal_dt"].dropna()
+    times=pd.Series(base_times.drop_duplicates().sort_values().to_list())
+    if len(times)<2:
+        return pd.DataFrame(),pd.DataFrame(),all_t.drop(columns=["_signal_dt"],errors="ignore")
+
+    cut_i=max(1,min(len(times)-1,int(len(times)*0.60)))
+    cutoff=times.iloc[cut_i]
+    all_t["樣本"]=np.where(all_t["_signal_dt"]<cutoff,"樣本內60%","樣本外40%")
+    all_t["共同切割時間"]=cutoff
+
+    summary=[]
+    for scheme,_ in modes:
+        for sample in ["樣本內60%","樣本外40%"]:
+            part=all_t[(all_t["方案"]==scheme)&(all_t["樣本"]==sample)]
+            if scheme=="正式Baseline":
+                exit_desc="5日固定"
+            elif scheme.startswith("候選A"):
+                exit_desc="KD停利+第2日MFE<2%失敗退出+5日兜底"
+            else:
+                exit_desc="KD停利+第3日未站回成本失敗退出+5日兜底"
+            summary.append({
+                "方案":scheme,
+                "樣本":sample,
+                "額外進場條件":"無" if scheme=="正式Baseline" else candidate_filter,
+                "持有天數/出場":exit_desc,
+                "共同切割時間":cutoff,
+                **strategy_lab_metrics(part),
+            })
+
+    summary_df=pd.DataFrame(summary)
+
+    # 對Baseline的差異
+    delta=[]
+    for sample in ["樣本內60%","樣本外40%"]:
+        b=summary_df[(summary_df["方案"]=="正式Baseline")&(summary_df["樣本"]==sample)]
+        if b.empty:
+            continue
+        br=b.iloc[0]
+        for scheme in ["候選A｜第2日MFE<2%","候選B｜第3日未站回成本"]:
+            c=summary_df[(summary_df["方案"]==scheme)&(summary_df["樣本"]==sample)]
+            if c.empty:
+                continue
+            cr=c.iloc[0]
+            delta.append({
+                "樣本":sample,
+                "方案":scheme,
+                "相對Baseline交易數":int(cr["交易數"])-int(br["交易數"]),
+                "相對Baseline勝率pp":float(cr["勝率%"]-br["勝率%"]) if pd.notna(cr["勝率%"]) and pd.notna(br["勝率%"]) else np.nan,
+                "相對Baseline平均淨報酬pp":float(cr["平均淨報酬%"]-br["平均淨報酬%"]) if pd.notna(cr["平均淨報酬%"]) and pd.notna(br["平均淨報酬%"]) else np.nan,
+                "相對Baseline PF":float(cr["PF"]-br["PF"]) if pd.notna(cr["PF"]) and pd.notna(br["PF"]) and np.isfinite(cr["PF"]) and np.isfinite(br["PF"]) else np.nan,
+            })
+
+    return summary_df,pd.DataFrame(delta),all_t.drop(columns=["_signal_dt"],errors="ignore").reset_index(drop=True)
+
+
+def strategy_lab_formal_validation_summary(
+    detail: pd.DataFrame,
+    initial_capital: float,
+) -> pd.DataFrame:
+    """把OOS單筆品質、六區塊、集中度與5%資金效率合成一張正式驗證總表。"""
+    if detail is None or detail.empty:
+        return pd.DataFrame()
+
+    schemes=strategy_lab_scheme_order(detail)
+    tb=strategy_lab_time_block_summary(detail,blocks=6)
+    conc=strategy_lab_concentration_summary(detail)
+    cap=strategy_lab_capital_matrix(detail,initial_capital,allocations=(0.05,))
+    rows=[]
+
+    for scheme in schemes:
+        oos=detail[(detail["方案"]==scheme)&(detail["樣本"]=="樣本外40%")]
+        m=strategy_lab_metrics(oos)
+
+        t=tb[tb["方案"]==scheme] if not tb.empty else pd.DataFrame()
+        pos_blocks=int((pd.to_numeric(t["平均淨報酬%"],errors="coerce")>0).sum()) if not t.empty else 0
+        worst_block=float(pd.to_numeric(t["平均淨報酬%"],errors="coerce").min()) if not t.empty else np.nan
+
+        c=conc[conc["方案"]==scheme] if not conc.empty else pd.DataFrame()
+        c0=c.iloc[0] if not c.empty else None
+
+        cp=cap[(cap["方案"]==scheme)&(cap["樣本"]=="樣本外40%")] if not cap.empty else pd.DataFrame()
+        cp0=cp.iloc[0] if not cp.empty else None
+
+        rows.append({
+            "方案":scheme,
+            "OOS交易數":m["交易數"],
+            "OOS平均淨報酬%":m["平均淨報酬%"],
+            "OOS PF":m["PF"],
+            "OOS正報酬區塊/6":pos_blocks,
+            "最差區塊平均淨報酬%":worst_block,
+            "正報酬股票比例%":float(c0["正報酬股票比例%"]) if c0 is not None else np.nan,
+            "移除Top20後平均淨報酬%":float(c0["移除Top20後平均淨報酬%"]) if c0 is not None else np.nan,
+            "移除Top20後PF":float(c0["移除Top20後PF"]) if c0 is not None else np.nan,
+            "5%組合報酬%":float(cp0["組合報酬%"]) if cp0 is not None else np.nan,
+            "5%已實現MDD%":float(cp0["已實現MDD%"]) if cp0 is not None else np.nan,
+            "5%報酬/MDD":float(cp0["報酬/MDD"]) if cp0 is not None else np.nan,
+            "5%資金利用率%":float(cp0["平均資金利用率%"]) if cp0 is not None else np.nan,
+            "5%資金週轉倍數":float(cp0["資金週轉倍數"]) if cp0 is not None else np.nan,
+        })
+    return pd.DataFrame(rows)
 
 
 def smart_refresh_seconds(now_ts=None):
@@ -2829,6 +3012,7 @@ with st.sidebar:
             lab_exit_mode=st.selectbox(
                 "候選出場方式",
                 [
+                    "正式三方案驗證｜Baseline vs MFE2 vs 第3日成本",
                     "KD停利+第2日MFE<2%失敗退出+5日兜底",
                     "KD停利+第2日MFE<3%失敗退出+5日兜底",
                     "KD停利+第3日未站回成本失敗退出+5日兜底",
@@ -2863,7 +3047,7 @@ with st.sidebar:
             else:
                 st.caption("KD動態出場皆以第5個後續交易日最後一根60分K收盤作最晚兜底。")
             st.caption("KD停利、價格型停損與時間型失敗退出都用完成60分K確認；觸發後在下一根60分K Open模擬出場。")
-            st.caption("正式驗證建議使用TOP150；本版會額外產生OOS時間區塊、集中度、3.33/5/10%資金配置矩陣。")
+            st.caption("V1.16.58正式驗證模式：TOP150一次同場跑Baseline、MFE2、第3日成本，避免分兩次執行與檔案對應混淆。")
             st.caption("V1.16.51起：60/40 OOS切點只由正式Baseline決定，所有候選出場方案共用同一切點，避免候選提早出場造成比較區間漂移。")
 
     if simple_mode=="今日雷達":
@@ -2871,7 +3055,7 @@ with st.sidebar:
     else:
         btn_label={
             "Shioaji即時引擎":"🔌 檢查本機Worker狀態",
-            "策略實驗室":"🧪 執行Baseline vs 候選策略",
+            "策略實驗室":"🏁 執行策略驗證",
             "策略凍結與即時規格":"🔒 顯示正式凍結規格",
             "長期穩健度驗證":"🧱 執行1年長期穩健度驗證",
             "長期集中度健診":"🧮 執行長期集中度健診",
@@ -3008,27 +3192,35 @@ if simple_mode=="今日雷達":
 # B線：策略實驗室
 # ============================================================
 if run and simple_mode=="進階研究" and research_mode=="策略實驗室":
-    with st.spinner("建立股票池並執行Baseline / 候選策略比較…"):
+    with st.spinner("建立股票池並執行策略驗證…"):
         _lab_pool,_lab_diag,_lab_err=build_current_formal_radar_pool(max_rank=int(lab_pool_n))
-        _lab_summary,_lab_delta,_lab_detail=run_strategy_lab(
-            _lab_pool,cost,lab_filter,int(lab_hold_days),lab_exit_mode,period="1y"
-        )
+        if lab_exit_mode=="正式三方案驗證｜Baseline vs MFE2 vs 第3日成本":
+            _lab_summary,_lab_delta,_lab_detail=run_strategy_lab_threeway(
+                _lab_pool,cost,lab_filter,period="1y"
+            )
+            _lab_validation_mode="threeway"
+        else:
+            _lab_summary,_lab_delta,_lab_detail=run_strategy_lab(
+                _lab_pool,cost,lab_filter,int(lab_hold_days),lab_exit_mode,period="1y"
+            )
+            _lab_validation_mode="single"
     st.session_state["st_v11647_strategy_lab"]={
         "pool":_lab_pool,"pool_diag":_lab_diag,"errors":_lab_err,
         "summary":_lab_summary,"delta":_lab_delta,"detail":_lab_detail,
         "filter":lab_filter,"hold":lab_hold_days,"exit_mode":lab_exit_mode,"pool_n":lab_pool_n,
         "capital":lab_capital,"alloc_pct":lab_alloc_pct,
+        "validation_mode":_lab_validation_mode,
     }
 
 if simple_mode=="進階研究" and research_mode=="策略實驗室":
-    st.markdown("## 🧪 B線策略實驗室")
-    st.caption("比較原則：同股票池、同歷史資料、同Baseline OOS切點；候選策略不得改變測試區間。")
+    st.markdown("## 🧪 B線策略實驗室｜V1.16.58 正式三方案驗證")
+    st.caption("比較原則：TOP150、同一批60m資料、同Baseline OOS切點；Baseline / MFE2 / 第3日成本一次同場驗證。")
     st.warning("這裡只做研究。正式今日雷達、Shioaji Worker與Telegram仍維持原凍結baseline。")
     st.caption("Baseline：TOP1–100＝KD黃金交叉+K<30；TOP101–150再要求S級；下一根60m Open進場；固定5個後續交易日出場。")
 
     _lab=st.session_state.get("st_v11647_strategy_lab")
     if not _lab:
-        st.info("左側設定候選條件後，按「🧪 執行Baseline vs 候選策略」。")
+        st.info("正式驗證請保留TOP150與「正式三方案驗證」，再按「🏁 執行策略驗證」。")
     else:
         if _lab.get("errors"):
             st.warning("股票池資料來源提醒："+"；".join(_lab.get("errors",[])))
@@ -3041,6 +3233,21 @@ if simple_mode=="進階研究" and research_mode=="策略實驗室":
         _sum=_lab.get("summary",pd.DataFrame())
         _delta=_lab.get("delta",pd.DataFrame())
         _detail=_lab.get("detail",pd.DataFrame())
+
+        if _lab.get("validation_mode")=="threeway" and _detail is not None and not _detail.empty:
+            _formal_validation=strategy_lab_formal_validation_summary(
+                _detail,float(_lab.get("capital",1000000))
+            )
+            if not _formal_validation.empty:
+                st.markdown("### 🏁 正式三方案驗證總表")
+                st.dataframe(_formal_validation,use_container_width=True,hide_index=True)
+                st.download_button(
+                    "⬇️ 下載正式三方案驗證總表 CSV",
+                    data=_formal_validation.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"{APP_VERSION}_正式三方案驗證總表.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
 
         if _sum is None or _sum.empty:
             st.error("本次沒有足夠交易資料可比較。")
@@ -3150,37 +3357,37 @@ if simple_mode=="進階研究" and research_mode=="策略實驗室":
                     use_container_width=True
                 )
 
-            _cand_detail=_detail[_detail["方案"]=="候選策略"].copy() if (_detail is not None and not _detail.empty and "方案" in _detail.columns) else pd.DataFrame()
-            _exit_sum=strategy_lab_exit_reason_summary(_cand_detail)
+            _candidate_schemes=[s for s in strategy_lab_scheme_order(_detail) if s!="正式Baseline"] if (_detail is not None and not _detail.empty) else []
+            _exit_frames=[]
+            _fail_frames=[]
+            for _scheme in _candidate_schemes:
+                _cand_detail=_detail[_detail["方案"]==_scheme].copy()
+                _es=strategy_lab_exit_reason_summary(_cand_detail)
+                if not _es.empty:
+                    _es.insert(0,"方案",_scheme)
+                    _exit_frames.append(_es)
+                _fs=strategy_lab_failure_exit_summary(_cand_detail)
+                if not _fs.empty:
+                    _fs.insert(0,"方案",_scheme)
+                    _fail_frames.append(_fs)
+
+            _exit_sum=pd.concat(_exit_frames,ignore_index=True) if _exit_frames else pd.DataFrame()
             if not _exit_sum.empty:
                 st.markdown("### 出場原因拆解")
                 st.dataframe(_exit_sum,use_container_width=True,hide_index=True)
-                st.caption("這張表用來判斷究竟是停利、停損還是第5日兜底在改善/拖累績效。")
 
-            _cf=strategy_lab_stop_counterfactual_summary(_cand_detail)
-            if not _cf.empty:
-                st.markdown("### 停損反事實追蹤")
-                st.dataframe(_cf,use_container_width=True,hide_index=True)
-                st.caption("停損有效比例＝實際停損結果優於同一筆交易若繼續抱到第5日的比例；越高代表停損比較像真的有幫助，而不是單純提早認賠。")
-
-            _fail_cf=strategy_lab_failure_exit_summary(_cand_detail)
+            _fail_cf=pd.concat(_fail_frames,ignore_index=True) if _fail_frames else pd.DataFrame()
             if not _fail_cf.empty:
                 st.markdown("### 時間型失敗退出追蹤")
                 st.dataframe(_fail_cf,use_container_width=True,hide_index=True)
-                st.caption("這裡直接比較：第2/3日提前退出，是否真的比同一筆交易繼續抱到第5日更好。")
+                st.caption("同場比較MFE2與第3日成本提前退出，是否真的比各自同一筆交易繼續抱到第5日更好。")
 
             oos=_sum[_sum["樣本"]=="樣本外40%"]
-            if len(oos)>=2:
-                b=oos[oos["方案"]=="正式Baseline"]
-                c=oos[oos["方案"]=="候選策略"]
-                if not b.empty and not c.empty:
-                    b=b.iloc[0]; c=c.iloc[0]
-                    st.markdown("### OOS判讀")
-                    st.caption(
-                        f"Baseline：交易 {int(b['交易數'])}｜平均淨報酬 {b['平均淨報酬%']:.3f}%｜PF {b['PF']:.3f}；"
-                        f"候選：交易 {int(c['交易數'])}｜平均淨報酬 {c['平均淨報酬%']:.3f}%｜PF {c['PF']:.3f}。"
-                    )
-                    st.info("不會只看單筆平均報酬判斷；新增固定資金利用率後，還要同時比較OOS組合報酬、資金占用與週轉效率。要納入正式版仍需TOP150、時間區塊、集中度與資料品質驗證。")
+            if not oos.empty:
+                st.markdown("### OOS判讀")
+                _oos_cols=[c for c in ["方案","交易數","勝率%","平均淨報酬%","PF","報酬中位數%"] if c in oos.columns]
+                st.dataframe(oos[_oos_cols],use_container_width=True,hide_index=True)
+                st.info("正式驗證不只看單筆平均報酬；請同時看六區塊、集中度、5%組合報酬/MDD，以及3.33/5/10%資金配置穩定性。")
 
             if _detail is not None and not _detail.empty:
                 st.download_button(
