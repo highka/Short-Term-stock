@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.16.50.1
+黑嚕嚕－短線交易雷達 ST V1.16.51
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -51,13 +51,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.50.1"
+APP_VERSION = "ST V1.16.51"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.50.1"
-EXPORT_PREFIX = "ST_V1.16.50.1"
+APP_VERSION = "ST_V1.16.51"
+EXPORT_PREFIX = "ST_V1.16.51"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -678,7 +678,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.16.50.1",
+        "strategy_version":"ST V1.16.51",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -2270,7 +2270,12 @@ def run_strategy_lab(ranked_pool: pd.DataFrame, cost: CostConfig, candidate_filt
 
     all_t=pd.concat([base,cand],ignore_index=True)
     all_t["_signal_dt"]=_as_taipei_series(all_t["訊號時間"])
-    times=pd.Series(all_t["_signal_dt"].dropna().drop_duplicates().sort_values().to_list())
+
+    # 重要：OOS切點固定由正式Baseline決定。
+    # 候選出場若提早解除non-overlap，會產生更多後續交易；
+    # 若把候選交易時間也拿來決定60/40切點，不同候選方案會得到不同OOS區間。
+    _base_times=all_t.loc[all_t["方案"]=="正式Baseline","_signal_dt"].dropna()
+    times=pd.Series(_base_times.drop_duplicates().sort_values().to_list())
     if len(times)<2:
         return pd.DataFrame(),pd.DataFrame(),all_t.drop(columns=["_signal_dt"],errors="ignore")
 
@@ -2433,6 +2438,7 @@ with st.sidebar:
                 st.caption("KD動態出場皆以第5個後續交易日最後一根60分K收盤作最晚兜底。")
             st.caption("KD停利/停損皆用完成60分K確認；觸發後在下一根60分K Open模擬出場，並追蹤『若不停損抱到第5日』的反事實結果。")
             st.caption("30/50檔適合快速篩選；要考慮納入正式策略，至少再跑TOP150與OOS/時間區塊/集中度驗證。")
+            st.caption("V1.16.51起：60/40 OOS切點只由正式Baseline決定，所有候選出場方案共用同一切點，避免候選提早出場造成比較區間漂移。")
 
     if simple_mode=="今日雷達":
         btn_label="🔄 更新今日雷達"
@@ -2589,6 +2595,7 @@ if run and simple_mode=="進階研究" and research_mode=="策略實驗室":
 
 if simple_mode=="進階研究" and research_mode=="策略實驗室":
     st.markdown("## 🧪 B線策略實驗室")
+    st.caption("比較原則：同股票池、同歷史資料、同Baseline OOS切點；候選策略不得改變測試區間。")
     st.warning("這裡只做研究。正式今日雷達、Shioaji Worker與Telegram仍維持原凍結baseline。")
     st.caption("Baseline：TOP1–100＝KD黃金交叉+K<30；TOP101–150再要求S級；下一根60m Open進場；固定5個後續交易日出場。")
 
