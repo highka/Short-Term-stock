@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.16.51
+黑嚕嚕－短線交易雷達 ST V1.16.52
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -51,13 +51,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.51"
+APP_VERSION = "ST V1.16.52"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.51"
-EXPORT_PREFIX = "ST_V1.16.51"
+APP_VERSION = "ST_V1.16.52"
+EXPORT_PREFIX = "ST_V1.16.52"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -678,7 +678,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.16.51",
+        "strategy_version":"ST V1.16.52",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -1955,16 +1955,25 @@ def find_dynamic_exit(
       Close >= 進場價 且 K>80 且當根KD死亡交叉
       -> 下一根60m Open出場
 
-    停損研究版本：
+    價格型停損研究：
       A. 連續2根60m Close < 進場價 且目前K<D
       B. Close <= 進場價 * 0.97 且目前K<D
       C. Close <= 進場價 * 0.95 且目前K<D
 
+    時間型失敗研究：
+      D. 進場後第2個交易日最後一根60m完成時：
+         自進場起MFE < +2%，且K<D -> 下一根60m Open出場
+      E. 進場後第2個交易日最後一根60m完成時：
+         自進場起MFE < +3%，且K<D -> 下一根60m Open出場
+      F. 進場後第3個交易日最後一根60m完成時：
+         Close < 進場價，且K<D -> 下一根60m Open出場
+
     兜底：
       第5個後續交易日最後一根60m Close出場
 
-    為避免look-ahead：
-      KD/價格條件需等完成K棒後確認，實際成交用下一根60m Open。
+    避免look-ahead：
+      所有KD/價格/MFE條件都等該60分K完成後確認，
+      實際模擬成交使用下一根60m Open。
     """
     if d is None or d.empty or entry_i>=len(d):
         return None,None,None
@@ -1972,18 +1981,32 @@ def find_dynamic_exit(
     x=add_kd_death_cross_flags(d)
     entry_date=pd.Timestamp(x.index[entry_i]).date()
 
-    # 第5個後續交易日最後一根bar
+    # 後續交易日
     trade_dates=[]
     for j in range(entry_i, len(x)):
         dt=pd.Timestamp(x.index[j]).date()
         if dt>entry_date and dt not in trade_dates:
             trade_dates.append(dt)
+
+    # 第5個後續交易日最後一根bar
     fallback_date=trade_dates[max_hold_days-1] if len(trade_dates)>=max_hold_days else None
     fallback_i=None
     if fallback_date is not None:
         idxs=[j for j in range(entry_i, len(x)) if pd.Timestamp(x.index[j]).date()==fallback_date]
         if idxs:
             fallback_i=max(idxs)
+
+    # 第2 / 第3 後續交易日最後一根bar
+    day2_last_i=None
+    day3_last_i=None
+    if len(trade_dates)>=2:
+        idxs=[j for j in range(entry_i, len(x)) if pd.Timestamp(x.index[j]).date()==trade_dates[1]]
+        if idxs:
+            day2_last_i=max(idxs)
+    if len(trade_dates)>=3:
+        idxs=[j for j in range(entry_i, len(x)) if pd.Timestamp(x.index[j]).date()==trade_dates[2]]
+        if idxs:
+            day3_last_i=max(idxs)
 
     below_entry_streak=0
 
@@ -2001,12 +2024,18 @@ def find_dynamic_exit(
         else:
             below_entry_streak = 0
 
-        # 停利：保留目前已驗證版本
+        # 自進場到目前已完成bar的MFE
+        path_high=pd.to_numeric(x["High"].iloc[entry_i:j+1],errors="coerce")
+        mfe_pct=(float(path_high.max())/entry_price-1)*100 if path_high.notna().any() else np.nan
+
         take_profit = (
             exit_mode in [
                 "KD停利+2根跌破停損+5日兜底",
                 "KD停利+-3%停損+5日兜底",
                 "KD停利+-5%停損+5日兜底",
+                "KD停利+第2日MFE<2%失敗退出+5日兜底",
+                "KD停利+第2日MFE<3%失敗退出+5日兜底",
+                "KD停利+第3日未站回成本失敗退出+5日兜底",
                 "只測KD停利+5日兜底",
             ]
             and np.isfinite(close) and close>=entry_price
@@ -2014,7 +2043,6 @@ def find_dynamic_exit(
             and dead
         )
 
-        # 停損：完成60m後確認，下一根Open成交
         stop_2bars = (
             exit_mode=="KD停利+2根跌破停損+5日兜底"
             and below_entry_streak>=2
@@ -2031,6 +2059,25 @@ def find_dynamic_exit(
             and np.isfinite(k) and np.isfinite(dd) and k<dd
         )
 
+        fail_day2_mfe2 = (
+            exit_mode=="KD停利+第2日MFE<2%失敗退出+5日兜底"
+            and day2_last_i is not None and j==day2_last_i
+            and np.isfinite(mfe_pct) and mfe_pct<2.0
+            and np.isfinite(k) and np.isfinite(dd) and k<dd
+        )
+        fail_day2_mfe3 = (
+            exit_mode=="KD停利+第2日MFE<3%失敗退出+5日兜底"
+            and day2_last_i is not None and j==day2_last_i
+            and np.isfinite(mfe_pct) and mfe_pct<3.0
+            and np.isfinite(k) and np.isfinite(dd) and k<dd
+        )
+        fail_day3_cost = (
+            exit_mode=="KD停利+第3日未站回成本失敗退出+5日兜底"
+            and day3_last_i is not None and j==day3_last_i
+            and np.isfinite(close) and close<entry_price
+            and np.isfinite(k) and np.isfinite(dd) and k<dd
+        )
+
         if j+1>=len(x):
             break
 
@@ -2042,6 +2089,12 @@ def find_dynamic_exit(
             return j+1, "-3%且K<D停損", "open"
         if stop_5pct:
             return j+1, "-5%且K<D停損", "open"
+        if fail_day2_mfe2:
+            return j+1, "第2日MFE<2%且K<D失敗退出", "open"
+        if fail_day2_mfe3:
+            return j+1, "第2日MFE<3%且K<D失敗退出", "open"
+        if fail_day3_cost:
+            return j+1, "第3日未站回成本且K<D失敗退出", "open"
 
     if fallback_i is not None:
         return fallback_i, "第5日兜底", "close"
@@ -2212,6 +2265,32 @@ def strategy_lab_stop_counterfactual_summary(trades: pd.DataFrame) -> pd.DataFra
 
 
 
+
+def strategy_lab_failure_exit_summary(trades: pd.DataFrame) -> pd.DataFrame:
+    """時間型失敗退出：比較實際退出 vs 若繼續抱到第5日。"""
+    if trades is None or trades.empty or "出場原因" not in trades.columns:
+        return pd.DataFrame()
+    x=trades[trades["出場原因"].astype(str).str.contains("失敗退出",na=False)].copy()
+    if x.empty:
+        return pd.DataFrame()
+
+    rows=[]
+    for sample,g in x.groupby("樣本"):
+        actual=pd.to_numeric(g["淨報酬%"],errors="coerce")
+        cf=pd.to_numeric(g["若抱到第5日淨報酬%"],errors="coerce")
+        improve=cf*-1 + actual  # actual - cf
+        rows.append({
+            "樣本":sample,
+            "失敗退出筆數":int(len(g)),
+            "實際退出平均淨報酬%":float(actual.mean()) if actual.notna().any() else np.nan,
+            "若抱到第5日平均淨報酬%":float(cf.mean()) if cf.notna().any() else np.nan,
+            "提前退出平均改善pp":float(improve.mean()) if improve.notna().any() else np.nan,
+            "提前退出有效比例%":float((improve>0).mean()*100) if improve.notna().any() else np.nan,
+            "若續抱最後轉正比例%":float((cf>0).mean()*100) if cf.notna().any() else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
 def strategy_lab_metrics(trades: pd.DataFrame) -> dict:
     if trades is None or trades.empty:
         return {"交易數":0,"勝率%":np.nan,"平均淨報酬%":np.nan,"PF":np.nan,"報酬中位數%":np.nan}
@@ -2377,7 +2456,7 @@ with st.sidebar:
         )
         captions={
             "Shioaji即時引擎":"Stage 4.4：Supabase共享狀態正式化；支援新版Publishable/Secret Key並保留舊Key相容。",
-            "策略實驗室":"B線研究區：正式baseline鎖定；可測2根跌破、-3%、-5%三種延遲停損與停損反事實，不影響今日雷達與Worker。",
+            "策略實驗室":"B線研究區：正式baseline鎖定；新增第2/3日時間型失敗退出，並保留價格型停損做對照，不影響今日雷達與Worker。",
             "策略凍結與即時規格":"查看正式凍結參數與未來 Shioaji 即時行情架構。",
             "長期穩健度驗證":"固定正式策略，以1y 60m資料、最後9mo評估與6段時間檢查長期穩健度。",
             "長期集中度健診":"沿用長期樣本，檢查月度、股票貢獻與Top貢獻集中度。"
@@ -2410,7 +2489,7 @@ with st.sidebar:
 
     lab_filter="無（正式baseline）"
     lab_hold_days=5
-    lab_exit_mode="KD停利+2根跌破停損+5日兜底"
+    lab_exit_mode="KD停利+第2日MFE<2%失敗退出+5日兜底"
     lab_pool_n=50
     if simple_mode=="進階研究" and research_mode=="策略實驗室":
         with st.expander("🧪 B線策略實驗設定", expanded=True):
@@ -2423,6 +2502,9 @@ with st.sidebar:
             lab_exit_mode=st.selectbox(
                 "候選出場方式",
                 [
+                    "KD停利+第2日MFE<2%失敗退出+5日兜底",
+                    "KD停利+第2日MFE<3%失敗退出+5日兜底",
+                    "KD停利+第3日未站回成本失敗退出+5日兜底",
                     "KD停利+2根跌破停損+5日兜底",
                     "KD停利+-3%停損+5日兜底",
                     "KD停利+-5%停損+5日兜底",
@@ -2436,7 +2518,7 @@ with st.sidebar:
                 lab_hold_days=st.select_slider("候選固定持有天數", options=[3,4,5,6,7], value=5)
             else:
                 st.caption("KD動態出場皆以第5個後續交易日最後一根60分K收盤作最晚兜底。")
-            st.caption("KD停利/停損皆用完成60分K確認；觸發後在下一根60分K Open模擬出場，並追蹤『若不停損抱到第5日』的反事實結果。")
+            st.caption("KD停利、價格型停損與時間型失敗退出都用完成60分K確認；觸發後在下一根60分K Open模擬出場。")
             st.caption("30/50檔適合快速篩選；要考慮納入正式策略，至少再跑TOP150與OOS/時間區塊/集中度驗證。")
             st.caption("V1.16.51起：60/40 OOS切點只由正式Baseline決定，所有候選出場方案共用同一切點，避免候選提早出場造成比較區間漂移。")
 
@@ -2637,6 +2719,12 @@ if simple_mode=="進階研究" and research_mode=="策略實驗室":
                 st.markdown("### 停損反事實追蹤")
                 st.dataframe(_cf,use_container_width=True,hide_index=True)
                 st.caption("停損有效比例＝實際停損結果優於同一筆交易若繼續抱到第5日的比例；越高代表停損比較像真的有幫助，而不是單純提早認賠。")
+
+            _fail_cf=strategy_lab_failure_exit_summary(_cand_detail)
+            if not _fail_cf.empty:
+                st.markdown("### 時間型失敗退出追蹤")
+                st.dataframe(_fail_cf,use_container_width=True,hide_index=True)
+                st.caption("這裡直接比較：第2/3日提前退出，是否真的比同一筆交易繼續抱到第5日更好。")
 
             oos=_sum[_sum["樣本"]=="樣本外40%"]
             if len(oos)>=2:
