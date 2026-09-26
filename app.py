@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.16.44
+黑嚕嚕－短線交易雷達 ST V1.16.46
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -39,6 +39,7 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 import urllib.request
+import urllib.parse
 import json
 
 warnings.filterwarnings("ignore")
@@ -50,13 +51,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.44"
+APP_VERSION = "ST V1.16.46"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.44"
-EXPORT_PREFIX = "ST_V1.16.44"
+APP_VERSION = "ST_V1.16.46"
+EXPORT_PREFIX = "ST_V1.16.46"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -677,7 +678,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.16.44",
+        "strategy_version":"ST V1.16.46",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -1709,21 +1710,103 @@ SECTOR_POOLS = {
 
 
 
+
+def get_supabase_read_config():
+    """Streamlit Cloud讀取共享狀態：優先新版Publishable Key，並相容舊anon key。"""
+    url=""
+    key=""
+    try:
+        if "supabase" in st.secrets:
+            sec=st.secrets["supabase"]
+            url=str(sec.get("url","")).strip().rstrip("/")
+            key=str(sec.get("publishable_key","") or sec.get("anon_key","")).strip()
+    except Exception:
+        pass
+    url=url or str(os.getenv("SUPABASE_URL","")).strip().rstrip("/")
+    key=key or str(os.getenv("SUPABASE_PUBLISHABLE_KEY","") or os.getenv("SUPABASE_ANON_KEY","")).strip()
+    return url,key
+
+
+def read_supabase_runtime():
+    """
+    從共享資料表讀 status / sim_positions / sim_pending。
+    回傳 (data,error)；不會把金鑰寫入畫面。
+    """
+    url,key=get_supabase_read_config()
+    if not url or not key:
+        return {}, "SHARED_NOT_CONFIGURED"
+
+    try:
+        endpoint=(
+            f"{url}/rest/v1/heylulu_runtime"
+            "?select=key,payload,updated_at"
+            "&key=in.(status,sim_positions,sim_pending)"
+        )
+        req=urllib.request.Request(
+            endpoint,
+            headers={
+                "apikey":key,
+                "Authorization":f"Bearer {key}",
+                "Accept":"application/json",
+            },
+        )
+        with urllib.request.urlopen(req,timeout=12) as resp:
+            rows=json.loads(resp.read().decode("utf-8"))
+
+        out={"_source":"supabase"}
+        for row in rows if isinstance(rows,list) else []:
+            k=str(row.get("key",""))
+            out[k]=row.get("payload",{})
+            out[f"{k}_updated_at"]=row.get("updated_at","")
+        return out,None
+    except Exception as e:
+        return {}, f"SHARED_READ_ERROR: {type(e).__name__}: {e}"
+
+
+def read_worker_runtime_unified():
+    """
+    優先讀本機runtime；若不存在則讀Supabase共享狀態。
+    """
+    local_status,local_err=read_shioaji_worker_status()
+    if local_status:
+        return {
+            "status":local_status,
+            "sim_positions":read_worker_json("runtime/sim_positions.json"),
+            "sim_pending":read_worker_json("runtime/sim_pending_entries.json"),
+            "_source":"local",
+        },None
+
+    shared,shared_err=read_supabase_runtime()
+    if shared and shared.get("status"):
+        return {
+            "status":shared.get("status",{}),
+            "sim_positions":shared.get("sim_positions",{}),
+            "sim_pending":shared.get("sim_pending",{}),
+            "_source":"supabase",
+            "status_updated_at":shared.get("status_updated_at",""),
+        },None
+
+    return {}, shared_err or local_err or "NO_RUNTIME_SOURCE"
+
+
 def diagnose_worker_runtime():
     """
-    診斷目前Streamlit執行環境為何讀不到本機Worker runtime。
-    不把「Cloud看不到Windows本機」誤判成使用者放錯檔案。
+    診斷Streamlit目前為何讀不到Worker。
+    會區分：本機runtime、Cloud但未設定共享橋接、共享橋接已設定但Worker未上傳、共享橋接正常。
     """
     cwd = Path.cwd()
     runtime_dir = cwd / "runtime"
     status_path = runtime_dir / "shioaji_status.json"
-
     cwd_text = str(cwd).replace("\\", "/")
     likely_cloud = (
         cwd_text.startswith("/mount/src/")
         or cwd_text.startswith("/home/adminuser/")
         or bool(os.getenv("STREAMLIT_SHARING_MODE"))
     )
+
+    supa_url,supa_key=get_supabase_read_config()
+    shared_configured=bool(supa_url and supa_key)
+    unified,unified_err=read_worker_runtime_unified()
 
     result = {
         "cwd": str(cwd),
@@ -1732,39 +1815,46 @@ def diagnose_worker_runtime():
         "runtime_exists": runtime_dir.exists(),
         "status_exists": status_path.exists(),
         "likely_cloud": likely_cloud,
+        "shared_configured": shared_configured,
+        "shared_source": unified.get("_source","") if unified else "",
         "diagnosis": "",
         "suggestion": "",
+        "level": "info",
     }
 
-    if status_path.exists():
-        result["diagnosis"] = "OK：目前Streamlit可以讀到Worker狀態檔。"
-        result["suggestion"] = "Worker與Streamlit資料來源已接通。"
+    if unified and unified.get("status"):
+        src=unified.get("_source","")
+        if src=="local":
+            result["diagnosis"]="OK：Streamlit正在直接讀取同一台機器的Worker狀態。"
+        else:
+            result["diagnosis"]="OK：Streamlit Cloud已透過Supabase共享橋接讀到Windows Worker狀態。"
+        result["suggestion"]="共享狀態已接通，可由自動刷新持續更新。"
+        result["level"]="success"
         return result
 
-    if likely_cloud:
-        result["diagnosis"] = (
-            "目前App很可能跑在Streamlit Cloud，而Worker跑在你的Windows電腦；"
-            "這兩台機器不是同一個檔案系統，所以Cloud看不到Windows的runtime。"
-        )
-        result["suggestion"] = (
-            "這通常不是你把檔案放錯地方。下一階段要接共享資料層，"
-            "讓Windows Worker把狀態寫到雲端，Streamlit Cloud再讀取。"
-        )
+    if likely_cloud and not shared_configured:
+        result["diagnosis"]="Streamlit Cloud與Windows Worker分屬不同機器，目前尚未設定共享資料橋接。"
+        result["suggestion"]="不是檔案放錯。請在Streamlit Secrets加入Supabase URL與Publishable Key，並在Windows .env加入URL與Secret Key。"
+        result["level"]="warning"
+        return result
+
+    if likely_cloud and shared_configured:
+        result["diagnosis"]="Supabase共享橋接已設定，但目前尚未讀到Worker上傳的狀態。"
+        result["suggestion"]="請確認Windows Worker已更新到V1.16.45並正在執行；也可檢查Supabase heylulu_runtime資料表是否已有status資料列。"
+        result["level"]="warning"
         return result
 
     if not runtime_dir.exists():
-        result["diagnosis"] = "本機Streamlit目前找不到 runtime 資料夾。"
-        result["suggestion"] = (
-            "若Streamlit與Worker都在同一台電腦，請確認app.py與Worker使用同一個專案根目錄，"
-            "或把Worker產生的runtime資料夾放在目前App工作目錄下。"
-        )
+        result["diagnosis"]="本機Streamlit目前找不到runtime資料夾。"
+        result["suggestion"]="若Streamlit與Worker在同一台電腦，請確認app.py與Worker使用同一個專案根目錄。"
+        result["level"]="warning"
         return result
 
-    result["diagnosis"] = "runtime資料夾存在，但 shioaji_status.json 不存在。"
-    result["suggestion"] = (
-        "請確認Worker是否真的有啟動並成功寫入狀態；也可能是Worker與App指向不同的runtime資料夾。"
-    )
+    result["diagnosis"]="runtime資料夾存在，但shioaji_status.json不存在。"
+    result["suggestion"]="請確認Worker是否已啟動並成功寫入狀態，或Worker與App是否指向不同runtime路徑。"
+    result["level"]="warning"
     return result
+
 
 
 def market_breadth_interpretation(row):
@@ -1861,7 +1951,7 @@ with st.sidebar:
             index=0
         )
         captions={
-            "Shioaji即時引擎":"Stage 4.2：加入Worker狀態診斷與市場廣度解讀；可判斷是Cloud/本機路徑/檔案缺失問題。",
+            "Shioaji即時引擎":"Stage 4.4：Supabase共享狀態正式化；支援新版Publishable/Secret Key並保留舊Key相容。",
             "策略凍結與即時規格":"查看正式凍結參數與未來 Shioaji 即時行情架構。",
             "長期穩健度驗證":"固定正式策略，以1y 60m資料、最後9mo評估與6段時間檢查長期穩健度。",
             "長期集中度健診":"沿用長期樣本，檢查月度、股票貢獻與Top貢獻集中度。"
@@ -2032,7 +2122,7 @@ if simple_mode=="今日雷達":
 # ============================================================
 
 if simple_mode=="進階研究" and research_mode=="Shioaji即時引擎":
-    st.markdown("## 🧪 Shioaji Stage 4.2｜模擬交易＋連線診斷")
+    st.markdown("## 🧪 Shioaji Stage 4.4｜模擬交易＋雲端共享狀態")
     st.warning("Stage 4 只做程式內模擬成交，不呼叫Shioaji place_order/update_order/cancel_order。正式訊號在下一根60m K第一筆Tick模擬建倉，建倉/出場後可推送Telegram。")
 
     st.markdown("### 操作檢查表")
@@ -2040,12 +2130,12 @@ if simple_mode=="進階研究" and research_mode=="Shioaji即時引擎":
 
     st.markdown("### 🔎 Worker連線診斷")
     _diag=diagnose_worker_runtime()
-    if _diag["status_exists"]:
+    if _diag["level"]=="success":
         st.success(_diag["diagnosis"])
-    elif _diag["likely_cloud"]:
-        st.info(_diag["diagnosis"])
-    else:
+    elif _diag["level"]=="warning":
         st.warning(_diag["diagnosis"])
+    else:
+        st.info(_diag["diagnosis"])
 
     st.caption(_diag["suggestion"])
     with st.expander("查看診斷路徑"):
@@ -2055,7 +2145,9 @@ if simple_mode=="進階研究" and research_mode=="Shioaji即時引擎":
             f"預期狀態檔：{_diag['status_path']}\n"
             f"runtime存在：{_diag['runtime_exists']}\n"
             f"status存在：{_diag['status_exists']}\n"
-            f"推測Cloud環境：{_diag['likely_cloud']}"
+            f"推測Cloud環境：{_diag['likely_cloud']}\n"
+            f"共享橋接已設定：{_diag['shared_configured']}\n"
+            f"目前共享來源：{_diag['shared_source']}"
         )
 
     st.markdown("### Worker 即時狀態")
@@ -2067,29 +2159,24 @@ if simple_mode=="進階研究" and research_mode=="Shioaji即時引擎":
 
     @st.fragment(run_every=_refresh_sec)
     def render_worker_live_panel():
-        status,err=read_shioaji_worker_status()
-        st.session_state["st_v11643_shioaji_status"]={"status":status,"error":err}
+        runtime,err=read_worker_runtime_unified()
+        status=runtime.get("status",{}) if runtime else {}
+        _source=runtime.get("_source","") if runtime else ""
 
-        if err:
-            st.info(
-                "目前這個 Streamlit 執行環境沒有讀到 Worker 狀態檔。"
-                "如果 app 在 Streamlit Cloud、Worker 跑在你的 Windows 電腦，Cloud 仍無法直接讀本機 runtime；"
-                "自動刷新只會重新讀目前 Streamlit 能存取的資料來源。"
-            )
-            st.caption(f"偵測結果：{err}")
+        if err or not status:
+            st.info("目前尚未取得Worker共享狀態。請查看上方【Worker連線診斷】。")
+            if err:
+                st.caption(f"偵測結果：{err}")
             return
 
-        if not status:
-            st.info("尚未取得 Worker 狀態。")
-            return
-
+        source_label="本機runtime" if _source=="local" else "Supabase共享狀態"
         phase=str(status.get("phase",""))
         if phase in ["running","subscribed"]:
-            st.success(f"Worker 狀態：{phase}")
+            st.success(f"Worker 狀態：{phase}｜來源：{source_label}")
         elif phase=="error":
             st.error(str(status.get("message","Worker發生錯誤")))
         else:
-            st.info(f"Worker 狀態：{phase}")
+            st.info(f"Worker 狀態：{phase}｜來源：{source_label}")
 
         st.dataframe(
             shioaji_stage1_status_table(status),
@@ -2097,8 +2184,8 @@ if simple_mode=="進階研究" and research_mode=="Shioaji即時引擎":
             hide_index=True
         )
 
-        _sim_positions=read_worker_json("runtime/sim_positions.json")
-        _sim_pending=read_worker_json("runtime/sim_pending_entries.json")
+        _sim_positions=runtime.get("sim_positions",{}) if runtime else {}
+        _sim_pending=runtime.get("sim_pending",{}) if runtime else {}
 
         c1,c2,c3,c4=st.columns(4)
         c1.metric("模擬持倉", len(_sim_positions) if isinstance(_sim_positions,dict) else 0)
@@ -2108,16 +2195,14 @@ if simple_mode=="進階研究" and research_mode=="Shioaji即時引擎":
 
         if isinstance(_sim_positions,dict) and _sim_positions:
             st.markdown("#### 🧪 模擬持倉")
-            _sp=pd.DataFrame(list(_sim_positions.values()))
-            st.dataframe(_sp,use_container_width=True,hide_index=True)
+            st.dataframe(pd.DataFrame(list(_sim_positions.values())),use_container_width=True,hide_index=True)
 
         if isinstance(_sim_pending,dict) and _sim_pending:
             st.markdown("#### ⏳ 待模擬進場")
-            _pe=pd.DataFrame(list(_sim_pending.values()))
-            st.dataframe(_pe,use_container_width=True,hide_index=True)
+            st.dataframe(pd.DataFrame(list(_sim_pending.values())),use_container_width=True,hide_index=True)
 
         _now_tw=pd.Timestamp.now(tz="Asia/Taipei")
-        st.caption(f"畫面更新時間：{_now_tw.strftime('%Y-%m-%d %H:%M:%S')}")
+        st.caption(f"畫面更新時間：{_now_tw.strftime('%Y-%m-%d %H:%M:%S')}｜資料來源：{source_label}")
 
     render_worker_live_panel()
 
