@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.16.61
+黑嚕嚕－短線交易雷達 ST V1.16.62
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -51,13 +51,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.61"
+APP_VERSION = "ST V1.16.62"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.61"
-EXPORT_PREFIX = "ST_V1.16.61"
+APP_VERSION = "ST_V1.16.62"
+EXPORT_PREFIX = "ST_V1.16.62"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -678,7 +678,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.16.61",
+        "strategy_version":"ST V1.16.62",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -3586,6 +3586,99 @@ def strategy_lab_walkforward_summary(compare_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+
+def strategy_lab_regime_summary(compare_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    依Baseline該時間窗自身報酬分成正/負報酬窗，
+    檢查候選B在順風與逆風期的相對穩健性。
+    """
+    if compare_df is None or compare_df.empty:
+        return pd.DataFrame()
+
+    x=compare_df.copy()
+    x["市場窗分類"]=np.where(
+        pd.to_numeric(x["Baseline組合報酬%"],errors="coerce") < 0,
+        "Baseline負報酬窗",
+        "Baseline正報酬窗"
+    )
+
+    rows=[]
+    for label,g in x.groupby("市場窗分類",dropna=False):
+        delta=pd.to_numeric(g["候選B相對報酬pp"],errors="coerce")
+        rows.append({
+            "市場窗分類":label,
+            "時間窗數":int(len(g)),
+            "候選B報酬勝出窗數":int(g["候選B報酬較高"].sum()),
+            "候選B報酬勝出率%":float(g["候選B報酬較高"].mean()*100),
+            "候選B相對報酬平均pp":float(delta.mean()),
+            "候選B相對報酬中位數pp":float(delta.median()),
+            "候選B最差相對報酬pp":float(delta.min()),
+            "候選B_MDD不劣率%":float(g["候選B_MDD不高於Baseline"].mean()*100),
+            "候選B報酬MDD勝出率%":float(g["候選B報酬MDD較高"].mean()*100),
+        })
+    return pd.DataFrame(rows)
+
+
+def strategy_lab_final_gate(
+    wf_summary: pd.DataFrame,
+    wf_compare: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    只做『研究狀態』判讀，不直接修改正式策略。
+    門檻是預先明示的研究門檻，避免看完結果再調：
+    - 全部時間窗報酬勝出率 >= 75%
+    - 全部時間窗報酬/MDD勝出率 >= 65%
+    - 最差相對報酬 >= -5pp
+    - Rolling 12M 報酬勝出率 >= 80%
+    - Baseline正報酬窗勝出率 >= 80%
+    """
+    if wf_summary is None or wf_summary.empty or wf_compare is None or wf_compare.empty:
+        return pd.DataFrame()
+
+    s=wf_summary.set_index("驗證家族")
+    regime=strategy_lab_regime_summary(wf_compare)
+    r=regime.set_index("市場窗分類") if not regime.empty else pd.DataFrame()
+
+    def val(df, idx, col):
+        try:
+            return float(df.loc[idx,col])
+        except Exception:
+            return np.nan
+
+    checks=[
+        ("全部時間窗報酬勝出率>=75%", val(s,"全部時間窗","候選B報酬勝出率%"), 75.0, ">="),
+        ("全部時間窗報酬/MDD勝出率>=65%", val(s,"全部時間窗","候選B報酬MDD勝出率%"), 65.0, ">="),
+        ("全部時間窗最差相對報酬>=-5pp", val(s,"全部時間窗","最差相對報酬pp"), -5.0, ">="),
+        ("Rolling12M報酬勝出率>=80%", val(s,"Rolling 12M","候選B報酬勝出率%"), 80.0, ">="),
+        ("Baseline正報酬窗勝出率>=80%", val(r,"Baseline正報酬窗","候選B報酬勝出率%"), 80.0, ">="),
+    ]
+
+    rows=[]
+    passed=0
+    for name,actual,threshold,op in checks:
+        ok=bool(pd.notna(actual) and actual>=threshold)
+        passed += int(ok)
+        rows.append({
+            "檢查項目":name,
+            "實際值":actual,
+            "門檻":threshold,
+            "結果":"PASS" if ok else "FAIL"
+        })
+
+    status = (
+        "可進入Shadow forward驗證"
+        if passed==len(checks)
+        else "維持研究候選"
+    )
+    rows.append({
+        "檢查項目":"整體研究狀態",
+        "實際值":passed,
+        "門檻":len(checks),
+        "結果":status
+    })
+    return pd.DataFrame(rows)
+
+
 def strategy_lab_formal_validation_summary(
     detail: pd.DataFrame,
     initial_capital: float,
@@ -3945,8 +4038,8 @@ if run and simple_mode=="進階研究" and research_mode=="策略實驗室":
     }
 
 if simple_mode=="進階研究" and research_mode=="策略實驗室":
-    st.markdown("## 🧪 B線策略實驗室｜V1.16.61 Walk-forward 定版驗證")
-    st.caption("比較原則：規則完全凍結，TOP150改用2年60m資料；Baseline與候選B固定5%配置，驗證前/中/後三段與Rolling 6/9/12M。")
+    st.markdown("## 🧪 B線策略實驗室｜V1.16.62 最終定版Gate")
+    st.caption("比較原則：規則完全凍結；用2年Walk-forward結果做市場窗分類與最終研究Gate，不再調整候選B參數。")
     st.info("V1.16.61使用2年60分K，第一次執行會比前一版久；這一版不新增退出條件、不調整候選B參數。")
     st.caption("V1.16.59.1修正：三方案驗證函式所有返回路徑統一回傳4個值，避免ValueError解包失敗。")
     st.warning("這裡只做研究。正式今日雷達、Shioaji Worker與Telegram仍維持原凍結baseline。")
@@ -4004,6 +4097,34 @@ if simple_mode=="進階研究" and research_mode=="策略實驗室":
                         mime="text/csv",
                         use_container_width=True
                     )
+
+                    _regime_summary=strategy_lab_regime_summary(_wf_compare)
+                    if not _regime_summary.empty:
+                        st.markdown("#### 市場窗分類：Baseline正報酬 vs 負報酬")
+                        st.dataframe(_regime_summary,use_container_width=True,hide_index=True)
+                        st.download_button(
+                            "⬇️ 下載市場窗分類 CSV",
+                            data=_regime_summary.to_csv(index=False).encode("utf-8-sig"),
+                            file_name=f"{APP_VERSION}_市場窗分類.csv",
+                            mime="text/csv",
+                            use_container_width=True
+                        )
+
+                    _final_gate=strategy_lab_final_gate(_wf_summary,_wf_compare)
+                    if not _final_gate.empty:
+                        st.markdown("#### 最終研究Gate")
+                        st.dataframe(_final_gate,use_container_width=True,hide_index=True)
+                        st.caption(
+                            "這個Gate只決定是否進入Shadow forward驗證；"
+                            "不會自動修改正式Baseline、Worker或Telegram。"
+                        )
+                        st.download_button(
+                            "⬇️ 下載最終研究Gate CSV",
+                            data=_final_gate.to_csv(index=False).encode("utf-8-sig"),
+                            file_name=f"{APP_VERSION}_最終研究Gate.csv",
+                            mime="text/csv",
+                            use_container_width=True
+                        )
 
                 if not _wf_compare.empty:
                     st.markdown("#### 每個時間窗 Baseline vs 候選B")
