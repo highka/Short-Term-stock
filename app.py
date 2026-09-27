@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.16.60
+黑嚕嚕－短線交易雷達 ST V1.16.61
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -51,13 +51,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.60"
+APP_VERSION = "ST V1.16.61"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.60"
-EXPORT_PREFIX = "ST_V1.16.60"
+APP_VERSION = "ST_V1.16.61"
+EXPORT_PREFIX = "ST_V1.16.61"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -678,7 +678,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.16.60",
+        "strategy_version":"ST V1.16.61",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -3387,6 +3387,205 @@ def strategy_lab_candidate_b_capacity_summary(
     return pd.DataFrame(rows)
 
 
+
+def _strategy_lab_window_pair(
+    detail: pd.DataFrame,
+    start_ts,
+    end_ts,
+    initial_capital: float,
+    label: str,
+    family: str,
+) -> list:
+    """同一時間窗比較 Baseline vs 候選B；固定5%配置、流動性排名優先。"""
+    if detail is None or detail.empty:
+        return []
+
+    x=detail.copy()
+    x["_signal_dt"]=_as_taipei_series(x["訊號時間"])
+    x=x.dropna(subset=["_signal_dt"]).copy()
+    x=x[(x["_signal_dt"]>=start_ts)&(x["_signal_dt"]<end_ts)].copy()
+    if x.empty:
+        return []
+
+    rows=[]
+    for scheme in ["正式Baseline","候選B｜第3日未站回成本"]:
+        g=x[x["方案"]==scheme].copy()
+        if g.empty:
+            continue
+
+        trade_m=strategy_lab_metrics(g)
+        cap_m,_=strategy_lab_capital_priority_sim(
+            g,
+            float(initial_capital),
+            0.05,
+            priority_mode="流動性排名優先",
+            random_seed=11661
+        )
+        rows.append({
+            "驗證家族":family,
+            "時間窗":label,
+            "開始":start_ts,
+            "結束":end_ts,
+            "方案":scheme,
+            "交易數":trade_m["交易數"],
+            "勝率%":trade_m["勝率%"],
+            "平均淨報酬%":trade_m["平均淨報酬%"],
+            "PF":trade_m["PF"],
+            "5%組合報酬%":cap_m["組合報酬%"],
+            "5%已實現MDD%":cap_m["已實現MDD%"],
+            "5%報酬/MDD":cap_m["報酬/MDD"],
+            "5%實際進場筆數":cap_m["實際進場筆數"],
+            "5%資金不足略過":cap_m["資金不足略過"],
+        })
+    return rows
+
+
+def strategy_lab_walkforward_windows(
+    detail: pd.DataFrame,
+    initial_capital: float,
+) -> pd.DataFrame:
+    """
+    V1.16.61 多時間窗穩健性：
+    1) 全期間切成前/中/後三段
+    2) Rolling 6M / 9M / 12M，步進3個月
+    規則完全固定，不在各視窗重新調參。
+    """
+    if detail is None or detail.empty:
+        return pd.DataFrame()
+
+    x=detail.copy()
+    x["_signal_dt"]=_as_taipei_series(x["訊號時間"])
+    base_times=x.loc[x["方案"]=="正式Baseline","_signal_dt"].dropna().sort_values()
+    if base_times.empty:
+        return pd.DataFrame()
+
+    min_t=base_times.min()
+    max_t=base_times.max()
+    max_exclusive=max_t + pd.Timedelta(seconds=1)
+
+    rows=[]
+
+    # 前 / 中 / 後三段
+    edges=pd.date_range(min_t,max_exclusive,periods=4)
+    for i,label in enumerate(["前段","中段","後段"]):
+        rows.extend(_strategy_lab_window_pair(
+            x,edges[i],edges[i+1],initial_capital,label,"三等分"
+        ))
+
+    # Rolling 6 / 9 / 12M；每3個月往前推
+    base_start=pd.Timestamp(min_t).floor("D")
+    for months in (6,9,12):
+        start=base_start
+        idx=1
+        last_start=None
+
+        while True:
+            end=start + pd.DateOffset(months=months)
+            if end > max_exclusive:
+                break
+            label=f"{months}M-{idx:02d}"
+            rows.extend(_strategy_lab_window_pair(
+                x,start,end,initial_capital,label,f"Rolling {months}M"
+            ))
+            last_start=start
+            start=start + pd.DateOffset(months=3)
+            idx += 1
+
+        # 補貼齊尾端視窗
+        trailing_start=max_exclusive - pd.DateOffset(months=months)
+        if trailing_start > base_start and (last_start is None or abs((trailing_start-last_start).total_seconds())>86400):
+            rows.extend(_strategy_lab_window_pair(
+                x,trailing_start,max_exclusive,initial_capital,
+                f"{months}M-Trailing",f"Rolling {months}M"
+            ))
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows).sort_values(
+        ["驗證家族","開始","方案"]
+    ).reset_index(drop=True)
+
+
+def strategy_lab_walkforward_compare(window_detail: pd.DataFrame) -> pd.DataFrame:
+    """每個時間窗做 Baseline vs 候選B 成對比較。"""
+    if window_detail is None or window_detail.empty:
+        return pd.DataFrame()
+
+    rows=[]
+    keys=["驗證家族","時間窗","開始","結束"]
+    for key,g in window_detail.groupby(keys,dropna=False):
+        b=g[g["方案"]=="正式Baseline"]
+        c=g[g["方案"]=="候選B｜第3日未站回成本"]
+        if b.empty or c.empty:
+            continue
+        b=b.iloc[0]
+        c=c.iloc[0]
+
+        bret=float(b["5%組合報酬%"])
+        cret=float(c["5%組合報酬%"])
+        bmdd=float(b["5%已實現MDD%"])
+        cmdd=float(c["5%已實現MDD%"])
+        brm=float(b["5%報酬/MDD"]) if pd.notna(b["5%報酬/MDD"]) else np.nan
+        crm=float(c["5%報酬/MDD"]) if pd.notna(c["5%報酬/MDD"]) else np.nan
+
+        rows.append({
+            "驗證家族":key[0],
+            "時間窗":key[1],
+            "開始":key[2],
+            "結束":key[3],
+            "Baseline組合報酬%":bret,
+            "候選B組合報酬%":cret,
+            "候選B相對報酬pp":cret-bret,
+            "Baseline_MDD%":bmdd,
+            "候選B_MDD%":cmdd,
+            "候選B_MDD改善pp":bmdd-cmdd,
+            "Baseline報酬/MDD":brm,
+            "候選B報酬/MDD":crm,
+            "候選B報酬較高":bool(cret>bret),
+            "候選B_MDD不高於Baseline":bool(cmdd<=bmdd),
+            "候選B報酬MDD較高":bool(
+                pd.notna(crm) and pd.notna(brm) and crm>brm
+            ),
+        })
+    return pd.DataFrame(rows)
+
+
+def strategy_lab_walkforward_summary(compare_df: pd.DataFrame) -> pd.DataFrame:
+    """彙總跨時間窗勝出比例與最差情況。"""
+    if compare_df is None or compare_df.empty:
+        return pd.DataFrame()
+
+    rows=[]
+    families=list(compare_df["驗證家族"].dropna().astype(str).drop_duplicates())
+    families.append("全部時間窗")
+
+    for family in families:
+        g=compare_df if family=="全部時間窗" else compare_df[compare_df["驗證家族"]==family]
+        if g.empty:
+            continue
+
+        delta=pd.to_numeric(g["候選B相對報酬pp"],errors="coerce")
+        mdd_imp=pd.to_numeric(g["候選B_MDD改善pp"],errors="coerce")
+
+        rows.append({
+            "驗證家族":family,
+            "時間窗數":int(len(g)),
+            "候選B報酬勝出窗數":int(g["候選B報酬較高"].sum()),
+            "候選B報酬勝出率%":float(g["候選B報酬較高"].mean()*100),
+            "候選B_MDD不劣窗數":int(g["候選B_MDD不高於Baseline"].sum()),
+            "候選B_MDD不劣率%":float(g["候選B_MDD不高於Baseline"].mean()*100),
+            "候選B報酬MDD勝出窗數":int(g["候選B報酬MDD較高"].sum()),
+            "候選B報酬MDD勝出率%":float(g["候選B報酬MDD較高"].mean()*100),
+            "相對報酬中位數pp":float(delta.median()),
+            "相對報酬平均pp":float(delta.mean()),
+            "最差相對報酬pp":float(delta.min()),
+            "最佳相對報酬pp":float(delta.max()),
+            "MDD改善中位數pp":float(mdd_imp.median()),
+        })
+    return pd.DataFrame(rows)
+
+
 def strategy_lab_formal_validation_summary(
     detail: pd.DataFrame,
     initial_capital: float,
@@ -3727,7 +3926,7 @@ if run and simple_mode=="進階研究" and research_mode=="策略實驗室":
         _lab_pool,_lab_diag,_lab_err=build_current_formal_radar_pool(max_rank=int(lab_pool_n))
         if lab_exit_mode=="正式三方案驗證｜Baseline vs MFE2 vs 第3日成本":
             _lab_summary,_lab_delta,_lab_detail,_lab_raw=run_strategy_lab_threeway(
-                _lab_pool,cost,lab_filter,period="1y"
+                _lab_pool,cost,lab_filter,period="2y"
             )
             _lab_validation_mode="threeway"
         else:
@@ -3746,8 +3945,9 @@ if run and simple_mode=="進階研究" and research_mode=="策略實驗室":
     }
 
 if simple_mode=="進階研究" and research_mode=="策略實驗室":
-    st.markdown("## 🧪 B線策略實驗室｜V1.16.60 候選B排序與容量驗證")
-    st.caption("比較原則：三方案同場驗證後，對候選B追加流動性排名分層、100次同時訊號隨機排序Monte Carlo與3.33/5/10%容量驗證。")
+    st.markdown("## 🧪 B線策略實驗室｜V1.16.61 Walk-forward 定版驗證")
+    st.caption("比較原則：規則完全凍結，TOP150改用2年60m資料；Baseline與候選B固定5%配置，驗證前/中/後三段與Rolling 6/9/12M。")
+    st.info("V1.16.61使用2年60分K，第一次執行會比前一版久；這一版不新增退出條件、不調整候選B參數。")
     st.caption("V1.16.59.1修正：三方案驗證函式所有返回路徑統一回傳4個值，避免ValueError解包失敗。")
     st.warning("這裡只做研究。正式今日雷達、Shioaji Worker與Telegram仍維持原凍結baseline。")
     st.caption("Baseline：TOP1–100＝KD黃金交叉+K<30；TOP101–150再要求S級；下一根60m Open進場；固定5個後續交易日出場。")
@@ -3783,6 +3983,50 @@ if simple_mode=="進階研究" and research_mode=="策略實驗室":
                     use_container_width=True
                 )
 
+                st.markdown("### 🧭 V1.16.61 Walk-forward / 多時間窗定版驗證")
+                _wf_detail=strategy_lab_walkforward_windows(
+                    _detail,float(_lab.get("capital",1000000))
+                )
+                _wf_compare=strategy_lab_walkforward_compare(_wf_detail)
+                _wf_summary=strategy_lab_walkforward_summary(_wf_compare)
+
+                if not _wf_summary.empty:
+                    st.markdown("#### 多時間窗總結")
+                    st.dataframe(_wf_summary,use_container_width=True,hide_index=True)
+                    st.caption(
+                        "規則固定，不在任何時間窗重新調參。固定5%單筆配置、流動性排名優先，"
+                        "比較Baseline與候選B跨時間的組合報酬、MDD與報酬/MDD。"
+                    )
+                    st.download_button(
+                        "⬇️ 下載WalkForward總結 CSV",
+                        data=_wf_summary.to_csv(index=False).encode("utf-8-sig"),
+                        file_name=f"{APP_VERSION}_WalkForward總結.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+
+                if not _wf_compare.empty:
+                    st.markdown("#### 每個時間窗 Baseline vs 候選B")
+                    st.dataframe(_wf_compare,use_container_width=True,hide_index=True)
+                    st.download_button(
+                        "⬇️ 下載WalkForward對比 CSV",
+                        data=_wf_compare.to_csv(index=False).encode("utf-8-sig"),
+                        file_name=f"{APP_VERSION}_WalkForward對比.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+
+                if not _wf_detail.empty:
+                    with st.expander("查看 Walk-forward 每方案完整明細"):
+                        st.dataframe(_wf_detail,use_container_width=True,hide_index=True)
+                    st.download_button(
+                        "⬇️ 下載WalkForward完整明細 CSV",
+                        data=_wf_detail.to_csv(index=False).encode("utf-8-sig"),
+                        file_name=f"{APP_VERSION}_WalkForward完整明細.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+
                 st.markdown("### 🧯 候選B壓力測試")
 
                 _cost_stress=strategy_lab_cost_stress_summary(
@@ -3815,26 +4059,28 @@ if simple_mode=="進階研究" and research_mode=="策略實驗室":
                         use_container_width=True
                     )
 
-                    _rank_bucket=strategy_lab_rank_bucket_summary(_detail)
-                    if not _rank_bucket.empty:
-                        st.markdown("#### ②-A 候選B流動性排名分層")
-                        st.dataframe(_rank_bucket,use_container_width=True,hide_index=True)
-                        st.download_button(
-                            "⬇️ 下載候選B排名分層 CSV",
-                            data=_rank_bucket.to_csv(index=False).encode("utf-8-sig"),
-                            file_name=f"{APP_VERSION}_候選B排名分層.csv",
-                            mime="text/csv",
-                            use_container_width=True
-                        )
-
-                    _mc_sum,_mc_trials=strategy_lab_random_priority_monte_carlo(
-                        _detail,float(_lab.get("capital",1000000)),
-                        allocation_pct=0.05,trials=100,base_seed=11660
+                _rank_bucket=strategy_lab_rank_bucket_summary(_detail)
+                if not _rank_bucket.empty:
+                    st.markdown("#### ②-A 候選B流動性排名分層")
+                    st.dataframe(_rank_bucket,use_container_width=True,hide_index=True)
+                    st.download_button(
+                        "⬇️ 下載候選B排名分層 CSV",
+                        data=_rank_bucket.to_csv(index=False).encode("utf-8-sig"),
+                        file_name=f"{APP_VERSION}_候選B排名分層.csv",
+                        mime="text/csv",
+                        use_container_width=True
                     )
-                    if not _mc_sum.empty:
-                        st.markdown("#### ②-B 候選B同時訊號隨機排序 Monte Carlo（100次）")
-                        st.dataframe(_mc_sum,use_container_width=True,hide_index=True)
-                        st.caption("只隨機化『同一進場時間』的資金取得順序；訊號、進出場時間與交易成本完全不變。")
+
+                st.markdown("#### ②-B 候選B同時訊號隨機排序 Monte Carlo（100次）")
+                _mc_sum,_mc_trials=strategy_lab_random_priority_monte_carlo(
+                    _detail,float(_lab.get("capital",1000000)),
+                    allocation_pct=0.05,trials=100,base_seed=11660
+                )
+                if not _mc_sum.empty:
+                    st.dataframe(_mc_sum,use_container_width=True,hide_index=True)
+                    st.caption("只隨機化『同一進場時間』的資金取得順序；訊號、進出場時間與交易成本完全不變。")
+                    c1,c2=st.columns(2)
+                    with c1:
                         st.download_button(
                             "⬇️ 下載Monte Carlo摘要 CSV",
                             data=_mc_sum.to_csv(index=False).encode("utf-8-sig"),
@@ -3842,6 +4088,7 @@ if simple_mode=="進階研究" and research_mode=="策略實驗室":
                             mime="text/csv",
                             use_container_width=True
                         )
+                    with c2:
                         st.download_button(
                             "⬇️ 下載Monte Carlo 100次明細 CSV",
                             data=_mc_trials.to_csv(index=False).encode("utf-8-sig"),
@@ -3849,20 +4096,24 @@ if simple_mode=="進階研究" and research_mode=="策略實驗室":
                             mime="text/csv",
                             use_container_width=True
                         )
+                else:
+                    st.warning("Monte Carlo沒有產生資料：請確認本次執行為「正式三方案驗證」且候選B OOS有交易。")
 
-                    _capacity=strategy_lab_candidate_b_capacity_summary(
-                        _detail,float(_lab.get("capital",1000000))
+                st.markdown("#### ②-C 候選B資金容量")
+                _capacity=strategy_lab_candidate_b_capacity_summary(
+                    _detail,float(_lab.get("capital",1000000))
+                )
+                if not _capacity.empty:
+                    st.dataframe(_capacity,use_container_width=True,hide_index=True)
+                    st.download_button(
+                        "⬇️ 下載候選B資金容量 CSV",
+                        data=_capacity.to_csv(index=False).encode("utf-8-sig"),
+                        file_name=f"{APP_VERSION}_候選B資金容量.csv",
+                        mime="text/csv",
+                        use_container_width=True
                     )
-                    if not _capacity.empty:
-                        st.markdown("#### ②-C 候選B資金容量")
-                        st.dataframe(_capacity,use_container_width=True,hide_index=True)
-                        st.download_button(
-                            "⬇️ 下載候選B資金容量 CSV",
-                            data=_capacity.to_csv(index=False).encode("utf-8-sig"),
-                            file_name=f"{APP_VERSION}_候選B資金容量.csv",
-                            mime="text/csv",
-                            use_container_width=True
-                        )
+                else:
+                    st.warning("候選B資金容量沒有產生資料：請確認候選B OOS有交易。")
 
                 _raw60=_lab.get("raw_60m",{})
                 _mtm_sum,_mtm_curve=strategy_lab_mtm_summary(
