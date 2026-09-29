@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.16.62
+黑嚕嚕－短線交易雷達 ST V1.16.64
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -51,13 +51,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.62"
+APP_VERSION = "ST V1.16.64"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.62"
-EXPORT_PREFIX = "ST_V1.16.62"
+APP_VERSION = "ST_V1.16.64"
+EXPORT_PREFIX = "ST_V1.16.64"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -678,7 +678,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.16.62",
+        "strategy_version":"ST V1.16.64",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -1740,7 +1740,7 @@ def read_supabase_runtime():
         endpoint=(
             f"{url}/rest/v1/heylulu_runtime"
             "?select=key,payload,updated_at"
-            "&key=in.(status,sim_positions,sim_pending)"
+            "&key=in.(status,sim_positions,sim_pending,shadow_positions,shadow_pending,shadow_pending_exits,shadow_daily_summary,shadow_recent_trades)"
         )
         req=urllib.request.Request(
             endpoint,
@@ -1773,6 +1773,11 @@ def read_worker_runtime_unified():
             "status":local_status,
             "sim_positions":read_worker_json("runtime/sim_positions.json"),
             "sim_pending":read_worker_json("runtime/sim_pending_entries.json"),
+            "shadow_positions":read_worker_json("runtime/shadow_b_positions.json"),
+            "shadow_pending":read_worker_json("runtime/shadow_b_pending_entries.json"),
+            "shadow_pending_exits":read_worker_json("runtime/shadow_b_pending_exits.json"),
+            "shadow_daily_summary":read_worker_json("runtime/shadow_b_daily_summary.json"),
+            "shadow_recent_trades":read_worker_json("runtime/shadow_b_recent_trades.json"),
             "_source":"local",
         },None
 
@@ -1782,6 +1787,11 @@ def read_worker_runtime_unified():
             "status":shared.get("status",{}),
             "sim_positions":shared.get("sim_positions",{}),
             "sim_pending":shared.get("sim_pending",{}),
+            "shadow_positions":shared.get("shadow_positions",{}),
+            "shadow_pending":shared.get("shadow_pending",{}),
+            "shadow_pending_exits":shared.get("shadow_pending_exits",{}),
+            "shadow_daily_summary":shared.get("shadow_daily_summary",{}),
+            "shadow_recent_trades":shared.get("shadow_recent_trades",{}),
             "_source":"supabase",
             "status_updated_at":shared.get("status_updated_at",""),
         },None
@@ -3802,7 +3812,19 @@ with st.sidebar:
     refresh_enabled=False
     refresh_mode="智慧"
     refresh_fixed=60
+    live_initial_capital=1000000
     if simple_mode=="進階研究" and research_mode=="Shioaji即時引擎":
+        with st.expander("💰 Forward資金設定", expanded=True):
+            live_initial_capital=st.number_input(
+                "初始資金",
+                min_value=100000,
+                max_value=100000000,
+                value=1000000,
+                step=100000,
+                help="預設100萬元。此欄用於Streamlit Forward資金顯示/後續績效分析；目前Worker實際模擬建倉仍維持固定股數，不會因修改此欄自動改變下單股數。"
+            )
+            st.caption("目前正式Baseline模擬仍固定SIM_ORDER_QTY；Candidate-B仍為Shadow Only。")
+
         with st.expander("🔄 即時畫面刷新", expanded=True):
             refresh_enabled=st.toggle("自動刷新", value=True)
             refresh_mode=st.radio("刷新模式", ["智慧","固定"], horizontal=True, index=0)
@@ -4419,8 +4441,9 @@ if simple_mode=="進階研究" and research_mode=="策略實驗室":
 # ============================================================
 
 if simple_mode=="進階研究" and research_mode=="Shioaji即時引擎":
-    st.markdown("## 🧪 Shioaji Stage 4.4｜模擬交易＋雲端共享狀態")
-    st.warning("Stage 4 只做程式內模擬成交，不呼叫Shioaji place_order/update_order/cancel_order。正式訊號在下一根60m K第一筆Tick模擬建倉，建倉/出場後可推送Telegram。")
+    st.markdown("## 👻 Shioaji Stage 5｜正式Baseline＋候選B Shadow Forward")
+    st.warning("正式Baseline維持原模擬邏輯；候選B只做Shadow Forward影子追蹤。兩者都不呼叫Shioaji place_order/update_order/cancel_order，不會下真單。")
+    st.info("目前『模擬建倉』仍是正式Baseline：固定5個後續交易日收盤；Candidate-B目前只在Shadow Forward獨立追蹤，尚未取代Baseline。")
 
     st.markdown("### 操作檢查表")
     st.dataframe(get_shioaji_stage1_checklist(),use_container_width=True,hide_index=True)
@@ -4484,7 +4507,9 @@ if simple_mode=="進階研究" and research_mode=="Shioaji即時引擎":
         _sim_positions=runtime.get("sim_positions",{}) if runtime else {}
         _sim_pending=runtime.get("sim_pending",{}) if runtime else {}
 
-        c1,c2,c3,c4=st.columns(4)
+        _worker_initial=float(status.get("sim_initial_capital",1000000) or 1000000)
+        c0,c1,c2,c3,c4=st.columns(5)
+        c0.metric("Forward初始資金",f"{float(live_initial_capital):,.0f}")
         c1.metric("模擬持倉", len(_sim_positions) if isinstance(_sim_positions,dict) else 0)
         c2.metric("待進場", len(_sim_pending) if isinstance(_sim_pending,dict) else 0)
         c3.metric("正式訊號", int(status.get("formal_signal_count",0) or 0))
@@ -4497,6 +4522,60 @@ if simple_mode=="進階研究" and research_mode=="Shioaji即時引擎":
         if isinstance(_sim_pending,dict) and _sim_pending:
             st.markdown("#### ⏳ 待模擬進場")
             st.dataframe(pd.DataFrame(list(_sim_pending.values())),use_container_width=True,hide_index=True)
+
+        st.markdown("### 👻 Candidate-B Shadow Forward")
+        _shadow_positions=runtime.get("shadow_positions",{}) if runtime else {}
+        _shadow_pending=runtime.get("shadow_pending",{}) if runtime else {}
+        _shadow_pending_exits=runtime.get("shadow_pending_exits",{}) if runtime else {}
+        _shadow_daily=runtime.get("shadow_daily_summary",{}) if runtime else {}
+        _shadow_recent=runtime.get("shadow_recent_trades",{}) if runtime else {}
+
+        s1,s2,s3,s4,s5=st.columns(5)
+        s1.metric("Shadow持倉",len(_shadow_positions) if isinstance(_shadow_positions,dict) else 0)
+        s2.metric("Shadow待進場",len(_shadow_pending) if isinstance(_shadow_pending,dict) else 0)
+        s3.metric("Shadow待出場",len(_shadow_pending_exits) if isinstance(_shadow_pending_exits,dict) else 0)
+        s4.metric("Shadow完成交易",int(_shadow_daily.get("closed_trade_count",0) or 0) if isinstance(_shadow_daily,dict) else 0)
+        _shadow_avg=_shadow_daily.get("avg_gross_return_pct") if isinstance(_shadow_daily,dict) else None
+        s5.metric("Shadow平均毛報酬",f"{float(_shadow_avg):.2f}%" if _shadow_avg is not None else "—")
+
+        st.caption("候選B固定規則：KD>80死叉停利；第3個後續交易日最後一根60m Close<成本且K<D→下一根60m第一筆Tick退出；第5個後續交易日收盤兜底。只影子記錄，不下單。")
+
+        if isinstance(_shadow_daily,dict) and _shadow_daily:
+            c1,c2,c3,c4,c5=st.columns(5)
+            c1.metric("今日Shadow訊號",int(_shadow_daily.get("today_signals",0) or 0))
+            c2.metric("今日建倉",int(_shadow_daily.get("today_opens",0) or 0))
+            c3.metric("今日出場",int(_shadow_daily.get("today_closes",0) or 0))
+            c4.metric("今日提前退出",int(_shadow_daily.get("today_early_exits",0) or 0))
+            _wr=_shadow_daily.get("win_rate_pct")
+            c5.metric("累積勝率",f"{float(_wr):.1f}%" if _wr is not None else "—")
+
+            _today_open_details=_shadow_daily.get("today_open_details",[])
+            if isinstance(_today_open_details,list) and _today_open_details:
+                st.markdown("#### 📋 今日 Shadow B 詳細建倉")
+                _odf=pd.DataFrame(_today_open_details).copy()
+                if not _odf.empty:
+                    if "qty" in _odf.columns:
+                        _odf["qty"]=pd.to_numeric(_odf["qty"],errors="coerce").round().astype("Int64")
+                    if "price" in _odf.columns:
+                        _odf["price"]=pd.to_numeric(_odf["price"],errors="coerce").round(2)
+                    _rename={"code":"股票代號","name":"股票名稱","qty":"數量","price":"價格","entry_time":"建倉時間"}
+                    _odf=_odf.rename(columns=_rename)
+                    st.dataframe(_odf,use_container_width=True,hide_index=True)
+
+        if isinstance(_shadow_positions,dict) and _shadow_positions:
+            with st.expander("查看 Shadow B 目前持倉",expanded=False):
+                st.dataframe(pd.DataFrame(list(_shadow_positions.values())),use_container_width=True,hide_index=True)
+
+        if isinstance(_shadow_pending_exits,dict) and _shadow_pending_exits:
+            st.markdown("#### 🚪 Shadow B 待下一根60m Tick出場")
+            st.dataframe(pd.DataFrame(list(_shadow_pending_exits.values())),use_container_width=True,hide_index=True)
+
+        _recent_items=_shadow_recent.get("items",[]) if isinstance(_shadow_recent,dict) else []
+        if isinstance(_recent_items,list) and _recent_items:
+            with st.expander("查看 Shadow B 最近50筆事件",expanded=False):
+                st.dataframe(pd.DataFrame(_recent_items),use_container_width=True,hide_index=True)
+
+        st.info("Shadow Forward記錄所有候選B合格交易；5%資金＋流動性排名優先的帳戶績效之後由完整Shadow交易紀錄重建，避免即時Tick先後順序污染驗證。")
 
         _now_tw=pd.Timestamp.now(tz="Asia/Taipei")
         st.caption(f"畫面更新時間：{_now_tw.strftime('%Y-%m-%d %H:%M:%S')}｜資料來源：{source_label}")
