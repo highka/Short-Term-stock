@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.16.64
+黑嚕嚕－短線交易雷達 ST V1.16.65.3
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -51,13 +51,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.64"
+APP_VERSION = "ST V1.16.65.3"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.64"
-EXPORT_PREFIX = "ST_V1.16.64"
+APP_VERSION = "ST_V1.16.65.3"
+EXPORT_PREFIX = "ST_V1.16.65.3"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -678,7 +678,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.16.64",
+        "strategy_version":"ST V1.16.65.3",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -1740,7 +1740,7 @@ def read_supabase_runtime():
         endpoint=(
             f"{url}/rest/v1/heylulu_runtime"
             "?select=key,payload,updated_at"
-            "&key=in.(status,sim_positions,sim_pending,shadow_positions,shadow_pending,shadow_pending_exits,shadow_daily_summary,shadow_recent_trades)"
+            "&key=in.(status,sim_positions,sim_pending,shadow_positions,shadow_pending,shadow_pending_exits,shadow_daily_summary,shadow_recent_trades,sim_capital,shadow_capital,sim_daily_holdings,shadow_daily_holdings)"
         )
         req=urllib.request.Request(
             endpoint,
@@ -1778,6 +1778,10 @@ def read_worker_runtime_unified():
             "shadow_pending_exits":read_worker_json("runtime/shadow_b_pending_exits.json"),
             "shadow_daily_summary":read_worker_json("runtime/shadow_b_daily_summary.json"),
             "shadow_recent_trades":read_worker_json("runtime/shadow_b_recent_trades.json"),
+            "sim_capital":read_worker_json("runtime/sim_capital_state.json"),
+            "shadow_capital":read_worker_json("runtime/shadow_b_capital_state.json"),
+            "sim_daily_holdings":read_worker_json("runtime/sim_daily_holdings_latest.json"),
+            "shadow_daily_holdings":read_worker_json("runtime/shadow_b_daily_holdings_latest.json"),
             "_source":"local",
         },None
 
@@ -1792,6 +1796,10 @@ def read_worker_runtime_unified():
             "shadow_pending_exits":shared.get("shadow_pending_exits",{}),
             "shadow_daily_summary":shared.get("shadow_daily_summary",{}),
             "shadow_recent_trades":shared.get("shadow_recent_trades",{}),
+            "sim_capital":shared.get("sim_capital",{}),
+            "shadow_capital":shared.get("shadow_capital",{}),
+            "sim_daily_holdings":shared.get("sim_daily_holdings",{}),
+            "shadow_daily_holdings":shared.get("shadow_daily_holdings",{}),
             "_source":"supabase",
             "status_updated_at":shared.get("status_updated_at",""),
         },None
@@ -3816,14 +3824,22 @@ with st.sidebar:
     if simple_mode=="進階研究" and research_mode=="Shioaji即時引擎":
         with st.expander("💰 Forward資金設定", expanded=True):
             live_initial_capital=st.number_input(
-                "初始資金",
+                "初始資金（研究顯示）",
                 min_value=100000,
                 max_value=100000000,
                 value=1000000,
                 step=100000,
-                help="預設100萬元。此欄用於Streamlit Forward資金顯示/後續績效分析；目前Worker實際模擬建倉仍維持固定股數，不會因修改此欄自動改變下單股數。"
+                help="V1.16.65 Worker預設使用100萬元。若要真正改變Windows Worker資金，請同步修改.env的SIM_INITIAL_CAPITAL。"
             )
-            st.caption("目前正式Baseline模擬仍固定SIM_ORDER_QTY；Candidate-B仍為Shadow Only。")
+            live_alloc_pct=st.number_input(
+                "單筆配置比例（%）",
+                min_value=0.5,
+                max_value=100.0,
+                value=5.0,
+                step=0.5,
+                help="V1.16.65 Worker預設5%。若要真正改變Windows Worker，請同步修改.env的SIM_ALLOC_PCT。"
+            )
+            st.caption("實際Worker資金參數會顯示在即時頁面；Baseline與Candidate-B各自使用獨立帳戶，方便公平比較。")
 
         with st.expander("🔄 即時畫面刷新", expanded=True):
             refresh_enabled=st.toggle("自動刷新", value=True)
@@ -4442,8 +4458,10 @@ if simple_mode=="進階研究" and research_mode=="策略實驗室":
 
 if simple_mode=="進階研究" and research_mode=="Shioaji即時引擎":
     st.markdown("## 👻 Shioaji Stage 5｜正式Baseline＋候選B Shadow Forward")
-    st.warning("正式Baseline維持原模擬邏輯；候選B只做Shadow Forward影子追蹤。兩者都不呼叫Shioaji place_order/update_order/cancel_order，不會下真單。")
-    st.info("目前『模擬建倉』仍是正式Baseline：固定5個後續交易日收盤；Candidate-B目前只在Shadow Forward獨立追蹤，尚未取代Baseline。")
+    st.warning("V1.16.65起，Baseline與Candidate-B各自使用獨立100萬元模擬帳戶；每個合格訊號以初始資金5%（預設5萬元）計算整數股數。兩者都不會下真單。")
+    st.info("策略仍分開：正式模擬建倉＝Baseline固定第5日出場；Candidate-B＝Shadow動態退出。現在兩邊使用相同100萬/5%資金規則，最後可以直接比較帳戶資金效率。")
+    st.info("價格會遵守台股跳動單位；股數、投入金額、手續費、證交稅、現金餘額全部用整數計算，不會出現小數股或小數元。")
+    st.info("V1.16.65.3起每天13:35後會保存Baseline與Candidate-B收盤持股快照；未平倉部位會跨日延續。Windows Worker預設台灣時間08:30開始、14:00停止Shioaji行情連線，其他時間保持休眠，隔日08:30自動恢復。")
 
     st.markdown("### 操作檢查表")
     st.dataframe(get_shioaji_stage1_checklist(),use_container_width=True,hide_index=True)
@@ -4507,9 +4525,12 @@ if simple_mode=="進階研究" and research_mode=="Shioaji即時引擎":
         _sim_positions=runtime.get("sim_positions",{}) if runtime else {}
         _sim_pending=runtime.get("sim_pending",{}) if runtime else {}
 
+        _sim_capital=runtime.get("sim_capital",{}) if runtime else {}
+        _shadow_capital=runtime.get("shadow_capital",{}) if runtime else {}
         _worker_initial=float(status.get("sim_initial_capital",1000000) or 1000000)
+        _worker_alloc=float(status.get("sim_allocation_pct",0.05) or 0.05)
         c0,c1,c2,c3,c4=st.columns(5)
-        c0.metric("Forward初始資金",f"{float(live_initial_capital):,.0f}")
+        c0.metric("Worker資金規則",f"{_worker_initial/10000:.0f}萬 × {_worker_alloc*100:.1f}%")
         c1.metric("模擬持倉", len(_sim_positions) if isinstance(_sim_positions,dict) else 0)
         c2.metric("待進場", len(_sim_pending) if isinstance(_sim_pending,dict) else 0)
         c3.metric("正式訊號", int(status.get("formal_signal_count",0) or 0))
@@ -4522,6 +4543,39 @@ if simple_mode=="進階研究" and research_mode=="Shioaji即時引擎":
         if isinstance(_sim_pending,dict) and _sim_pending:
             st.markdown("#### ⏳ 待模擬進場")
             st.dataframe(pd.DataFrame(list(_sim_pending.values())),use_container_width=True,hide_index=True)
+
+        st.markdown("### 💰 Baseline vs Candidate-B 資金帳戶")
+        _b_cash=float((_sim_capital or {}).get("cash",status.get("sim_cash",0)) or 0)
+        _b_invest=float(status.get("sim_invested_book",0) or 0)
+        _s_cash=float((_shadow_capital or {}).get("cash",status.get("shadow_cash",0)) or 0)
+        _s_invest=float(status.get("shadow_invested_book",0) or 0)
+        ac1,ac2,ac3,ac4=st.columns(4)
+        ac1.metric("Baseline現金",f"{_b_cash:,.0f}")
+        ac2.metric("Baseline持倉成本",f"{_b_invest:,.0f}")
+        ac3.metric("B模式現金",f"{_s_cash:,.0f}")
+        ac4.metric("B模式持倉成本",f"{_s_invest:,.0f}")
+        st.caption("兩邊各自從100萬元開始、每筆目標5萬元，不共用現金。股數與新台幣金額一律為整數；成交價依台股合法跳動單位（因此低價股可能合法出現0.05、0.1等小數），不會使用不合法的小數價格。")
+
+        _sim_daily_hold=runtime.get("sim_daily_holdings",{}) if runtime else {}
+        _shadow_daily_hold=runtime.get("shadow_daily_holdings",{}) if runtime else {}
+        if (isinstance(_sim_daily_hold,dict) and _sim_daily_hold) or (isinstance(_shadow_daily_hold,dict) and _shadow_daily_hold):
+            st.markdown("#### 🌙 最近一個收盤日持股快照")
+            h1,h2=st.columns(2)
+            with h1:
+                st.markdown("**Baseline 收盤持股**")
+                _items=_sim_daily_hold.get("holdings",[]) if isinstance(_sim_daily_hold,dict) else []
+                if _items:
+                    st.dataframe(pd.DataFrame(_items),use_container_width=True,hide_index=True)
+                else:
+                    st.caption("無持股")
+            with h2:
+                st.markdown("**Candidate-B 收盤持股**")
+                _items=_shadow_daily_hold.get("holdings",[]) if isinstance(_shadow_daily_hold,dict) else []
+                if _items:
+                    st.dataframe(pd.DataFrame(_items),use_container_width=True,hide_index=True)
+                else:
+                    st.caption("無持股")
+            st.caption("每日13:35後各寫一份收盤持股快照；隔日Worker重啟時仍會從positions.json載入未平倉持股繼續追蹤。")
 
         st.markdown("### 👻 Candidate-B Shadow Forward")
         _shadow_positions=runtime.get("shadow_positions",{}) if runtime else {}
@@ -4558,7 +4612,7 @@ if simple_mode=="進階研究" and research_mode=="Shioaji即時引擎":
                         _odf["qty"]=pd.to_numeric(_odf["qty"],errors="coerce").round().astype("Int64")
                     if "price" in _odf.columns:
                         _odf["price"]=pd.to_numeric(_odf["price"],errors="coerce").round(2)
-                    _rename={"code":"股票代號","name":"股票名稱","qty":"數量","price":"價格","entry_time":"建倉時間"}
+                    _rename={"code":"股票代號","name":"股票名稱","qty":"數量","price":"價格","budget":"目標配置","cost":"實際投入","cash_after":"建倉後現金","entry_time":"建倉時間"}
                     _odf=_odf.rename(columns=_rename)
                     st.dataframe(_odf,use_container_width=True,hide_index=True)
 
