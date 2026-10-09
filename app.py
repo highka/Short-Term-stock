@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.16.65.3
+黑嚕嚕－短線交易雷達 ST V1.17.0
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -51,13 +51,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.16.65.3"
+APP_VERSION = "ST V1.17.0"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.16.65.3"
-EXPORT_PREFIX = "ST_V1.16.65.3"
+APP_VERSION = "ST_V1.17.0"
+EXPORT_PREFIX = "ST_V1.17.0"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -678,7 +678,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.16.65.3",
+        "strategy_version":"ST V1.17.0",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -1740,7 +1740,7 @@ def read_supabase_runtime():
         endpoint=(
             f"{url}/rest/v1/heylulu_runtime"
             "?select=key,payload,updated_at"
-            "&key=in.(status,sim_positions,sim_pending,shadow_positions,shadow_pending,shadow_pending_exits,shadow_daily_summary,shadow_recent_trades,sim_capital,shadow_capital,sim_daily_holdings,shadow_daily_holdings)"
+            "&key=in.(status,sim_positions,sim_pending,shadow_positions,shadow_pending,shadow_pending_exits,shadow_daily_summary,shadow_recent_trades,sim_capital,shadow_capital,sim_daily_holdings,shadow_daily_holdings,fubon_status,fubon_latest_ticks,fubon_current_bars,fubon_warmup_diag,fubon_compare)"
         )
         req=urllib.request.Request(
             endpoint,
@@ -1782,6 +1782,11 @@ def read_worker_runtime_unified():
             "shadow_capital":read_worker_json("runtime/shadow_b_capital_state.json"),
             "sim_daily_holdings":read_worker_json("runtime/sim_daily_holdings_latest.json"),
             "shadow_daily_holdings":read_worker_json("runtime/shadow_b_daily_holdings_latest.json"),
+            "fubon_status":read_worker_json("runtime_fubon/fubon_status.json"),
+            "fubon_latest_ticks":read_worker_json("runtime_fubon/fubon_latest_ticks.json"),
+            "fubon_current_bars":read_worker_json("runtime_fubon/fubon_current_60m_bars.json"),
+            "fubon_warmup_diag":read_worker_json("runtime_fubon/fubon_warmup_diagnostics.json"),
+            "fubon_compare":read_worker_json("runtime_fubon/fubon_vs_shioaji_compare.json"),
             "_source":"local",
         },None
 
@@ -1800,6 +1805,11 @@ def read_worker_runtime_unified():
             "shadow_capital":shared.get("shadow_capital",{}),
             "sim_daily_holdings":shared.get("sim_daily_holdings",{}),
             "shadow_daily_holdings":shared.get("shadow_daily_holdings",{}),
+            "fubon_status":shared.get("fubon_status",{}),
+            "fubon_latest_ticks":shared.get("fubon_latest_ticks",{}),
+            "fubon_current_bars":shared.get("fubon_current_bars",{}),
+            "fubon_warmup_diag":shared.get("fubon_warmup_diag",{}),
+            "fubon_compare":shared.get("fubon_compare",{}),
             "_source":"supabase",
             "status_updated_at":shared.get("status_updated_at",""),
         },None
@@ -4461,7 +4471,7 @@ if simple_mode=="進階研究" and research_mode=="Shioaji即時引擎":
     st.warning("V1.16.65起，Baseline與Candidate-B各自使用獨立100萬元模擬帳戶；每個合格訊號以初始資金5%（預設5萬元）計算整數股數。兩者都不會下真單。")
     st.info("策略仍分開：正式模擬建倉＝Baseline固定第5日出場；Candidate-B＝Shadow動態退出。現在兩邊使用相同100萬/5%資金規則，最後可以直接比較帳戶資金效率。")
     st.info("價格會遵守台股跳動單位；股數、投入金額、手續費、證交稅、現金餘額全部用整數計算，不會出現小數股或小數元。")
-    st.info("V1.16.65.3起每天13:35後會保存Baseline與Candidate-B收盤持股快照；未平倉部位會跨日延續。Windows Worker預設台灣時間08:30開始、14:00停止Shioaji行情連線，其他時間保持休眠，隔日08:30自動恢復。")
+    st.info("V1.16.65.4起非運行時段完全不碰Yahoo/TWSE/TPEx/Shioaji；Worker保持休眠，08:30才開始更新TOP150並連線，14:00停止行情連線。每日13:35持股快照與跨日持股功能保留。")
 
     st.markdown("### 操作檢查表")
     st.dataframe(get_shioaji_stage1_checklist(),use_container_width=True,hide_index=True)
@@ -4576,6 +4586,32 @@ if simple_mode=="進階研究" and research_mode=="Shioaji即時引擎":
                 else:
                     st.caption("無持股")
             st.caption("每日13:35後各寫一份收盤持股快照；隔日Worker重啟時仍會從positions.json載入未平倉持股繼續追蹤。")
+
+        st.markdown("### 🟦 Broker雙引擎｜Fubon Neo 行情驗證")
+        _fubon_status=runtime.get("fubon_status",{}) if runtime else {}
+        _fubon_ticks=runtime.get("fubon_latest_ticks",{}) if runtime else {}
+        _fubon_bars=runtime.get("fubon_current_bars",{}) if runtime else {}
+        _fubon_warmup=runtime.get("fubon_warmup_diag",{}) if runtime else {}
+        _fubon_compare=runtime.get("fubon_compare",{}) if runtime else {}
+
+        fb1,fb2,fb3,fb4,fb5=st.columns(5)
+        fb1.metric("Fubon狀態",str(_fubon_status.get("phase","未啟動")))
+        fb2.metric("Fubon總Ticks",int(_fubon_status.get("total_ticks",0) or 0))
+        fb3.metric("訂閱檔數",int(_fubon_status.get("subscribed_count",0) or 0))
+        fb4.metric("60m進行中",len(_fubon_bars) if isinstance(_fubon_bars,dict) else 0)
+        fb5.metric("Warmup成功",int(_fubon_warmup.get("ok",0) or 0) if isinstance(_fubon_warmup,dict) else 0)
+
+        st.caption("Fubon ST V1.17.0目前只做行情平行驗證：TOP150 trades、60m聚合、歷史60m暖機及Shioaji交叉比對；不呼叫任何富邦下單API。")
+
+        _cmp_items=_fubon_compare.get("items",[]) if isinstance(_fubon_compare,dict) else []
+        if isinstance(_cmp_items,list) and _cmp_items:
+            _cmp_df=pd.DataFrame(_cmp_items[-30:])
+            with st.expander("查看最近30筆 Fubon vs Shioaji 60m 比對",expanded=False):
+                st.dataframe(_cmp_df,use_container_width=True,hide_index=True)
+
+        if isinstance(_fubon_ticks,dict) and _fubon_ticks:
+            with st.expander("查看 Fubon 最新Tick（最多TOP150）",expanded=False):
+                st.dataframe(pd.DataFrame(list(_fubon_ticks.values())),use_container_width=True,hide_index=True)
 
         st.markdown("### 👻 Candidate-B Shadow Forward")
         _shadow_positions=runtime.get("shadow_positions",{}) if runtime else {}
