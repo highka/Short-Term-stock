@@ -1,5 +1,5 @@
 """
-黑嚕嚕－短線交易雷達 ST V1.17.0
+黑嚕嚕－短線交易雷達 ST V1.17.0.1
 
 正式核心策略已凍結：
 - 官方 TWSE + TPEx 普通股母池
@@ -51,13 +51,13 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-APP_VERSION = "ST V1.17.0"
+APP_VERSION = "ST V1.17.0.1"
 APP_NAME = "黑嚕嚕－短線交易雷達"
 MA_LIST = [5, 15, 30, 60, 200]
 INTERVALS = ["5m", "15m", "60m"]
 
-APP_VERSION = "ST_V1.17.0"
-EXPORT_PREFIX = "ST_V1.17.0"
+APP_VERSION = "ST_V1.17.0.1"
+EXPORT_PREFIX = "ST_V1.17.0.1"
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="⚡", layout="wide")
 
@@ -678,7 +678,7 @@ def get_frozen_strategy_config():
     """
     return {
         "strategy_status":"FROZEN_BASELINE",
-        "strategy_version":"ST V1.17.0",
+        "strategy_version":"ST V1.17.0.1",
         "universe_source":"官方TWSE+TPEx普通股母池",
         "liquidity_ranking":"前一完成交易日，20日成交金額中位數，Point-in-Time",
         "formal_pool_rule":"TOP1-100全部 + TOP101-150僅S級",
@@ -4601,7 +4601,7 @@ if simple_mode=="進階研究" and research_mode=="Shioaji即時引擎":
         fb4.metric("60m進行中",len(_fubon_bars) if isinstance(_fubon_bars,dict) else 0)
         fb5.metric("Warmup成功",int(_fubon_warmup.get("ok",0) or 0) if isinstance(_fubon_warmup,dict) else 0)
 
-        st.caption("Fubon ST V1.17.0目前只做行情平行驗證：TOP150 trades、60m聚合、歷史60m暖機及Shioaji交叉比對；不呼叫任何富邦下單API。")
+        st.caption("Fubon ST V1.17.0.1目前只做行情平行驗證：TOP150 trades、60m聚合、歷史60m暖機及Shioaji交叉比對；不呼叫任何富邦下單API。")
 
         _cmp_items=_fubon_compare.get("items",[]) if isinstance(_fubon_compare,dict) else []
         if isinstance(_cmp_items,list) and _cmp_items:
